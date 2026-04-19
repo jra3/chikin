@@ -1,0 +1,24 @@
+services:
+  chrome:
+    build: .
+    image: chikin:local
+    container_name: chikin
+    restart: unless-stopped
+    shm_size: "2gb"
+    ports:
+      - "127.0.0.1:9322:9222"   # host:container. Never change host side to 0.0.0.0.
+    environment:
+      CDP_PORT: "${CDP_PORT:-9222}"
+      WINDOW_SIZE: "${WINDOW_SIZE:-1920,1080}"
+      DISPLAY_NUM: "${DISPLAY_NUM:-99}"
+      EXTRA_CHROME_ARGS: "${EXTRA_CHROME_ARGS:-}"
+    volumes:
+      - chikin-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${CDP_PORT:-9222}/json/version >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  chikin-data:
