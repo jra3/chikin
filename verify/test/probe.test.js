@@ -7,7 +7,8 @@ const goodRaw = {
   webdriver: undefined,
   pluginsLength: 3,
   languages: ["en-US", "en"],
-  hasWindowChromeRuntime: true,
+  hasWindowChrome: true,
+  hasWindowChromeRuntime: false,
   webglVendor: "Google Inc. (Google)",
   webglRenderer: "ANGLE (Google, SwiftShader Device, SwiftShader driver)",
 };
@@ -42,10 +43,17 @@ test("empty languages → fail", () => {
   assert.equal(row.status, "fail");
 });
 
-test("no window.chrome.runtime → fail", () => {
-  const rows = interpretProbe({ ...goodRaw, hasWindowChromeRuntime: false });
+test("no window.chrome → fail", () => {
+  const rows = interpretProbe({ ...goodRaw, hasWindowChrome: false });
   const row = rows.find((r) => r.id === "windowChrome");
   assert.equal(row.status, "fail");
+});
+
+test("window.chrome.runtime is informational, never required", () => {
+  const rows = interpretProbe({ ...goodRaw, hasWindowChromeRuntime: false });
+  const row = rows.find((r) => r.id === "windowChromeRuntime");
+  assert.equal(row.required, false);
+  assert.equal(row.status, "info");
 });
 
 test("WebGL row is informational, never fails", () => {

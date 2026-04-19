@@ -9,6 +9,7 @@ export const PROBE_EXPRESSION = `
       webdriver: navigator.webdriver,
       pluginsLength: navigator.plugins.length,
       languages: Array.from(navigator.languages || []),
+      hasWindowChrome: !!window.chrome,
       hasWindowChromeRuntime: !!(window.chrome && window.chrome.runtime),
       webglVendor: dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : null,
       webglRenderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null,
@@ -55,12 +56,25 @@ export function interpretProbe(raw) {
     value: raw.languages,
   });
 
-  const chromeOk = raw.hasWindowChromeRuntime === true;
+  // Required: window.chrome exists. Headless Chrome leaves it undefined;
+  // real/headed Chrome defines it with at least {loadTimes, csi, app}.
+  const chromeOk = raw.hasWindowChrome === true;
   rows.push({
     id: "windowChrome",
-    label: "window.chrome.runtime is defined",
+    label: "window.chrome is defined",
     status: chromeOk ? "pass" : "fail",
     required: true,
+    value: raw.hasWindowChrome,
+  });
+
+  // Informational: window.chrome.runtime. Real user browsers have it
+  // because of the extension host; a clean containerized Chrome may not.
+  // Client-side stealth (e.g. puppeteer-extra-plugin-stealth) patches it.
+  rows.push({
+    id: "windowChromeRuntime",
+    label: "window.chrome.runtime is defined (informational — client-side stealth patches this)",
+    status: "info",
+    required: false,
     value: raw.hasWindowChromeRuntime,
   });
 
