@@ -1,6 +1,6 @@
 export function parseArgs(argv) {
   const out = {
-    host: "http://localhost:9222",
+    host: "http://localhost:9322",
     json: false,
     skipSannysoft: false,
   };

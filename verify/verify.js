@@ -55,7 +55,7 @@ async function main() {
   try {
     client = await CDP({
       host: url.hostname,
-      port: Number(url.port) || 9222,
+      port: Number(url.port) || 9322,
     });
   } catch (e) {
     console.error(`could not connect to CDP at ${args.host}: ${e.message}`);

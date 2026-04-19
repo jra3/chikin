@@ -4,7 +4,7 @@ import { parseArgs } from "../args.js";
 
 test("defaults when no flags", () => {
   const a = parseArgs([]);
-  assert.equal(a.host, "http://localhost:9222");
+  assert.equal(a.host, "http://localhost:9322");
   assert.equal(a.json, false);
   assert.equal(a.skipSannysoft, false);
 });
