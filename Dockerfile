@@ -22,7 +22,6 @@ RUN groupadd -r chrome && useradd -r -g chrome -G audio,video chrome \
 
 COPY --chmod=0755 entrypoint.sh /entrypoint.sh
 
-USER chrome
 WORKDIR /data
 
 EXPOSE 9222
