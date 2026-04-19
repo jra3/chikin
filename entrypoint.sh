@@ -6,6 +6,11 @@ WINDOW_SIZE="${WINDOW_SIZE:-1920,1080}"
 DISPLAY_NUM="${DISPLAY_NUM:-99}"
 EXTRA_CHROME_ARGS="${EXTRA_CHROME_ARGS:-}"
 
+# Chrome (since ~111) ignores --remote-debugging-address=0.0.0.0 and always
+# binds to loopback. We run Chrome on a private loopback-only port and use
+# socat to bridge the publicly-advertised CDP_PORT to it.
+CHROME_LOOPBACK_PORT=9223
+
 # Xvfb wants WxHxD (e.g. 1920x1080x24). Chrome wants W,H.
 XVFB_SIZE="$(echo "$WINDOW_SIZE" | tr ',' 'x')x24"
 
@@ -24,10 +29,14 @@ done
 
 export DISPLAY=":$DISPLAY_NUM"
 
+# socat listens on every interface at CDP_PORT and forwards to Chrome's
+# loopback bind. fork lets it handle concurrent CDP clients.
+socat "TCP-LISTEN:$CDP_PORT,fork,reuseaddr" "TCP:127.0.0.1:$CHROME_LOOPBACK_PORT" &
+
 # shellcheck disable=SC2086
 exec google-chrome \
-  --remote-debugging-port="$CDP_PORT" \
-  --remote-debugging-address=0.0.0.0 \
+  --remote-debugging-port="$CHROME_LOOPBACK_PORT" \
+  --remote-allow-origins=* \
   --user-data-dir=/data \
   --no-first-run \
   --no-default-browser-check \
