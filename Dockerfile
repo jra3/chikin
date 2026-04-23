@@ -1,5 +1,6 @@
 FROM debian:bookworm-slim
 
+ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -10,11 +11,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libnss3 libpango-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 \
       libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 \
       libxrender1 libxss1 libxtst6 xdg-utils \
-  && wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
-       | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-  && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
-       > /etc/apt/sources.list.d/google-chrome.list \
-  && apt-get update && apt-get install -y --no-install-recommends google-chrome-stable \
+  && if [ "$TARGETARCH" = "amd64" ]; then \
+       wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
+         | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg && \
+       echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+         > /etc/apt/sources.list.d/google-chrome.list && \
+       apt-get update && apt-get install -y --no-install-recommends google-chrome-stable; \
+     elif [ "$TARGETARCH" = "arm64" ]; then \
+       apt-get install -y --no-install-recommends chromium && \
+       ln -sf /usr/bin/chromium /usr/local/bin/google-chrome; \
+     else \
+       echo "chikin: unsupported TARGETARCH=$TARGETARCH" >&2 && exit 1; \
+     fi \
   && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -r chrome \

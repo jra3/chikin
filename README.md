@@ -8,14 +8,30 @@ Real (non-headless) Google Chrome in a Docker container, exposing the [Chrome De
 - CDP endpoint on `127.0.0.1:9322`.
 - No `HeadlessChrome` in the User-Agent.
 - `navigator.webdriver` is `undefined` (not `true`) thanks to `--disable-blink-features=AutomationControlled`.
-- `window.chrome` is defined (headless Chrome leaves it undefined).
+- `window.chrome` is defined. Note: modern `--headless=new` also defines this, so it's no longer a reliable headless/headed discriminator — the UA check above is the strong signal.
 - A `verify.js` script that proves the above.
 
 ## What you do NOT get
 
 - Deep stealth. `window.chrome.runtime` is missing (real browsers populate it via the extension host); WebGL vendor/renderer report SwiftShader or null; `navigator.plugins` is Chrome's default without spoofed additions. That's a client-side concern — use [`puppeteer-extra-plugin-stealth`](https://github.com/berstend/puppeteer-extra/tree/master/packages/puppeteer-extra-plugin-stealth), [`playwright-extra`](https://github.com/berstend/puppeteer-extra/tree/master/packages/playwright-extra), or your own `Page.addScriptToEvaluateOnNewDocument` injection.
-- Multi-arch. amd64 only.
 - Defense against sophisticated fingerprinters (mouse entropy, TLS fingerprinting). This is a cat-and-mouse game.
+
+## Architecture & platforms
+
+The image is published as a multi-arch manifest covering:
+
+- **linux/amd64** — Google Chrome stable. The default path; behaves exactly as Google ships Chrome on Linux.
+- **linux/arm64** — Debian's Chromium package. Google does not publish `google-chrome-stable` for Linux arm64, so true-native arm64 means Chromium. The User-Agent says `Chromium/<ver>` instead of `Chrome/<ver>`, and the proprietary codecs Google bundles (H.264, AAC) are absent. The anti-detection signals chikin actually targets — absence of `HeadlessChrome`, `navigator.webdriver`, `navigator.plugins` populated — are upstream Blink and behave identically.
+
+On **Apple Silicon Macs**, `docker compose up` pulls the arm64 image natively; no Rosetta emulation. On **Linux ARM**, same thing.
+
+If you specifically need Google-branded Chrome on arm64 (e.g. a site that checks the UA for `Chrome/`), that's outside chikin's scope — you'd need a different base or a client-side UA override.
+
+## Prerequisites
+
+- Docker 20.10+ with Compose v2 (the `docker compose` subcommand, not the older `docker-compose` standalone).
+- Node.js ≥ 20 for `verify.js` (host-side, not inside the container).
+- ~1.5 GB disk for the first build. First `docker compose up -d` takes 2–4 minutes to install Chrome/Chromium; subsequent starts are instant.
 
 ## Quickstart
 
