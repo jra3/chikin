@@ -32,7 +32,7 @@ If the verify script exits `0`, the container is doing its job.
 ```yaml
 services:
   chrome:
-    image: ghcr.io/<OWNER>/chikin:latest
+    image: ghcr.io/jra3/chikin:latest
     container_name: chikin
     restart: unless-stopped
     shm_size: "2gb"
@@ -44,8 +44,6 @@ services:
 volumes:
   chikin-data:
 ```
-
-Replace `<OWNER>` with the GitHub user/org that publishes this repo.
 
 ## Configuration
 
