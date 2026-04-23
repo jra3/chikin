@@ -43,10 +43,18 @@ test("empty languages → fail", () => {
   assert.equal(row.status, "fail");
 });
 
-test("no window.chrome → fail", () => {
-  const rows = interpretProbe({ ...goodRaw, hasWindowChrome: false });
-  const row = rows.find((r) => r.id === "windowChrome");
-  assert.equal(row.status, "fail");
+test("windowChrome is informational, never required", () => {
+  const presentRows = interpretProbe({ ...goodRaw, hasWindowChrome: true });
+  const present = presentRows.find((r) => r.id === "windowChrome");
+  assert.equal(present.required, false);
+  assert.equal(present.status, "info");
+  assert.equal(present.value, true);
+
+  const absentRows = interpretProbe({ ...goodRaw, hasWindowChrome: false });
+  const absent = absentRows.find((r) => r.id === "windowChrome");
+  assert.equal(absent.required, false);
+  assert.equal(absent.status, "info");
+  assert.equal(absent.value, false);
 });
 
 test("window.chrome.runtime is informational, never required", () => {

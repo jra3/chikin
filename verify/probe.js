@@ -56,14 +56,14 @@ export function interpretProbe(raw) {
     value: raw.languages,
   });
 
-  // Required: window.chrome exists. Headless Chrome leaves it undefined;
-  // real/headed Chrome defines it with at least {loadTimes, csi, app}.
-  const chromeOk = raw.hasWindowChrome === true;
+  // Informational: window.chrome is defined on headed Chrome, Chromium, and
+  // modern --headless=new. It's undefined only on legacy --headless (pre-2023).
+  // The UA substring check above is the strong, version-stable signal.
   rows.push({
     id: "windowChrome",
-    label: "window.chrome is defined",
-    status: chromeOk ? "pass" : "fail",
-    required: true,
+    label: "window.chrome is defined (informational — undefined only on legacy --headless)",
+    status: "info",
+    required: false,
     value: raw.hasWindowChrome,
   });
 
