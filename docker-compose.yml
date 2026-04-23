@@ -14,11 +14,17 @@ services:
       EXTRA_CHROME_ARGS: "${EXTRA_CHROME_ARGS:-}"
     volumes:
       - chikin-data:/data
+    networks:
+      - chikin-net
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:${CDP_PORT:-9222}/json/version >/dev/null"]
       interval: 10s
       timeout: 3s
       retries: 5
+
+networks:
+  chikin-net:
+    driver: bridge
 
 volumes:
   chikin-data:
