@@ -1,4 +1,17 @@
 services:
+  # One-shot: Docker auto-creates /tmp/chikin-shared as root:root 0755 if it
+  # doesn't exist, which blocks the chrome user (UID 997) from writing. This
+  # sidecar runs as root and flips it to 1777 sticky before chrome starts.
+  # Idempotent — safe to re-run every `up`.
+  shared-init:
+    image: busybox
+    container_name: chikin-shared-init
+    user: root
+    command: ["chmod", "1777", "/shared"]
+    volumes:
+      - /tmp/chikin-shared:/shared
+    restart: "no"
+
   chrome:
     build: .
     image: chikin:local
@@ -14,6 +27,21 @@ services:
       EXTRA_CHROME_ARGS: "${EXTRA_CHROME_ARGS:-}"
     volumes:
       - chikin-data:/data
+      # Shared scratch dir between host and container.
+      # - Host side: /tmp/chikin-shared (1777 world-writable, sticky like /tmp)
+      # - Container side: /shared (rw)
+      # - Container side: /home/chrome/Downloads (rw, same dir) — so Chrome's
+      #   downloads land here AND host can read/write the same files.
+      # Workflow:
+      #   * host -> container: copy file into /tmp/chikin-shared, then call
+      #     upload_file with /shared/foo.jpg. Chrome (UID 997) reads via the bind.
+      #   * container -> host: Chrome download dialog -> /home/chrome/Downloads
+      #     -> appears on host at /tmp/chikin-shared.
+      - /tmp/chikin-shared:/shared:rw
+      - /tmp/chikin-shared:/home/chrome/Downloads:rw
+    depends_on:
+      shared-init:
+        condition: service_completed_successfully
     networks:
       - chikin-net
     healthcheck:
