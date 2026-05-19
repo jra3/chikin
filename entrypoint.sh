@@ -5,6 +5,7 @@ CDP_PORT="${CDP_PORT:-9222}"
 WINDOW_SIZE="${WINDOW_SIZE:-1920,1080}"
 DISPLAY_NUM="${DISPLAY_NUM:-99}"
 EXTRA_CHROME_ARGS="${EXTRA_CHROME_ARGS:-}"
+NOVNC_PORT="${NOVNC_PORT:-6080}"
 
 # Chrome (since ~111) ignores --remote-debugging-address=0.0.0.0 and always
 # binds to loopback. We run Chrome on a private loopback-only port and use
@@ -32,6 +33,16 @@ export DISPLAY=":$DISPLAY_NUM"
 # socat listens on every interface at CDP_PORT and forwards to Chrome's
 # loopback bind. fork lets it handle concurrent CDP clients.
 socat "TCP-LISTEN:$CDP_PORT,fork,reuseaddr" "TCP:127.0.0.1:$CHROME_LOOPBACK_PORT" &
+
+# x11vnc attaches to the Xvfb display so a human can drive Chrome (e.g. to
+# solve a captcha). Bound to localhost inside the container; websockify below
+# is what the host actually talks to, so no auth on the VNC port is fine.
+x11vnc -display ":$DISPLAY_NUM" -forever -shared -nopw -localhost \
+       -rfbport 5900 -quiet -bg
+
+# noVNC: websockify serves the static noVNC client over HTTP and upgrades to
+# a websocket that proxies to x11vnc. Open http://<host>:$NOVNC_PORT/vnc.html.
+websockify --web=/usr/share/novnc "$NOVNC_PORT" localhost:5900 &
 
 # shellcheck disable=SC2086
 exec google-chrome \

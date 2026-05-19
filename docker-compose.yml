@@ -1,7 +1,7 @@
 services:
   # One-shot: Docker auto-creates /tmp/chikin-shared as root:root 0755 if it
-  # doesn't exist, which blocks the chrome user (UID 997) from writing. This
-  # sidecar runs as root and flips it to 1777 sticky before chrome starts.
+  # doesn't exist, which blocks the chrome user from writing. This sidecar
+  # runs as root and flips it to 1777 sticky before chrome starts.
   # Idempotent — safe to re-run every `up`.
   shared-init:
     image: busybox
@@ -12,6 +12,19 @@ services:
       - /tmp/chikin-shared:/shared
     restart: "no"
 
+  # One-shot: chown the persistent chrome profile volume to chrome's pinned
+  # UID (1100). Earlier images shipped with a non-pinned UID, so volumes
+  # created back then can be owned by a stale UID — this corrects them on
+  # first up. Idempotent.
+  data-init:
+    image: busybox
+    container_name: chikin-data-init
+    user: root
+    command: ["chown", "-R", "1100:1100", "/data"]
+    volumes:
+      - chikin-data:/data
+    restart: "no"
+
   chrome:
     build: .
     image: chikin:local
@@ -20,11 +33,13 @@ services:
     shm_size: "2gb"
     ports:
       - "127.0.0.1:9322:9222"   # host:container. Never change host side to 0.0.0.0.
+      - "127.0.0.1:6080:6080"   # noVNC web client — open http://localhost:6080/vnc.html
     environment:
       CDP_PORT: "${CDP_PORT:-9222}"
       WINDOW_SIZE: "${WINDOW_SIZE:-1920,1080}"
       DISPLAY_NUM: "${DISPLAY_NUM:-99}"
       EXTRA_CHROME_ARGS: "${EXTRA_CHROME_ARGS:-}"
+      NOVNC_PORT: "${NOVNC_PORT:-6080}"
     volumes:
       - chikin-data:/data
       # Shared scratch dir between host and container.
@@ -34,13 +49,28 @@ services:
       #   downloads land here AND host can read/write the same files.
       # Workflow:
       #   * host -> container: copy file into /tmp/chikin-shared, then call
-      #     upload_file with /shared/foo.jpg. Chrome (UID 997) reads via the bind.
+      #     upload_file with /tmp/chikin-shared/foo.jpg — same string works
+      #     on both sides because of the mirrored mount below. (/shared also
+      #     works inside the container, but it fails MCP workspace-root
+      #     validation on the host, so prefer the mirrored path.)
       #   * container -> host: Chrome download dialog -> /home/chrome/Downloads
       #     -> appears on host at /tmp/chikin-shared.
       - /tmp/chikin-shared:/shared:rw
       - /tmp/chikin-shared:/home/chrome/Downloads:rw
+      # Mirror host path inside the container so chrome-devtools-mcp's
+      # upload_file (which passes the path verbatim to Chrome via CDP) can
+      # find files written by the host using the same /tmp/chikin-shared/*
+      # path the MCP validator accepts.
+      - /tmp/chikin-shared:/tmp/chikin-shared:rw
+      # Mirror /home/jallen/tmp into the container at the same path so files
+      # placed there by Claude Code (which has /home/jallen/tmp as a workspace
+      # root for upload_file validation) are also readable by Chrome when CDP
+      # passes the path verbatim during file-input uploads.
+      - /home/jallen/tmp:/home/jallen/tmp:rw
     depends_on:
       shared-init:
+        condition: service_completed_successfully
+      data-init:
         condition: service_completed_successfully
     networks:
       - chikin-net
