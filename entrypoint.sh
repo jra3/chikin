@@ -15,6 +15,11 @@ CHROME_LOOPBACK_PORT=9223
 # Xvfb wants WxHxD (e.g. 1920x1080x24). Chrome wants W,H.
 XVFB_SIZE="$(echo "$WINDOW_SIZE" | tr ',' 'x')x24"
 
+# Clear stale X lock+socket from a previous Xvfb that died inside this same
+# writable layer. Docker restart-policy reuses the rootfs, so a lockfile from
+# a crashed run will block the new Xvfb with "Server is already active".
+rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}"
+
 Xvfb ":$DISPLAY_NUM" -screen 0 "$XVFB_SIZE" -nolisten tcp &
 
 # Wait up to 5s for the X socket to appear.
