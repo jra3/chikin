@@ -26,6 +26,12 @@ function tokenOk(provided: string): boolean {
 }
 
 function authMiddleware(req: Request, res: Response, next: NextFunction): void {
+  // Empty token => auth disabled: accept requests with no Authorization header
+  // at all (loopback-trusted). With a token set, a valid Bearer is required.
+  if (!config.token) {
+    next();
+    return;
+  }
   const header = req.header("authorization") ?? "";
   const m = header.match(/^Bearer\s+(.+)$/i);
   if (!m || !tokenOk(m[1])) {

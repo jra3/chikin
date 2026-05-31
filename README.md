@@ -47,9 +47,11 @@ Prerequisites: Docker 20.10+ with Compose v2, and ~1.5 GB disk for the first bui
 # 1. Build the fleet Chrome image (chikin:local) used to provision browsers.
 docker compose build chrome-image
 
-# 2. Set a bearer token and bring up the gateway + socket-proxy.
+# 2. Bring up the gateway + socket-proxy.
 cp .env.example .env
-sed -i "s/^GATEWAY_TOKEN=.*/GATEWAY_TOKEN=$(openssl rand -hex 32)/" .env
+# The gateway binds 127.0.0.1 only, so a bearer is optional. Leave GATEWAY_TOKEN
+# empty for no-auth local use, or set one to require it:
+#   sed -i "s/^GATEWAY_TOKEN=.*/GATEWAY_TOKEN=$(openssl rand -hex 32)/" .env
 docker compose up -d
 
 # 3. Sanity check.
@@ -61,20 +63,28 @@ The gateway listens on `127.0.0.1:8080` only. Browsers are **not** compose servi
 
 ### Wire up a client
 
-Each client picks a name; that name *is* its persistent browser identity.
+Each client picks a name; that name *is* its persistent, isolated browser identity. Because the gateway allows only **one active session per name**, every concurrent Claude Code window must use a *distinct* name — otherwise the second one gets `409 already has an active session`.
+
+**Recommended: the `chikin-claude` launcher.** It binds a window to its own browser via Claude Code's `--mcp-config`, so windows in the *same* directory still get isolated browsers (a plain `claude mcp add` is keyed by directory and can't). Symlink it onto your `PATH`:
 
 ```bash
-TOKEN=$(grep GATEWAY_TOKEN .env | cut -d= -f2)
+ln -s "$PWD/bin/chikin-claude" ~/.local/bin/chikin-claude
 
-# Claude Code instance "alice":
-claude mcp add --transport http chikin \
-  http://localhost:8080/b/alice/ \
-  --header "Authorization: Bearer $TOKEN"
+chikin-claude alice            # this window drives an isolated browser "alice"
+chikin-claude bob --continue   # a different window → fully isolated "bob"
+```
 
-# Another instance, fully isolated profile "bob":
-claude mcp add --transport http chikin \
-  http://localhost:8080/b/bob/ \
-  --header "Authorization: Bearer $TOKEN"
+Set `CHIKIN_GATEWAY` if the gateway isn't at `http://localhost:8080`. If `GATEWAY_TOKEN` is set, export it as `CHIKIN_TOKEN` and the launcher adds the bearer header.
+
+**Or persist it with `claude mcp add`** (one browser per *directory* — fine if each task lives in its own dir):
+
+```bash
+# no-auth (default): no header needed
+claude mcp add --transport http chikin http://localhost:8080/b/alice/
+
+# with a token set:
+claude mcp add --transport http chikin http://localhost:8080/b/alice/ \
+  --header "Authorization: Bearer $(grep GATEWAY_TOKEN .env | cut -d= -f2)"
 ```
 
 The first tool call provisions and starts the browser (a few seconds). From then on, `alice` always gets the same profile. Disconnect and the browser stays warm for a fast reconnect; leave it idle past `IDLE_TTL_SEC` with no client attached and it's stopped (the profile volume is preserved, so reconnecting restores everything).
@@ -95,7 +105,7 @@ Set in `.env` (see `.env.example`) or the environment.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GATEWAY_TOKEN` | *(required)* | Bearer token clients must present. Generate with `openssl rand -hex 32`. Empty disables auth (dev only). |
+| `GATEWAY_TOKEN` | *(empty)* | Bearer token clients must present. **Empty disables auth** — safe because the port is bound to `127.0.0.1`. Set one (`openssl rand -hex 32`) to require it. |
 | `MAX_FLEET` | `8` | Max concurrent browsers. Provisioning past the cap is rejected with HTTP 429 instead of OOMing the host. |
 | `IDLE_TTL_SEC` | `900` | Idle seconds (no attached client stream) before a browser is reaped. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |

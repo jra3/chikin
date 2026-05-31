@@ -66,7 +66,9 @@ services:
       # Bind all interfaces *inside* the container; the host-side mapping below
       # (127.0.0.1:8080) is what restricts reachability to loopback.
       HOST: "0.0.0.0"
-      GATEWAY_TOKEN: "${GATEWAY_TOKEN:?set GATEWAY_TOKEN (e.g. in a .env file)}"
+      # Empty disables bearer auth — fine because the published port is bound to
+      # 127.0.0.1 only (loopback-trusted). Set a token to require one.
+      GATEWAY_TOKEN: "${GATEWAY_TOKEN:-}"
       MAX_FLEET: "${MAX_FLEET:-8}"
       IDLE_TTL_SEC: "${IDLE_TTL_SEC:-900}"
       REAP_INTERVAL_SEC: "${REAP_INTERVAL_SEC:-30}"

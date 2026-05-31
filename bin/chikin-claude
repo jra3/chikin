@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# chikin-claude <browser-name> [claude args...]
+#
+# Launch Claude Code with its OWN isolated chikin browser. Each <browser-name>
+# maps to a dedicated Chrome container + sticky profile behind the gateway
+# (container chikin-chrome-<name>, volume chikin-profile-<name>). Two windows
+# with different names get fully isolated browsers and never collide on the
+# gateway's one-session-per-name lock — this is the whole point of the fleet.
+#
+# The MCP server is always called "chikin" inside the window (stable toolset
+# name); only the browser identity (the URL path) varies per name.
+#
+# Examples:
+#   chikin-claude giard            # window driving browser "giard"
+#   chikin-claude carey --continue # resume, driving an isolated "carey" browser
+#
+# Env:
+#   CHIKIN_GATEWAY   gateway base URL (default http://localhost:8080)
+#   CHIKIN_TOKEN     bearer token, if the gateway has GATEWAY_TOKEN set
+set -euo pipefail
+
+NAME="${1:-}"
+if [[ -z "$NAME" ]] || ! [[ "$NAME" =~ ^[a-z0-9-]{1,32}$ ]]; then
+  echo "usage: chikin-claude <name> [claude args...]   (name: [a-z0-9-], 1-32 chars)" >&2
+  exit 64
+fi
+shift
+
+GATEWAY="${CHIKIN_GATEWAY:-http://localhost:8080}"
+
+# Stable per-name config file so --continue/--resume and repeated launches reuse
+# the same definition (and exec doesn't leak a tmpfile).
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/chikin"
+mkdir -p "$CFG_DIR"
+CFG="$CFG_DIR/${NAME}.json"
+
+# Optional bearer header (only if the gateway requires a token).
+HEADERS=""
+if [[ -n "${CHIKIN_TOKEN:-}" ]]; then
+  HEADERS=$(printf '"headers": { "Authorization": "Bearer %s" },' "$CHIKIN_TOKEN")
+fi
+
+cat > "$CFG" <<JSON
+{
+  "mcpServers": {
+    "chikin": {
+      "type": "http",
+      ${HEADERS}
+      "url": "${GATEWAY}/b/${NAME}/"
+    }
+  }
+}
+JSON
+
+exec claude --mcp-config "$CFG" "$@"
