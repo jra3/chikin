@@ -99,8 +99,20 @@ export function createApp(deps: ServerDeps): express.Express {
 
     // Single active session per name (issue #6) — claim synchronously.
     if (!deps.registry.reserve(name)) {
-      res.status(409).json(rpcError(RPC.BUSY, `browser '${name}' already has an active session`));
-      return;
+      // Name is taken. If the current holder has NO attached event stream, it's
+      // a stale session from an unclean disconnect (client vanished without a
+      // DELETE) — reclaim it instead of rejecting, so reconnects don't 409.
+      // A genuinely attached client (streams > 0) or an in-flight provision
+      // (pending, no live session) still gets a 409.
+      const existing = deps.registry.getByName(name);
+      const act = deps.registry.getActivity(name);
+      if (existing && (!act || act.streams === 0)) {
+        await existing.close("reclaimed by new client (stale session)");
+      }
+      if (!deps.registry.reserve(name)) {
+        res.status(409).json(rpcError(RPC.BUSY, `browser '${name}' already has an active session`));
+        return;
+      }
     }
 
     let session;
@@ -130,7 +142,14 @@ export function createApp(deps: ServerDeps): express.Express {
       return;
     }
     deps.registry.streamOpened(session.name);
-    res.on("close", () => deps.registry.streamClosed(session.name));
+    res.on("close", () => {
+      deps.registry.streamClosed(session.name);
+      // Client disconnected its event stream: tear the session down so the
+      // single-session lock frees immediately and a reconnect isn't blocked by
+      // a stale session. The container stays warm (the activity record persists
+      // for the reaper), so reconnect is fast and the profile is preserved.
+      void session.close("client disconnected (event stream closed)");
+    });
     await session.http.handleRequest(req, res);
   });
 
