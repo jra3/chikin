@@ -1,8 +1,29 @@
+name: chikin
+
+# Multi-Chrome MCP gateway fleet.
+#
+#   host Claude Code ──HTTP/MCP+bearer──► gateway (127.0.0.1:8080)
+#                                            │ scoped docker API (socket-proxy)
+#                                            └─ provisions chikin-chrome-<name>
+#                                               on demand (internal chikin-net)
+#
+# Bring up the control plane:
+#   docker compose build chrome-image    # builds chikin:local (the fleet image)
+#   GATEWAY_TOKEN=... docker compose up -d
+# Browsers are created on demand by the gateway; they are NOT compose services.
+
 services:
-  # One-shot: Docker auto-creates /tmp/chikin-shared as root:root 0755 if it
-  # doesn't exist, which blocks the chrome user (UID 997) from writing. This
-  # sidecar runs as root and flips it to 1777 sticky before chrome starts.
-  # Idempotent — safe to re-run every `up`.
+  # Build-only helper: produces the chikin:local fleet image. Never started
+  # (the gateway provisions chrome containers from this image at runtime).
+  chrome-image:
+    build: .
+    image: chikin:local
+    profiles: ["build"]
+    entrypoint: ["true"]
+    restart: "no"
+
+  # One-shot: make the shared scratch dir world-writable (1777, sticky) before
+  # any browser mounts it as ~/Downloads. Idempotent — safe every `up`.
   shared-init:
     image: busybox
     container_name: chikin-shared-init
@@ -12,47 +33,80 @@ services:
       - /tmp/chikin-shared:/shared
     restart: "no"
 
-  chrome:
-    build: .
-    image: chikin:local
-    container_name: chikin
-    restart: unless-stopped
-    shm_size: "2gb"
-    ports:
-      - "127.0.0.1:9322:9222"   # host:container. Never change host side to 0.0.0.0.
+  # Scoped Docker API. The gateway provisions browsers through this proxy, never
+  # the raw socket. Read-only socket mount; only the path groups we need are
+  # enabled (containers + volumes + images + networks; POST for create/start/
+  # stop). No EXEC, no host info, no swarm, etc.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: chikin-socket-proxy
     environment:
-      CDP_PORT: "${CDP_PORT:-9222}"
-      WINDOW_SIZE: "${WINDOW_SIZE:-1920,1080}"
-      DISPLAY_NUM: "${DISPLAY_NUM:-99}"
-      EXTRA_CHROME_ARGS: "${EXTRA_CHROME_ARGS:-}"
+      CONTAINERS: "1"
+      VOLUMES: "1"
+      IMAGES: "1"
+      NETWORKS: "1"
+      POST: "1"
     volumes:
-      - chikin-data:/data
-      # Shared scratch dir between host and container.
-      # - Host side: /tmp/chikin-shared (1777 world-writable, sticky like /tmp)
-      # - Container side: /shared (rw)
-      # - Container side: /home/chrome/Downloads (rw, same dir) — so Chrome's
-      #   downloads land here AND host can read/write the same files.
-      # Workflow:
-      #   * host -> container: copy file into /tmp/chikin-shared, then call
-      #     upload_file with /shared/foo.jpg. Chrome (UID 997) reads via the bind.
-      #   * container -> host: Chrome download dialog -> /home/chrome/Downloads
-      #     -> appears on host at /tmp/chikin-shared.
-      - /tmp/chikin-shared:/shared:rw
-      - /tmp/chikin-shared:/home/chrome/Downloads:rw
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - chikin-net
+    restart: unless-stopped
+
+  gateway:
+    build: ./gateway
+    image: chikin-gateway:local
+    container_name: chikin-gateway
+    init: true
+    restart: unless-stopped
+    ports:
+      # Loopback only. MCP is bearer-protected; the dashboard/VNC proxy are
+      # loopback-trusted. Never change the host side to 0.0.0.0.
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Bind all interfaces *inside* the container; the host-side mapping below
+      # (127.0.0.1:8080) is what restricts reachability to loopback.
+      HOST: "0.0.0.0"
+      GATEWAY_TOKEN: "${GATEWAY_TOKEN:?set GATEWAY_TOKEN (e.g. in a .env file)}"
+      MAX_FLEET: "${MAX_FLEET:-8}"
+      IDLE_TTL_SEC: "${IDLE_TTL_SEC:-900}"
+      REAP_INTERVAL_SEC: "${REAP_INTERVAL_SEC:-30}"
+      PROVISION_TIMEOUT_SEC: "${PROVISION_TIMEOUT_SEC:-90}"
+      WINDOW_SIZE: "${WINDOW_SIZE:-1920,1080}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      CHROME_IMAGE: "chikin:local"
+      CHIKIN_NETWORK: "chikin-net"
+      CHIKIN_EGRESS_NETWORK: "chikin-egress"
+      SHARED_DIR: "/tmp/chikin-shared"
+      DOCKER_PROXY_HOST: "docker-socket-proxy"
+      DOCKER_PROXY_PORT: "2375"
     depends_on:
       shared-init:
         condition: service_completed_successfully
+      docker-socket-proxy:
+        condition: service_started
     networks:
+      # chikin-net (internal) reaches the socket-proxy and the chrome CDP
+      # endpoints; chikin-egress is non-internal so the published 8080 port can
+      # actually accept ingress from the host (internal-only nets can't).
       - chikin-net
+      - chikin-egress
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:${CDP_PORT:-9222}/json/version >/dev/null"]
+      test:
+        - "CMD"
+        - "node"
+        - "-e"
+        - "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
       interval: 10s
       timeout: 3s
       retries: 5
 
 networks:
+  # Control plane: gateway <-> socket-proxy <-> chrome CDP. internal: true means
+  # no external connectivity, so a no-auth CDP endpoint can never be reached
+  # from outside Docker. The gateway's published port (ingress) still works.
   chikin-net:
-    driver: bridge
-
-volumes:
-  chikin-data:
+    name: chikin-net
+    internal: true
+  # Egress: gives provisioned browsers real internet access for browsing.
+  chikin-egress:
+    name: chikin-egress
