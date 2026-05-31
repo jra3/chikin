@@ -63,31 +63,28 @@ The gateway listens on `127.0.0.1:8080` only. Browsers are **not** compose servi
 
 ### Wire up a client
 
-Each client picks a name; that name *is* its persistent, isolated browser identity. Because the gateway allows only **one active session per name**, every concurrent Claude Code window must use a *distinct* name — otherwise the second one gets `409 already has an active session`.
-
-**Recommended: the `chikin-claude` launcher.** It binds a window to its own browser via Claude Code's `--mcp-config`, so windows in the *same* directory still get isolated browsers (a plain `claude mcp add` is keyed by directory and can't). Symlink it onto your `PATH`:
+Install once, and **every** Claude Code instance automatically gets its own multiplexed browser — no per-window config. A small stdio↔HTTP bridge (`bin/chikin-mcp`) derives a unique name per instance (`inst-<pid>`, overridable) and registers as one user-scope MCP server:
 
 ```bash
+# bridge deps + put the helpers on your PATH
+( cd client && npm install --omit=dev )
+ln -s "$PWD/bin/chikin-mcp"    ~/.local/bin/chikin-mcp
 ln -s "$PWD/bin/chikin-claude" ~/.local/bin/chikin-claude
 
-chikin-claude alice            # this window drives an isolated browser "alice"
-chikin-claude bob --continue   # a different window → fully isolated "bob"
+# register the gateway once, for all projects
+claude mcp add --scope user chikin -- ~/.local/bin/chikin-mcp
 ```
 
-Set `CHIKIN_GATEWAY` if the gateway isn't at `http://localhost:8080`. If `GATEWAY_TOKEN` is set, export it as `CHIKIN_TOKEN` and the launcher adds the bearer header.
-
-**Or persist it with `claude mcp add`** (one browser per *directory* — fine if each task lives in its own dir):
+Now any `claude` instance — even several in the same directory — connects to its own isolated browser, and the gateway multiplexes them (up to `MAX_FLEET`). The default name `inst-<pid>` is unique per running instance; **pin a sticky, persistent browser** by name with the wrapper (it just exports `CHIKIN_NAME`):
 
 ```bash
-# no-auth (default): no header needed
-claude mcp add --transport http chikin http://localhost:8080/b/alice/
-
-# with a token set:
-claude mcp add --transport http chikin http://localhost:8080/b/alice/ \
-  --header "Authorization: Bearer $(grep GATEWAY_TOKEN .env | cut -d= -f2)"
+chikin-claude giard            # this instance drives the sticky "giard" profile
+chikin-claude carey --continue # another instance, isolated "carey"
 ```
 
-The first tool call provisions and starts the browser (a few seconds). From then on, `alice` always gets the same profile. Disconnect and the browser stays warm for a fast reconnect; leave it idle past `IDLE_TTL_SEC` with no client attached and it's stopped (the profile volume is preserved, so reconnecting restores everything).
+Env (read by `chikin-mcp`): `CHIKIN_GATEWAY` (default `http://localhost:8080`), `CHIKIN_NAME` (explicit browser name), `CHIKIN_TOKEN` (bearer, only if `GATEWAY_TOKEN` is set).
+
+The first tool call provisions and starts the browser (a few seconds). A named browser (`giard`) always gets the same profile. Disconnect and the browser stays warm for a fast reconnect; leave it idle past `IDLE_TTL_SEC` with no client attached and it's stopped (the profile volume is preserved, so reconnecting restores everything).
 
 ### Watch a browser / solve a captcha
 
