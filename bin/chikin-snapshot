@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# chikin-snapshot [golden-name]
+#
+# Capture a logged-in "golden" browser profile as the fleet seed. Every NEW
+# browser the gateway provisions is then cloned from this seed, so it starts
+# already logged in (SEED_VOLUME=chikin-seed must be set for the gateway).
+#
+# Workflow:
+#   chikin-claude golden        # launch the golden browser
+#   #  -> log into your sites by hand at http://localhost:8080/vnc/golden/
+#   chikin-snapshot             # freeze it as the seed
+#   #  -> refresh anytime by logging back in and re-running this
+#
+# Cookies decrypt in the cloned browsers because every container uses Chrome's
+# keyring-less `basic` password store and the os_crypt key travels in Local State.
+#
+# Env: CHIKIN_SEED_VOLUME (default chikin-seed), CHIKIN_IMAGE (default chikin:local)
+set -euo pipefail
+
+GOLDEN="${1:-golden}"
+SRC="chikin-profile-${GOLDEN}"
+SEED="${CHIKIN_SEED_VOLUME:-chikin-seed}"
+IMG="${CHIKIN_IMAGE:-chikin:local}"
+CONTAINER="chikin-chrome-${GOLDEN}"
+
+if ! docker volume inspect "$SRC" >/dev/null 2>&1; then
+  echo "chikin-snapshot: no profile volume '$SRC'." >&2
+  echo "  Launch it first:  chikin-claude ${GOLDEN}   then log in via http://localhost:8080/vnc/${GOLDEN}/" >&2
+  exit 1
+fi
+
+# Copy the profile LIVE — do NOT stop golden. Stopping Chrome discards in-memory
+# session cookies, which logs the clones out of sites that don't offer a
+# "remember me" option (FamilySearch, Findmypast, Arcanum, AGATHA, ...). A live
+# copy preserves them. Just make sure golden is IDLE (you've finished logging in)
+# so the SQLite cookie DB isn't mid-write when we copy it.
+if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+  echo "chikin-snapshot: copying ${CONTAINER} live (leave it running)..."
+else
+  echo "chikin-snapshot: note: ${CONTAINER} not running; snapshotting its volume as-is." >&2
+fi
+
+docker volume create "$SEED" >/dev/null
+
+echo "chikin-snapshot: copying ${SRC} -> ${SEED} ..."
+docker run --rm --network none \
+  -v "${SRC}:/seed:ro" -v "${SEED}:/data" \
+  --entrypoint /bin/sh "$IMG" -c '
+    set -e
+    rm -rf /data/* /data/.[!.]* 2>/dev/null || true
+    cp -a /seed/. /data/
+    # strip instance locks, saved tabs/session, and caches (not needed for logins)
+    rm -f /data/SingletonLock /data/SingletonSocket /data/SingletonCookie
+    rm -rf "/data/Default/Cache" "/data/Default/Code Cache" "/data/Default/GPUCache" \
+           "/data/Default/Service Worker/CacheStorage" \
+           /data/Default/Sessions "/data/Default/Current Session" "/data/Default/Current Tabs" \
+           "/data/Default/Last Session" "/data/Default/Last Tabs"
+    echo "chikin-snapshot: seed size $(du -sh /data | cut -f1)"
+  '
+
+echo "chikin-snapshot: done. New browsers will clone from '${SEED}'."
+echo "  (Already-running browsers keep their current profile; only new ones are seeded.)"

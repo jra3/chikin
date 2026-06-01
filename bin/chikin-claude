@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# chikin-claude <browser-name> [claude args...]
+#
+# Launch Claude Code pinned to a SPECIFIC sticky chikin browser <name> (its own
+# container chikin-chrome-<name> + persistent profile volume chikin-profile-<name>).
+#
+# This is just sugar over the user-scope `chikin` MCP server: it exports
+# CHIKIN_NAME so this instance uses the named browser instead of the default
+# per-instance inst-<pid>. A plain `claude` already gets its own unique browser.
+#
+# Requires the user-scope server to be registered once:
+#   claude mcp add --scope user chikin -- ~/.local/bin/chikin-mcp
+#
+# Examples:
+#   chikin-claude giard            # drive sticky browser "giard"
+#   chikin-claude carey --continue # resume, pinned to "carey"
+set -euo pipefail
+
+NAME="${1:-}"
+if [[ -z "$NAME" ]] || ! [[ "$NAME" =~ ^[a-z0-9-]{1,32}$ ]]; then
+  echo "usage: chikin-claude <name> [claude args...]   (name: [a-z0-9-], 1-32 chars)" >&2
+  exit 64
+fi
+shift
+
+exec env CHIKIN_NAME="$NAME" claude "$@"

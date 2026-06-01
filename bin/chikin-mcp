@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# chikin-mcp — stdio MCP server that bridges this Claude instance to its OWN
+# browser behind the chikin gateway. Register once at user scope:
+#
+#   claude mcp add --scope user chikin -- ~/.local/bin/chikin-mcp
+#
+# Then EVERY Claude instance automatically gets a unique, multiplexed browser.
+# The name defaults to inst-<claude pid> (unique per running instance, stable
+# for its lifetime). Pin a specific sticky browser by exporting CHIKIN_NAME
+# (the chikin-claude wrapper just does that for you).
+#
+# Env:
+#   CHIKIN_GATEWAY  gateway base URL (default http://localhost:8080)
+#   CHIKIN_NAME     explicit browser name (default inst-<ppid>)
+#   CHIKIN_TOKEN    bearer token, if the gateway has GATEWAY_TOKEN set
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+REPO="$(dirname "$(dirname "$SELF")")"
+
+GATEWAY="${CHIKIN_GATEWAY:-http://localhost:8080}"
+RAW="${CHIKIN_NAME:-inst-$PPID}"
+# Gateway names must match [a-z0-9-]{1,32}.
+NAME="$(printf '%s' "$RAW" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-32)"
+
+exec node "$REPO/client/bridge.mjs" "${GATEWAY}/b/${NAME}/"

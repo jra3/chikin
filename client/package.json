@@ -1,0 +1,11 @@
+{
+  "name": "chikin-client-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Transparent stdio<->HTTP MCP bridge so a stdio-only client (Claude Code) can drive a per-instance browser behind the chikin gateway.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}

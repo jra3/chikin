@@ -3,9 +3,14 @@ FROM debian:bookworm-slim
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Pin the chrome user to a fixed UID/GID so volumes created by the gateway
+# provisioner can be chowned deterministically (see gateway provisioner and
+# the self-chown fallback in entrypoint.sh).
+ENV CHROME_UID=1100 CHROME_GID=1100
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       wget gnupg ca-certificates tini xvfb socat \
-      x11vnc novnc python3-websockify \
+      x11vnc novnc websockify \
       fonts-liberation fonts-noto-color-emoji \
       libasound2 libatk-bridge2.0-0 libatk1.0-0 libcairo2 libcups2 \
       libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 \
@@ -26,20 +31,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
      fi \
   && rm -rf /var/lib/apt/lists/*
 
-# Pin the chrome UID/GID. The persistent /data volume is owned by this UID,
-# so it must stay stable across image rebuilds — otherwise newly-installed
-# system packages can claim a system-account UID and bump chrome's UID, which
-# locks it out of its own profile volume.
-RUN groupadd -g 1100 chrome \
- && useradd -u 1100 -m -d /home/chrome -g chrome -G audio,video chrome \
+# Some novnc builds ship the client only as vnc.html; symlink an index so
+# /vnc/<name>/ lands on a usable page without a query string.
+RUN if [ -f /usr/share/novnc/vnc.html ] && [ ! -e /usr/share/novnc/index.html ]; then \
+      ln -s vnc.html /usr/share/novnc/index.html; \
+    fi
+
+RUN groupadd -r -g "$CHROME_GID" chrome \
+ && useradd -r -u "$CHROME_UID" -m -d /home/chrome -g chrome -G audio,video chrome \
  && mkdir -p /data && chown -R chrome:chrome /data \
+ && mkdir -p /home/chrome/Downloads && chown -R chrome:chrome /home/chrome/Downloads \
  && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
 COPY --chmod=0755 entrypoint.sh /entrypoint.sh
 
-USER chrome
+# NOTE: the container starts as root so entrypoint.sh can self-chown the
+# /data profile volume (the gateway may provision a fresh, root-owned volume),
+# then drops to the unprivileged chrome user before launching anything.
 WORKDIR /data
 
-EXPOSE 9222
+EXPOSE 9222 6080
 
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/entrypoint.sh"]

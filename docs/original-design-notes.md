@@ -175,7 +175,7 @@ Add to your Claude Code MCP config (`~/.claude/mcp.json` or project-level equiva
 }
 ```
 
-The exact flag name varies by MCP implementation — check `npx chrome-devtools-mcp --help`. Look for one of: `--browserUrl`, `--cdp-endpoint`, `--browserWSEndpoint`. If it wants the WebSocket URL directly, fetch it:
+The connect flags are `--browserUrl` (HTTP) or `--wsEndpoint` (a full WebSocket URL). There is no `--cdp-endpoint` or `--browserWSEndpoint`. If you need the WebSocket URL directly, fetch it:
 
 ```bash
 curl -s http://localhost:9222/json/version | jq -r .webSocketDebuggerUrl
