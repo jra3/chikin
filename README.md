@@ -90,6 +90,24 @@ The first tool call provisions and starts the browser (a few seconds). A named b
 
 Open the dashboard at <http://localhost:8080/> and click **open noVNC** next to any running browser, or go straight to `http://localhost:8080/vnc/<name>/`. You can drive that Chrome window by hand — useful for logging in or clearing a captcha while the MCP client keeps the session.
 
+### Pre-authenticated browsers (golden profile)
+
+Each browser starts with a fresh profile, so you'd normally have to log into sites every time. Instead, seed every new browser from a **golden** profile you log into once:
+
+```bash
+# 1. enable seeding (gateway env) and restart
+echo 'SEED_VOLUME=chikin-seed' >> .env && docker compose up -d gateway
+
+# 2. log into your sites by hand, once
+chikin-claude golden                       # launch the golden browser
+#  -> open http://localhost:8080/vnc/golden/ and sign in to your sites
+
+# 3. freeze it as the seed
+chikin-snapshot                            # clones golden's profile -> chikin-seed
+```
+
+From then on **every new browser is cloned from the seed and starts logged in** — and the MCP automation sees those cookies (it shares the persistent profile context). Re-run `chikin-snapshot` whenever sessions expire. It works because every container uses Chrome's keyring-less `basic` cookie store, so the encryption key travels in the copied `Local State` and decrypts in the clones. Caveat: all seeded browsers share one identity, so sites that forbid concurrent sessions may re-challenge.
+
 ### Shared files
 
 Everything dropped in `/tmp/chikin-shared` on the host appears inside **every** browser as `~/Downloads` (and at the same `/tmp/chikin-shared` path, which is what `upload_file` expects). Downloads triggered in any browser land back in that host directory. Scratch files are shared across clients; only cookies/profile are per-name isolated.
@@ -104,6 +122,7 @@ Set in `.env` (see `.env.example`) or the environment.
 |---|---|---|
 | `GATEWAY_TOKEN` | *(empty)* | Bearer token clients must present. **Empty disables auth** — safe because the port is bound to `127.0.0.1`. Set one (`openssl rand -hex 32`) to require it. |
 | `MAX_FLEET` | `8` | Max concurrent browsers. Provisioning past the cap is rejected with HTTP 429 instead of OOMing the host. |
+| `SEED_VOLUME` | *(empty)* | Docker volume cloned into every new profile so browsers start logged in. Empty = off. Populate with `bin/chikin-snapshot` (see [Pre-authenticated browsers](#pre-authenticated-browsers-golden-profile)). |
 | `IDLE_TTL_SEC` | `900` | Idle seconds (no attached client stream) before a browser is reaped. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
 | `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up before failing the connect. |

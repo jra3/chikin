@@ -76,6 +76,9 @@ services:
       WINDOW_SIZE: "${WINDOW_SIZE:-1920,1080}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
       CHROME_IMAGE: "chikin:local"
+      # Golden-profile seed volume. Empty = off; set to chikin-seed and populate
+      # it with bin/chikin-snapshot to have new browsers start logged in.
+      SEED_VOLUME: "${SEED_VOLUME:-}"
       CHIKIN_NETWORK: "chikin-net"
       CHIKIN_EGRESS_NETWORK: "chikin-egress"
       SHARED_DIR: "/tmp/chikin-shared"

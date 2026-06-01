@@ -29,6 +29,10 @@ export const config = {
   // Fleet member image + network. The network name is forced (compose `name:`)
   // so the gateway and provisioned containers share one resolvable DNS domain.
   image: str("CHROME_IMAGE", "chikin:local"),
+  // Optional golden-profile seed: a Docker volume whose contents are cloned into
+  // every NEW per-name profile so browsers start already logged in. Populate it
+  // with `bin/chikin-snapshot`. Empty = disabled (browsers start fresh).
+  seedVolume: str("SEED_VOLUME", ""),
   // Control-plane network (internal: true): gateway <-> socket-proxy <-> chrome
   // CDP. Egress network gives the browsers actual internet access for browsing.
   network: str("CHIKIN_NETWORK", "chikin-net"),

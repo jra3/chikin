@@ -61,14 +61,67 @@ export class Provisioner {
     const vol = volumeName(name);
     try {
       await this.docker.getVolume(vol).inspect();
+      return; // already exists — leave its profile untouched
     } catch {
-      log.info(`provisioner: creating profile volume ${vol}`);
-      await this.docker.createVolume({
-        Name: vol,
-        Labels: { "chikin.fleet": "1", "chikin.name": name },
-      });
-      // Ownership is fixed by the container's entrypoint self-chown (it starts
-      // as root, chowns /data to the chrome UID, then drops privileges).
+      // fall through to create
+    }
+    log.info(`provisioner: creating profile volume ${vol}`);
+    await this.docker.createVolume({
+      Name: vol,
+      Labels: { "chikin.fleet": "1", "chikin.name": name },
+    });
+    // Ownership is fixed by the container's entrypoint self-chown (it starts as
+    // root, chowns /data to the chrome UID, then drops privileges).
+
+    // Seed from the golden snapshot so the browser starts logged in. Skipped if
+    // unset, if this volume *is* the seed, or if the seed doesn't exist yet.
+    const seed = config.seedVolume;
+    if (seed && seed !== vol) {
+      try {
+        await this.docker.getVolume(seed).inspect();
+        log.info(`provisioner: seeding ${vol} from ${seed}`);
+        await this.seedVolumeFrom(seed, vol);
+      } catch (e) {
+        log.warn(`provisioner: seed volume ${seed} unavailable; ${vol} starts empty`, String(e));
+      }
+    }
+  }
+
+  /**
+   * Clone a seed volume's contents into a freshly-created profile volume so a
+   * new browser starts from the golden (logged-in) profile. Cookies decrypt
+   * across containers because every browser uses the keyring-less `basic`
+   * password store (the os_crypt key travels in the copied `Local State`).
+   * Best-effort: on failure the browser just starts with an empty profile.
+   */
+  private async seedVolumeFrom(seedVol: string, targetVol: string): Promise<void> {
+    const script =
+      "set -e; cp -a /seed/. /data/ 2>/dev/null || true; " +
+      // drop instance locks + saved tabs/session so the clone opens clean (about:blank)
+      // but keeps Cookies / Login Data / Local Storage / Local State (the os_crypt key).
+      "rm -f /data/SingletonLock /data/SingletonSocket /data/SingletonCookie; " +
+      'rm -rf /data/Default/Sessions "/data/Default/Current Session" "/data/Default/Current Tabs" "/data/Default/Last Session" "/data/Default/Last Tabs"';
+    const helper = await this.docker.createContainer({
+      Image: config.image,
+      Entrypoint: ["/bin/sh", "-c"],
+      Cmd: [script],
+      User: "0:0",
+      Labels: { "chikin.fleet": "1", "chikin.seed": "1" },
+      HostConfig: {
+        Binds: [`${seedVol}:/seed:ro`, `${targetVol}:/data`],
+        NetworkMode: "none",
+        AutoRemove: true,
+      },
+    });
+    await helper.start();
+    try {
+      const res = (await helper.wait()) as { StatusCode?: number };
+      if (res?.StatusCode && res.StatusCode !== 0) {
+        log.warn(`provisioner: seed copy into ${targetVol} exited ${res.StatusCode}`);
+      }
+    } catch (e) {
+      // AutoRemove can race the wait result; the copy itself usually succeeded.
+      log.debug(`provisioner: seed copy wait (${targetVol}): ${String(e)}`);
     }
   }
 
