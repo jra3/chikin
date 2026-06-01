@@ -141,15 +141,15 @@ export function createApp(deps: ServerDeps): express.Express {
       res.status(404).json(rpcError(RPC.NOT_FOUND, "unknown or mismatched session"));
       return;
     }
+    // NOTE: do NOT close the session when the event stream closes. Claude Code
+    // (and other clients) close the standalone SSE stream while idle between
+    // tool calls but keep the logical MCP session, intending to POST more
+    // requests. Tearing the session down here would 404 the next request and
+    // hang the client. The single-session lock is freed instead by reclaiming a
+    // stale (streamless) session on the next initialize (see the POST handler),
+    // and idle containers are still reaped on the activity TTL.
     deps.registry.streamOpened(session.name);
-    res.on("close", () => {
-      deps.registry.streamClosed(session.name);
-      // Client disconnected its event stream: tear the session down so the
-      // single-session lock frees immediately and a reconnect isn't blocked by
-      // a stale session. The container stays warm (the activity record persists
-      // for the reaper), so reconnect is fast and the profile is preserved.
-      void session.close("client disconnected (event stream closed)");
-    });
+    res.on("close", () => deps.registry.streamClosed(session.name));
     await session.http.handleRequest(req, res);
   });
 
