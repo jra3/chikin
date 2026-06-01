@@ -29,11 +29,15 @@ if ! docker volume inspect "$SRC" >/dev/null 2>&1; then
   exit 1
 fi
 
-# Stop the golden browser so its cookie/login SQLite DBs are flushed and unlocked
-# (copying a live profile can capture a partial/locked DB).
+# Copy the profile LIVE — do NOT stop golden. Stopping Chrome discards in-memory
+# session cookies, which logs the clones out of sites that don't offer a
+# "remember me" option (FamilySearch, Findmypast, Arcanum, AGATHA, ...). A live
+# copy preserves them. Just make sure golden is IDLE (you've finished logging in)
+# so the SQLite cookie DB isn't mid-write when we copy it.
 if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
-  echo "chikin-snapshot: stopping ${CONTAINER} for a consistent copy..."
-  docker stop "$CONTAINER" >/dev/null
+  echo "chikin-snapshot: copying ${CONTAINER} live (leave it running)..."
+else
+  echo "chikin-snapshot: note: ${CONTAINER} not running; snapshotting its volume as-is." >&2
 fi
 
 docker volume create "$SEED" >/dev/null
