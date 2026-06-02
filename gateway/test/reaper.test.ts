@@ -6,12 +6,14 @@ import { config } from "../src/config.js";
 
 function fakeProvisioner(fleet: { name: string; state: string }[] = []) {
   const stopped: string[] = [];
+  const removed: string[] = [];
   const provisioner = {
     listFleet: async () =>
       fleet.map((m) => ({ name: m.name, containerId: m.name, state: m.state, status: m.state })),
     stopContainer: async (n: string) => void stopped.push(n),
+    removeContainer: async (n: string) => void removed.push(n),
   };
-  return { provisioner, stopped };
+  return { provisioner, stopped, removed };
 }
 
 test("reaper reclaims idle browsers but spares attached ones", async () => {
@@ -21,11 +23,12 @@ test("reaper reclaims idle browsers but spares attached ones", async () => {
   // attached: an SSE stream is open -> never reap
   reg.streamOpened("attached", 0);
 
-  const { provisioner, stopped } = fakeProvisioner();
+  const { provisioner, stopped, removed } = fakeProvisioner();
   const reaper = new Reaper(reg, provisioner as never);
   await reaper.sweep(config.idleTtlMs + 1000);
 
   assert.deepEqual(stopped, ["idle"], "only the idle, unattached browser is stopped");
+  assert.deepEqual(removed, ["idle"], "reaped container is removed, not just stopped");
   assert.equal(reg.getActivity("idle"), undefined, "idle activity dropped after reap");
   assert.ok(reg.getActivity("attached"), "attached browser preserved");
 });
