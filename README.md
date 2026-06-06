@@ -86,6 +86,20 @@ Env (read by `chikin-mcp`): `CHIKIN_GATEWAY` (default `http://localhost:8080`), 
 
 The first tool call provisions and starts the browser (a few seconds). A named browser (`giard`) always gets the same profile. Disconnect and the browser stays warm for a fast reconnect; leave it idle past `IDLE_TTL_SEC` with no client attached and it's stopped (the profile volume is preserved, so reconnecting restores everything).
 
+#### Direct HTTP transport (pin a browser, or non–Claude-Code clients)
+
+The stdio bridge above is the easy path — it auto-assigns each Claude Code instance its own browser. If instead you want to **pin a client to a specific named browser**, or wire up any MCP client that speaks streamable HTTP directly, point it at the gateway's per-browser endpoint `http://localhost:8080/b/<name>/` (`<name>` is `[a-z0-9-]+`, 1–32 chars). To configure two isolated browsers:
+
+```bash
+# Two MCP servers, two isolated profiles. Drop --header if GATEWAY_TOKEN is empty.
+claude mcp add --transport http alice http://localhost:8080/b/alice/ \
+  --header "Authorization: Bearer $GATEWAY_TOKEN"
+claude mcp add --transport http bob   http://localhost:8080/b/bob/ \
+  --header "Authorization: Bearer $GATEWAY_TOKEN"
+```
+
+`alice` and `bob` get fully isolated profiles (volumes `chikin-profile-alice`, `chikin-profile-bob`); the gateway provisions each browser on first use. Only one client may hold a given name at a time — a second concurrent connect to `alice` is rejected with `409`. This is exactly the form any streamable-HTTP MCP client uses; `chikin-mcp` is just a convenience wrapper that fills in the name (and the bearer) for you.
+
 ### Watch a browser / solve a captcha
 
 Open the dashboard at <http://localhost:8080/> and click **open noVNC** next to any running browser, or go straight to `http://localhost:8080/vnc/<name>/`. You can drive that Chrome window by hand — useful for logging in or clearing a captcha while the MCP client keeps the session.

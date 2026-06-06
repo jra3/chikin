@@ -1,18 +1,31 @@
 #!/usr/bin/env node
-// Transparent stdio<->HTTP MCP bridge, with a keepalive heartbeat.
+// Transparent, SELF-HEALING stdio<->HTTP MCP bridge with a keepalive heartbeat.
 //
-// Claude Code speaks MCP over stdio to a subprocess; the chikin gateway speaks
-// MCP over Streamable HTTP at /b/<name>/. This bridge pumps frames between the
-// two so a stdio client drives a per-instance browser behind the gateway. The
-// browser name is baked into the URL (argv[2]) by the chikin-mcp launcher.
+// Claude Code speaks MCP over stdio to this subprocess; the chikin gateway
+// speaks MCP over Streamable HTTP at /b/<name>/. This bridge pumps frames
+// between the two so a stdio client drives a per-instance browser behind the
+// gateway. The browser name is baked into the URL (argv[2]) by chikin-mcp.
+//
+// RESILIENCE (issue: a transient SSE drop must not kill the MCP server). The
+// MCP *session* (the client's one-time `initialize` handshake) lives in the
+// client and is never repeated. So when the gateway link breaks — a flaky SSE
+// stream (`TypeError: terminated`), or the gateway tearing the session down
+// because its browser/child died — we MUST NOT exit the process: Claude Code
+// does not restart a stdio MCP server mid-session, so exiting deregisters every
+// tool until a manual `/mcp` reconnect. Instead we:
+//   1. fail any in-flight request with a retryable JSON-RPC error (its result
+//      is genuinely gone), so the client unblocks instead of hanging;
+//   2. transparently rebuild the HTTP transport and REPLAY the cached
+//      `initialize` (+ `notifications/initialized`) against a fresh gateway
+//      session, swallowing the replayed responses (the client already has them);
+//   3. keep the stdio side — and the process — alive throughout.
+// The client never sees the session drop; its next tool call just works (a
+// reconnect re-provisions the browser for this name, warm profile intact).
 //
 // Heartbeat: the gateway reaps a browser after IDLE_TTL_SEC with no MCP traffic.
-// Claude Code can sit idle between tool calls far longer than that, so the
-// bridge sends a periodic `ping` to refresh the gateway-side activity clock.
-// This keeps a browser alive for as long as its window is open (the bridge runs
-// for the window's lifetime); when the window closes the bridge exits, the
-// pings stop, and the reaper reclaims the browser normally. Ping replies are
-// swallowed so they never reach the client.
+// Claude Code sits idle between tool calls far longer than that, so we send a
+// periodic `ping` to refresh the gateway-side activity clock. A failed ping is
+// just another reconnect trigger. Ping replies are swallowed.
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -27,23 +40,37 @@ const httpOpts = token
   ? { requestInit: { headers: { Authorization: `Bearer ${token}` } } }
   : undefined;
 const HEARTBEAT_MS = Number(process.env.CHIKIN_HEARTBEAT_MS || 120000);
+// Reconnect backoff bounds. We retry indefinitely (the process stays up so the
+// client keeps its tools) but never hot-loop.
+const RECONNECT_MIN_MS = Number(process.env.CHIKIN_RECONNECT_MIN_MS || 500);
+const RECONNECT_MAX_MS = Number(process.env.CHIKIN_RECONNECT_MAX_MS || 30000);
+const REPLAY_TIMEOUT_MS = Number(process.env.CHIKIN_REPLAY_TIMEOUT_MS || 20000);
 
 const log = (m) => process.stderr.write(`chikin bridge: ${m}\n`);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const stdio = new StdioServerTransport();
-const http = new StreamableHTTPClientTransport(new URL(url), httpOpts);
 
+let http = null; // current StreamableHTTPClientTransport (replaced on reconnect)
+let generation = 0; // bumped per transport so stale callbacks are ignored
 let ready = false; // client handshake complete -> safe to heartbeat
+let reconnecting = false;
+let shuttingDown = false;
+
+// The client's one-time `initialize` request, cached so we can replay it to a
+// fresh gateway session after a link loss. Without this, a rebuilt transport
+// has no MCP session and the gateway 400s every (non-initialize) request.
+let initFrame = null;
+
 const pingIds = new Set(); // internal heartbeat ids we must not forward
-// Client requests forwarded to the gateway that are still awaiting a reply. A
-// request is a frame with both a `method` and an `id`; notifications (no id)
-// and the client's own responses (no method) are not tracked. If the gateway
-// link breaks, every pending id MUST get a JSON-RPC error reply or the client
-// (Claude Code) hangs forever waiting on a tool call that will never return.
+// Client requests forwarded to the gateway still awaiting a reply. A request is
+// a frame with both `method` and `id`; notifications (no id) and the client's
+// own responses (no method) are not tracked. If the link breaks, every pending
+// id MUST get a JSON-RPC error or the client (Claude Code) hangs forever.
 const inflight = new Map();
 
-// Send a JSON-RPC error back to the client for a pending request, so it
-// unblocks instead of hanging. -32001 = "gateway link lost".
+// -32001 = "gateway link lost". Send a JSON-RPC error to the client for a
+// pending request so it unblocks instead of hanging.
 const failRequest = (id, message) => {
   inflight.delete(id);
   stdio
@@ -51,77 +78,160 @@ const failRequest = (id, message) => {
     .catch((e) => log(`->client error send failed: ${e?.message ?? e}`));
 };
 
+const failAllInflight = (message) => {
+  for (const id of [...inflight.keys()]) failRequest(id, message);
+};
+
+// Build + wire a fresh HTTP transport bound to the current generation. Stale
+// callbacks (from a transport we've already discarded) are dropped by the
+// generation check so they can't trigger a second reconnect.
+function makeHttp(gen) {
+  const h = new StreamableHTTPClientTransport(new URL(url), httpOpts);
+  h.onmessage = (m) => {
+    if (gen !== generation) return;
+    if (m && pingIds.has(m.id)) {
+      pingIds.delete(m.id); // swallow heartbeat reply
+      return;
+    }
+    if (m && m.id !== undefined) inflight.delete(m.id); // reply delivered
+    stdio.send(m).catch((e) => log(`->client send failed: ${e?.message ?? e}`));
+  };
+  h.onclose = () => {
+    if (gen !== generation || shuttingDown) return;
+    scheduleReconnect("gateway session closed");
+  };
+  h.onerror = (e) => {
+    if (gen !== generation || shuttingDown) return;
+    scheduleReconnect(`gateway error: ${e?.message ?? String(e)}`);
+  };
+  return h;
+}
+
+// Replay the cached initialize handshake against a freshly-started transport so
+// the gateway re-establishes an MCP session for this browser name. The replayed
+// responses are swallowed — the client already completed initialize once.
+function replayInitialize(h, gen) {
+  if (!initFrame) return Promise.resolve(); // client never initialized yet
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("initialize replay timed out")),
+      REPLAY_TIMEOUT_MS,
+    );
+    const prev = h.onmessage;
+    h.onmessage = (m) => {
+      if (gen !== generation) return;
+      if (m && m.id === initFrame.id) {
+        clearTimeout(timer);
+        h.onmessage = prev; // restore normal pumping
+        // Tell the gateway we're initialized, then we're live again.
+        h.send({ jsonrpc: "2.0", method: "notifications/initialized" })
+          .then(resolve)
+          .catch(reject);
+      }
+      // swallow anything else that arrives mid-replay
+    };
+    h.send(initFrame).catch(reject);
+  });
+}
+
+// Rebuild the gateway link without dropping the stdio session. Idempotent: many
+// triggers (send failure, transport close/error, heartbeat) funnel here.
+async function scheduleReconnect(why) {
+  if (shuttingDown || reconnecting) return;
+  reconnecting = true;
+  ready = false;
+  log(`reconnecting: ${why}`);
+  // Pending replies are never coming on the dead transport — unblock the client.
+  failAllInflight(`chikin gateway link reset (${why}); retry the request`);
+  try {
+    await http?.close();
+  } catch {}
+
+  let delay = RECONNECT_MIN_MS;
+  for (;;) {
+    if (shuttingDown) return;
+    const gen = ++generation;
+    const h = makeHttp(gen);
+    try {
+      await h.start();
+      await replayInitialize(h, gen);
+      http = h;
+      reconnecting = false;
+      ready = initFrame != null;
+      log(`reconnected (gen ${gen})`);
+      return;
+    } catch (e) {
+      try {
+        await h.close();
+      } catch {}
+      log(`reconnect attempt failed: ${e?.message ?? e}; retrying in ${delay}ms`);
+      await sleep(delay);
+      delay = Math.min(delay * 2, RECONNECT_MAX_MS);
+    }
+  }
+}
+
+// Client -> gateway. Cache the initialize frame; track requests so a link loss
+// can fail them; forward everything to the live transport.
 stdio.onmessage = (m) => {
+  if (m && m.method === "initialize") initFrame = m;
   if (m && m.method === "notifications/initialized") ready = true;
   const tracked = m && m.method !== undefined && m.id !== undefined && !pingIds.has(m.id);
   if (tracked) inflight.set(m.id, true);
-  http.send(m).catch((e) => {
-    const why = e?.message ?? String(e);
-    log(`->gateway send failed: ${why}`);
-    // The gateway dropped this request (e.g. the browser was reaped and the
-    // session 404s). Answer the client so it doesn't hang, then exit so the
-    // launcher respawns us — a fresh bridge re-initializes and the gateway
-    // provisions a new browser for this name.
-    if (tracked) failRequest(m.id, `chikin browser was reclaimed mid-session (${why}); session reset — retry the request`);
-    drainAndShutdown(`gateway send failed: ${why}`);
-  });
-};
-http.onmessage = (m) => {
-  if (m && pingIds.has(m.id)) {
-    pingIds.delete(m.id); // swallow heartbeat reply
+
+  const target = http;
+  if (!target || reconnecting) {
+    // Mid-reconnect: don't hang the client. Fail this request; the client
+    // retries and by then the link is usually back.
+    if (tracked) failRequest(m.id, "chikin gateway link resetting; retry the request");
     return;
   }
-  if (m && m.id !== undefined) inflight.delete(m.id); // reply delivered
-  stdio.send(m).catch((e) => log(`->client send failed: ${e?.message ?? e}`));
+  target.send(m).catch((e) => {
+    const why = e?.message ?? String(e);
+    log(`->gateway send failed: ${why}`);
+    if (tracked) failRequest(m.id, `chikin gateway send failed (${why}); retry the request`);
+    scheduleReconnect(`send failed: ${why}`);
+  });
 };
 
-let shuttingDown = false;
-// Fail any still-pending client requests, then tear down. Idempotent so the
-// several teardown triggers (send failure, gateway close/error, stdio close)
-// can all funnel here without double-exiting.
-const drainAndShutdown = (why, code = 0) => {
+// Only a genuine client disconnect (stdio closed) tears us down.
+stdio.onclose = () => shutdown("client disconnected (stdio closed)");
+
+function shutdown(why, code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
-  for (const id of inflight.keys())
-    failRequest(id, `chikin browser link lost (${why}); session reset — retry the request`);
+  failAllInflight(`chikin bridge shutting down (${why})`);
   clearInterval(hb);
   log(why);
-  http.close().catch(() => {});
-  // Give the error replies a tick to flush to stdout before exiting.
+  http?.close().catch(() => {});
   setTimeout(() => {
     stdio.close().catch(() => {});
     process.exit(code);
   }, 50).unref?.();
-};
-stdio.onclose = () => drainAndShutdown("client disconnected (stdio closed)");
-http.onclose = () => drainAndShutdown("gateway session closed");
-http.onerror = (e) => {
-  const why = e?.message ?? String(e);
-  log(`gateway error: ${why}`);
-  // A transport-level error with requests in flight means those replies are
-  // never coming — unblock the client and respawn rather than hang.
-  if (inflight.size > 0) drainAndShutdown(`gateway error: ${why}`);
-};
+}
 
-await http.start();
+// Initial connect, then start the stdio side.
+{
+  const gen = ++generation;
+  http = makeHttp(gen);
+  await http.start();
+}
 await stdio.start();
 
 let seq = 0;
 const hb = setInterval(() => {
-  if (!ready) return;
+  if (!ready || reconnecting || !http) return;
   const id = `chikin-hb-${++seq}`;
   pingIds.add(id);
   http.send({ jsonrpc: "2.0", id, method: "ping" }).catch((e) => {
     pingIds.delete(id);
     const why = e?.message ?? String(e);
     log(`heartbeat failed: ${why}`);
-    // A failed ping means the gateway session is dead (or the browser already
-    // reaped). Respawn now — within HEARTBEAT_MS, well before the idle-reap
-    // window and before the client's next call — instead of silently letting
-    // activity go stale until the next real request hangs.
-    drainAndShutdown(`heartbeat failed: ${why}`);
+    // A failed ping means the gateway session is dead (or browser reaped).
+    // Reconnect now — well before the next real request would hang.
+    scheduleReconnect(`heartbeat failed: ${why}`);
   });
 }, HEARTBEAT_MS);
 hb.unref?.();
 
-log(`linked stdio <-> ${url} (heartbeat ${HEARTBEAT_MS}ms)`);
+log(`linked stdio <-> ${url} (heartbeat ${HEARTBEAT_MS}ms, self-healing)`);

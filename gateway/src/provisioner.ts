@@ -272,6 +272,17 @@ export class Provisioner {
   }
 
   /**
+   * Tear down a (possibly wedged) browser container so the next `ensureContainer`
+   * rebuilds it from scratch. The named profile volume is preserved, so the
+   * fresh container reseeds from the saved cookies/state. Used by the bridge's
+   * child-respawn path when Chrome itself has stopped answering CDP.
+   */
+  async recreateContainer(name: string): Promise<void> {
+    await this.stopContainer(name);
+    await this.removeContainer(name);
+  }
+
+  /**
    * Remove leftover non-running fleet containers from a previous run, reboot, or
    * crash. Profile volumes are preserved. Without this, stopped containers
    * accumulate across restarts and silently saturate MAX_FLEET, blocking all new
