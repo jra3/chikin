@@ -23,4 +23,32 @@ RAW="${CHIKIN_NAME:-inst-$PPID}"
 # Gateway names must match [a-z0-9-]{1,32}.
 NAME="$(printf '%s' "$RAW" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-32)"
 
-exec node "$REPO/client/bridge.mjs" "${GATEWAY}/b/${NAME}/"
+URL="${GATEWAY}/b/${NAME}/"
+
+# Supervisor loop (backstop). The bridge is self-healing: transient gateway/SSE
+# failures are recovered IN-PROCESS, so it normally exits only on a clean client
+# disconnect (exit 0). This loop exists purely for a HARD node crash — by NOT
+# exec'ing, this bash process keeps Claude Code's stdio pipe open across a
+# respawn, so the MCP server never disappears (which would deregister every tool
+# until a manual /mcp reconnect). Clean exit (0) => client is gone, so stop.
+#
+# CRITICAL: the bridge MUST inherit our stdin (the MCP pipe from Claude Code).
+# A non-interactive bash redirects a BACKGROUNDED job's stdin from /dev/null
+# unless it is explicitly redirected — so we run the bridge in the background
+# (so `wait` can be interrupted by SIGTERM for a clean shutdown) but pin its
+# stdin back to ours with `0<&0`. Without this the bridge reads instant EOF and
+# the handshake dies with "Connection closed".
+# NB: guard the kill — an empty $child would make `kill 0` signal the whole
+# process group (including our parent's session).
+trap '[ -n "${child:-}" ] && kill "$child" 2>/dev/null; exit 0' TERM INT
+
+backoff=1
+while true; do
+  node "$REPO/client/bridge.mjs" "$URL" 0<&0 &
+  child=$!
+  wait "$child"; rc=$?
+  [ "$rc" -eq 0 ] && exit 0            # clean shutdown: client disconnected
+  echo "chikin-mcp: bridge exited ($rc); respawning in ${backoff}s" >&2
+  sleep "$backoff"
+  backoff=$(( backoff < 16 ? backoff * 2 : 16 ))
+done

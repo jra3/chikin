@@ -28,6 +28,9 @@
 // just another reconnect trigger. Ping replies are swallowed.
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const url = process.argv[2];
 if (!url) {
@@ -60,7 +63,26 @@ let shuttingDown = false;
 // The client's one-time `initialize` request, cached so we can replay it to a
 // fresh gateway session after a link loss. Without this, a rebuilt transport
 // has no MCP session and the gateway 400s every (non-initialize) request.
+//
+// It is ALSO persisted to disk: if this process hard-crashes, the chikin-mcp
+// supervisor respawns us, but the client never re-sends `initialize` — without
+// the persisted frame the fresh bridge could never establish a gateway session
+// and every call would fail forever. Recovery is lazy: the first forwarded
+// request 400s (no session), which triggers scheduleReconnect, which replays
+// the recovered frame. A live client's own `initialize` always overwrites a
+// (possibly stale) recovered frame before any replay can use it, so a leftover
+// file from a previous crash is harmless on a genuinely fresh session.
+const initPath = join(
+  process.env.XDG_RUNTIME_DIR || tmpdir(),
+  `chikin-bridge${new URL(url).pathname.replace(/[^a-zA-Z0-9-]+/g, "-")}init.json`,
+);
 let initFrame = null;
+try {
+  initFrame = JSON.parse(readFileSync(initPath, "utf8"));
+  log(`recovered persisted initialize (${initPath}); resuming session after respawn`);
+} catch {
+  /* no persisted frame — normal fresh start */
+}
 
 const pingIds = new Set(); // internal heartbeat ids we must not forward
 // Client requests forwarded to the gateway still awaiting a reply. A request is
@@ -174,7 +196,14 @@ async function scheduleReconnect(why) {
 // Client -> gateway. Cache the initialize frame; track requests so a link loss
 // can fail them; forward everything to the live transport.
 stdio.onmessage = (m) => {
-  if (m && m.method === "initialize") initFrame = m;
+  if (m && m.method === "initialize") {
+    initFrame = m;
+    try {
+      writeFileSync(initPath, JSON.stringify(m)); // survive a hard crash + respawn
+    } catch (e) {
+      log(`initialize persist failed: ${e?.message ?? e}`);
+    }
+  }
   if (m && m.method === "notifications/initialized") ready = true;
   const tracked = m && m.method !== undefined && m.id !== undefined && !pingIds.has(m.id);
   if (tracked) inflight.set(m.id, true);
@@ -186,16 +215,25 @@ stdio.onmessage = (m) => {
     if (tracked) failRequest(m.id, "chikin gateway link resetting; retry the request");
     return;
   }
+  const gen = generation; // bind this send to the transport it used
   target.send(m).catch((e) => {
     const why = e?.message ?? String(e);
     log(`->gateway send failed: ${why}`);
-    if (tracked) failRequest(m.id, `chikin gateway send failed (${why}); retry the request`);
-    scheduleReconnect(`send failed: ${why}`);
+    // Only fail the request if a reconnect hasn't already done so (a duplicate
+    // error reply for the same id would confuse the client).
+    if (tracked && inflight.has(m.id))
+      failRequest(m.id, `chikin gateway send failed (${why}); retry the request`);
+    // A STALE rejection (the transport was already replaced while this send's
+    // failure was in flight) must not tear down the freshly rebuilt link.
+    if (gen === generation) scheduleReconnect(`send failed: ${why}`);
   });
 };
 
-// Only a genuine client disconnect (stdio closed) tears us down.
+// Only a genuine client disconnect (stdio closed) — or a signal from the
+// supervisor — tears us down. Both are clean exits (initPath is removed).
 stdio.onclose = () => shutdown("client disconnected (stdio closed)");
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 function shutdown(why, code = 0) {
   if (shuttingDown) return;
@@ -203,6 +241,9 @@ function shutdown(why, code = 0) {
   failAllInflight(`chikin bridge shutting down (${why})`);
   clearInterval(hb);
   log(why);
+  try {
+    unlinkSync(initPath); // clean exit: the session is over, drop the crash-recovery frame
+  } catch {}
   http?.close().catch(() => {});
   setTimeout(() => {
     stdio.close().catch(() => {});
@@ -223,13 +264,15 @@ const hb = setInterval(() => {
   if (!ready || reconnecting || !http) return;
   const id = `chikin-hb-${++seq}`;
   pingIds.add(id);
+  const gen = generation; // bind to the transport this ping rode on
   http.send({ jsonrpc: "2.0", id, method: "ping" }).catch((e) => {
     pingIds.delete(id);
     const why = e?.message ?? String(e);
     log(`heartbeat failed: ${why}`);
     // A failed ping means the gateway session is dead (or browser reaped).
-    // Reconnect now — well before the next real request would hang.
-    scheduleReconnect(`heartbeat failed: ${why}`);
+    // Reconnect now — well before the next real request would hang. Skip if
+    // the rejection is stale (the transport was already replaced).
+    if (gen === generation) scheduleReconnect(`heartbeat failed: ${why}`);
   });
 }, HEARTBEAT_MS);
 hb.unref?.();

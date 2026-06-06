@@ -56,6 +56,12 @@ export const config = {
   // The per-browser MCP engine. One child process per browser, connecting to
   // the container's CDP endpoint over the internal network.
   cdmCommand: str("CDM_COMMAND", "/app/node_modules/.bin/chrome-devtools-mcp"),
+  // Extra flags appended to every chrome-devtools-mcp invocation, whitespace-
+  // separated. E.g. CDM_EXTRA_ARGS="--experimentalPageIdRouting" routes every
+  // page-scoped tool by explicit pageId instead of the sticky selected-page
+  // binding that causes the stale-target wedge (issue #15) — opt-in because it
+  // changes the tool schemas the client sees.
+  cdmExtraArgs: str("CDM_EXTRA_ARGS", "").split(/\s+/).filter(Boolean),
 
   containerPrefix: "chikin-chrome-",
   volumePrefix: "chikin-profile-",
