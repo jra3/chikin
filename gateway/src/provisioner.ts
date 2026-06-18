@@ -251,4 +251,55 @@ export class Provisioner {
       }
     }
   }
+
+  /**
+   * Remove a fleet container. The named profile volume is left intact, so a
+   * reconnect recreates the container and reseeds from the saved cookies/state.
+   * Callers stop the container first (graceful, so Chrome flushes to the volume)
+   * — `force` here just makes removal idempotent if it's somehow still running.
+   */
+  async removeContainer(name: string): Promise<void> {
+    try {
+      await this.docker.getContainer(containerName(name)).remove({ force: true });
+      log.info(`provisioner: removed ${containerName(name)}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // 404 = already gone; treat as success.
+      if (!/no such container|404/i.test(msg)) {
+        log.warn(`provisioner: remove ${containerName(name)} failed`, msg);
+      }
+    }
+  }
+
+  /**
+   * Tear down a (possibly wedged) browser container so the next `ensureContainer`
+   * rebuilds it from scratch. The named profile volume is preserved, so the
+   * fresh container reseeds from the saved cookies/state. Used by the bridge's
+   * child-respawn path when Chrome itself has stopped answering CDP.
+   */
+  async recreateContainer(name: string): Promise<void> {
+    await this.stopContainer(name);
+    await this.removeContainer(name);
+  }
+
+  /**
+   * Remove leftover non-running fleet containers from a previous run, reboot, or
+   * crash. Profile volumes are preserved. Without this, stopped containers
+   * accumulate across restarts and silently saturate MAX_FLEET, blocking all new
+   * browsers (the "fleet is full" lockup). Returns how many were removed.
+   */
+  async gcExited(): Promise<number> {
+    let removed = 0;
+    for (const m of await this.listFleet()) {
+      if (m.state === "running") continue;
+      try {
+        await this.docker.getContainer(m.containerId).remove({ force: true });
+        log.info(`provisioner: gc removed ${containerName(m.name)} (${m.state})`);
+        removed++;
+      } catch (e) {
+        log.warn(`provisioner: gc remove ${containerName(m.name)} failed`, String(e));
+      }
+    }
+    return removed;
+  }
 }

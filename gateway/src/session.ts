@@ -1,36 +1,41 @@
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { log } from "./log.js";
 
 /**
  * One live MCP session = one client connection to a named browser. Bridges the
- * client's HTTP MCP transport to a single `chrome-devtools-mcp` child (stdio).
+ * client's HTTP MCP transport to a `chrome-devtools-mcp` child (stdio).
  *
  * A Session is ephemeral: it exists only while a client is connected, and is
  * used for request routing and the single-active-session-per-name guard. The
  * browser *container's* idle lifetime is tracked separately, per name, in the
  * Registry's activity map — so a container can outlive a session (warm for a
  * fast reconnect) and still be reaped once it's been idle long enough.
+ *
+ * The child process is NOT owned directly by the Session: the bridge keeps it
+ * replaceable so a crashed `chrome-devtools-mcp` (or a wedged Chrome) can be
+ * respawned transparently without tearing down the client's HTTP session. The
+ * bridge hands us a `closeChild` thunk that tears down whatever child is current
+ * at close time.
  */
 export class Session {
   readonly name: string;
   readonly http: StreamableHTTPServerTransport;
-  readonly child: StdioClientTransport;
 
   sessionId: string | undefined;
 
   private closed = false;
   private readonly onClose: (s: Session, reason: string) => void;
+  private readonly closeChild: () => Promise<void>;
 
   constructor(
     name: string,
     http: StreamableHTTPServerTransport,
-    child: StdioClientTransport,
+    closeChild: () => Promise<void>,
     onClose: (s: Session, reason: string) => void,
   ) {
     this.name = name;
     this.http = http;
-    this.child = child;
+    this.closeChild = closeChild;
     this.onClose = onClose;
   }
 
@@ -44,6 +49,6 @@ export class Session {
     this.closed = true;
     log.info(`session[${this.name}]: closing (${reason})`);
     this.onClose(this, reason);
-    await Promise.allSettled([this.http.close(), this.child.close()]);
+    await Promise.allSettled([this.http.close(), this.closeChild()]);
   }
 }

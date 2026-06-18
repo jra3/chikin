@@ -75,6 +75,10 @@ services:
       PROVISION_TIMEOUT_SEC: "${PROVISION_TIMEOUT_SEC:-90}"
       WINDOW_SIZE: "${WINDOW_SIZE:-1920,1080}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # Wedge self-healing knobs (issue #15). CDM_EXTRA_ARGS e.g.
+      # "--experimentalPageIdRouting" to bypass the sticky page binding.
+      CDM_EXTRA_ARGS: "${CDM_EXTRA_ARGS:-}"
+      NAV_VERIFY_DELAY_MS: "${NAV_VERIFY_DELAY_MS:-2500}"
       CHROME_IMAGE: "chikin:local"
       # Golden-profile seed volume. Empty = off; set to chikin-seed and populate
       # it with bin/chikin-snapshot to have new browsers start logged in.

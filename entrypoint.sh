@@ -31,6 +31,17 @@ fi
 # config dirs would fail. /home/chrome is created+owned by the user in the image.
 export HOME=/home/chrome
 
+# Clear stale single-instance locks before launching. Chrome removes these on a
+# clean exit, but a reaped or crashed container (SIGKILL after the gateway's stop
+# grace) leaves them in the *persistent* profile volume. They're symlinks keyed
+# to the writing container's hostname, so a recreated container reusing the same
+# volume sees a foreign hostname, decides the profile is "in use on another host"
+# (liveness unprobeable across hosts), and refuses to start — which kills the
+# chrome-devtools-mcp child and triggers a reap/recreate thrash. Single-session-
+# per-name guarantees no other live container shares this volume, so removing
+# them unconditionally on start is safe.
+rm -f /data/SingletonLock /data/SingletonSocket /data/SingletonCookie
+
 # Chrome (since ~111) ignores --remote-debugging-address=0.0.0.0 and always
 # binds to loopback. We run Chrome on a private loopback-only port and use
 # socat to bridge the publicly-advertised CDP_PORT to it.

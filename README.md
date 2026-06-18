@@ -86,6 +86,20 @@ Env (read by `chikin-mcp`): `CHIKIN_GATEWAY` (default `http://localhost:8080`), 
 
 The first tool call provisions and starts the browser (a few seconds). A named browser (`giard`) always gets the same profile. Disconnect and the browser stays warm for a fast reconnect; leave it idle past `IDLE_TTL_SEC` with no client attached and it's stopped (the profile volume is preserved, so reconnecting restores everything).
 
+#### Direct HTTP transport (pin a browser, or non–Claude-Code clients)
+
+The stdio bridge above is the easy path — it auto-assigns each Claude Code instance its own browser. If instead you want to **pin a client to a specific named browser**, or wire up any MCP client that speaks streamable HTTP directly, point it at the gateway's per-browser endpoint `http://localhost:8080/b/<name>/` (`<name>` is `[a-z0-9-]+`, 1–32 chars). To configure two isolated browsers:
+
+```bash
+# Two MCP servers, two isolated profiles. Drop --header if GATEWAY_TOKEN is empty.
+claude mcp add --transport http alice http://localhost:8080/b/alice/ \
+  --header "Authorization: Bearer $GATEWAY_TOKEN"
+claude mcp add --transport http bob   http://localhost:8080/b/bob/ \
+  --header "Authorization: Bearer $GATEWAY_TOKEN"
+```
+
+`alice` and `bob` get fully isolated profiles (volumes `chikin-profile-alice`, `chikin-profile-bob`); the gateway provisions each browser on first use. Only one client may hold a given name at a time — a second concurrent connect to `alice` is rejected with `409`. This is exactly the form any streamable-HTTP MCP client uses; `chikin-mcp` is just a convenience wrapper that fills in the name (and the bearer) for you.
+
 ### Watch a browser / solve a captcha
 
 Open the dashboard at <http://localhost:8080/> and click **open noVNC** next to any running browser, or go straight to `http://localhost:8080/vnc/<name>/`. You can drive that Chrome window by hand — useful for logging in or clearing a captcha while the MCP client keeps the session.
@@ -127,7 +141,17 @@ Set in `.env` (see `.env.example`) or the environment.
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
 | `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up before failing the connect. |
 | `WINDOW_SIZE` | `1920,1080` | Chrome window / Xvfb screen size for provisioned browsers. |
+| `CDM_EXTRA_ARGS` | *(empty)* | Extra flags for every `chrome-devtools-mcp` child, whitespace-separated. E.g. `--experimentalPageIdRouting` routes page-scoped tools by explicit `pageId` instead of the sticky selected-page binding (sidesteps the stale-target wedge, but changes tool schemas). |
+| `NAV_VERIFY_DELAY_MS` | `2500` | How long after a "successful" navigation the wedge watchdog waits before checking the browser's real CDP page list. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+
+### Wedge self-healing (issue #15)
+
+`chrome-devtools-mcp` (≤1.1.1) can bind to a stale page target after an SPA route change or cross-origin navigation: navigation tools then return success but silently no-op while Chrome itself is healthy. The gateway defends in three layers:
+
+1. **Nav watchdog** — after the child reports a navigation succeeded, the gateway checks the container's CDP `/json/list` (ground truth). Two consecutive navs that provably went nowhere force a transparent child respawn, which re-binds the browser's real current target. Repeated CDP connection failures on the child's stderr (e.g. the container was removed out-of-band) trigger the same respawn.
+2. **`chikin_reset` tool** — injected into every `tools/list`, so the model itself can hard-reset a wedged browser (container recreated, profile/logins preserved) without human help.
+3. **Self-healing transports** — both the client bridge and the gateway replay the cached `initialize` over a rebuilt link, so none of the above ever drops the client's MCP session.
 
 Gateway responses use JSON-RPC error envelopes with these HTTP statuses: `401` (bad/missing token), `400` (invalid name or non-initialize without a session), `409` (a name already has an active session), `429` (fleet full), `503` (provisioning failed).
 

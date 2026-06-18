@@ -6,8 +6,10 @@ import type { Provisioner } from "./provisioner.js";
 /**
  * Periodically reclaims idle browsers (issue #7). A browser is reaped only when
  * it has NO attached client stream AND has been idle past IDLE_TTL. Reaping
- * tears down any session and stops the container, but preserves the named
- * profile volume so a reconnect restores cookies/state.
+ * tears down any session, then stops AND removes the container, but preserves
+ * the named profile volume so a reconnect restores cookies/state. Removing (not
+ * just stopping) is essential: stopped containers still count against MAX_FLEET,
+ * so leaving them around leaks fleet slots until provisioning locks up.
  *
  * Reaping is driven by the per-name activity map, not by live sessions, so a
  * container that outlives its session (warm for fast reconnect) is still
@@ -62,6 +64,7 @@ export class Reaper {
         const session = this.registry.getByName(name);
         if (session) await session.close("reaped: idle");
         await this.provisioner.stopContainer(name);
+        await this.provisioner.removeContainer(name);
         this.registry.dropActivity(name);
       } catch (e) {
         log.warn(`reaper: failed to reclaim ${name}`, String(e));

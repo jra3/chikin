@@ -23,6 +23,15 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Clear leftover exited fleet containers from a previous run / reboot / crash
+  // before they count against MAX_FLEET and block new browsers. Volumes are kept.
+  try {
+    const n = await provisioner.gcExited();
+    if (n) log.info(`startup: removed ${n} leftover exited fleet container(s)`);
+  } catch (e) {
+    log.warn("startup: gc of exited containers failed", e instanceof Error ? e.message : String(e));
+  }
+
   const reaper = new Reaper(registry, provisioner);
   reaper.start();
 
