@@ -18,6 +18,22 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { interpretProbe, PROBE_EXPRESSION } from "./probe.js";
 import { formatPretty, formatJson } from "./format.js";
 
+const SANNYSOFT_URL = "https://bot.sannysoft.com";
+
+// Scrapes the bot.sannysoft.com results table into [{label, result}] rows.
+const SCRAPE_EXPRESSION = `
+  (() => {
+    const rows = [];
+    document.querySelectorAll("table tr").forEach((tr) => {
+      const cells = tr.querySelectorAll("td");
+      if (cells.length >= 2) {
+        rows.push({ label: cells[0].innerText.trim(), result: cells[1].innerText.trim() });
+      }
+    });
+    return rows;
+  })()
+`;
+
 function parseArgs(argv) {
   const a = {
     gateway: "http://localhost:8080",
@@ -26,10 +42,12 @@ function parseArgs(argv) {
     // plugins, and WebGL are all available on it.
     url: "data:text/html,<title>chikin%20verify</title>",
     json: false,
+    sannysoft: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const v = argv[i];
     if (v === "--json") a.json = true;
+    else if (v === "--sannysoft") a.sannysoft = true;
     else if (v === "--gateway") a.gateway = argv[++i];
     else if (v === "--name") a.name = argv[++i];
     else if (v === "--url") a.url = argv[++i];
@@ -48,12 +66,16 @@ function extractJson(result) {
     .filter((c) => c.type === "text")
     .map((c) => c.text)
     .join("\n");
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
+  // chrome-devtools-mcp wraps the value in a ```json … ``` fence; fall back to
+  // brace/bracket matching. Handles both objects (probe) and arrays (scrape).
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const body = fence ? fence[1] : text;
+  const start = body.search(/[[{]/);
+  const end = Math.max(body.lastIndexOf("}"), body.lastIndexOf("]"));
   if (start === -1 || end === -1 || end < start) {
     throw new Error(`no JSON in evaluate_script result:\n${text}`);
   }
-  return JSON.parse(text.slice(start, end + 1));
+  return JSON.parse(body.slice(start, end + 1));
 }
 
 async function main() {
@@ -89,8 +111,23 @@ async function main() {
     );
 
     const rows = interpretProbe(raw);
-    // Fleet path has no sannysoft scrape (that needs a dedicated CDP target).
-    const result = { rows, sannysoft: null };
+
+    let sannysoft = null;
+    if (args.sannysoft) {
+      await client.callTool({
+        name: "navigate_page",
+        arguments: { type: "url", url: SANNYSOFT_URL },
+      });
+      await new Promise((r) => setTimeout(r, 3000)); // let async fingerprint tests settle
+      sannysoft = extractJson(
+        await client.callTool({
+          name: "evaluate_script",
+          arguments: { function: `() => (${SCRAPE_EXPRESSION})` },
+        }),
+      );
+    }
+
+    const result = { rows, sannysoft };
     console.log(args.json ? formatJson(result) : formatPretty(result));
 
     const required = rows.filter((r) => r.required);

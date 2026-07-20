@@ -15,49 +15,56 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build image
+      - name: Build chrome image (load)
         uses: docker/build-push-action@v5
         with:
           context: .
           push: false
           load: true
-          tags: chikin:canary
+          tags: ghcr.io/${{ github.repository }}:canary
           cache-from: type=gha
 
-      - name: Run container
-        run: |
-          docker run -d \
-            --name chikin \
-            --shm-size=2g \
-            -p 127.0.0.1:9322:9222 \
-            chikin:canary
-
-      - name: Wait for healthy
-        run: |
-          for i in $(seq 1 30); do
-            if curl -fs http://localhost:9322/json/version > /dev/null; then exit 0; fi
-            sleep 1
-          done
-          echo "CDP did not come up in 30s"
-          docker logs chikin
-          exit 1
+      - name: Build gateway image (load)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./gateway
+          push: false
+          load: true
+          tags: ghcr.io/${{ github.repository }}-gateway:canary
+          cache-from: type=gha,scope=gateway
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Run verify with sannysoft
-        working-directory: verify
+      # Drive a fleet-provisioned browser to bot.sannysoft.com through the
+      # gateway (the fleet never exposes CDP). CHIKIN_VERSION=canary points
+      # compose at the :canary images loaded above.
+      - name: Fleet up + sannysoft canary via the gateway
+        env:
+          CHIKIN_VERSION: canary
         run: |
-          npm ci
-          node verify.js
+          docker compose up -d
+          for i in $(seq 1 60); do
+            if curl -fs http://localhost:8080/healthz > /dev/null; then
+              echo "gateway healthy after $((i * 2))s"; break
+            fi
+            sleep 2
+          done
+          ( cd verify && npm ci && node verify-fleet.js --sannysoft )
 
-      - name: Dump container logs
+      - name: Dump compose logs
         if: always()
-        run: docker logs chikin > chrome.log 2>&1 || true
+        run: docker compose logs > compose.log 2>&1 || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: canary-chrome-logs
-          path: chrome.log
+          name: canary-compose-logs
+          path: compose.log
+
+      - name: Tear down fleet
+        if: always()
+        env:
+          CHIKIN_VERSION: canary
+        run: docker compose --profile build down -v || true

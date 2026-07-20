@@ -1,9 +1,6 @@
 # chikin
 
-Real (non-headless) Google Chrome in Docker, for browser automation that should **not** self-identify as headless. Two ways to run it:
-
-- **Fleet mode** (default `docker-compose.yml`) — a **multi-Chrome MCP gateway**. One gateway container fronts N per-client Chrome containers, each with its own sticky profile, and speaks [MCP](https://modelcontextprotocol.io/) over HTTP. Several Claude Code instances (or any MCP client) each drive their own isolated browser through a single bearer-protected endpoint.
-- **Single-container mode** — one standalone Chrome exposing the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) on a loopback port. The original chikin; see [Single-container mode](#single-container-mode).
+Real (non-headless) Google Chrome in Docker, for browser automation that should **not** self-identify as headless. chikin runs as a **fleet**: one gateway container fronts N per-name Chrome containers, each with its own sticky profile, and speaks [MCP](https://modelcontextprotocol.io/) over HTTP. Several Claude Code instances (or any MCP client) each drive their own isolated browser through a single bearer-protected endpoint. Everything runs on one host, in containers — never remote.
 
 ## What you get
 
@@ -158,37 +155,13 @@ Gateway responses use JSON-RPC error envelopes with these HTTP statuses: `401` (
 
 ---
 
-## Single-container mode
+## Chrome container internals
 
-If you just want one standalone Chrome on a loopback CDP port (the original chikin), skip the gateway:
-
-```yaml
-# docker-compose.standalone.yml
-services:
-  chrome:
-    image: ghcr.io/jra3/chikin:latest   # or: build: .
-    container_name: chikin
-    restart: unless-stopped
-    shm_size: "2gb"
-    ports:
-      - "127.0.0.1:9322:9222"   # loopback only — never 0.0.0.0
-    volumes:
-      - chikin-data:/data
-volumes:
-  chikin-data:
-```
-
-```bash
-docker compose -f docker-compose.standalone.yml up -d
-curl -s http://localhost:9322/json/version   # should NOT say HeadlessChrome
-cd verify && npm install && node verify.js --host http://localhost:9322
-```
-
-Environment variables read by `entrypoint.sh` in either mode:
+Environment variables read by `entrypoint.sh` (the fleet sets these when it provisions each browser):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CDP_PORT` | `9222` | Port inside the container clients reach via socat. |
+| `CDP_PORT` | `9222` | Port inside the container the gateway reaches via socat. |
 | `WINDOW_SIZE` | `1920,1080` | `--window-size` for Chrome; also drives the Xvfb screen dimensions. |
 | `DISPLAY_NUM` | `99` | Which `:N` display Xvfb creates. |
 | `ENABLE_VNC` | `0` | `1` to start x11vnc + noVNC on `VNC_PORT`. The fleet sets this automatically. |
@@ -197,27 +170,7 @@ Environment variables read by `entrypoint.sh` in either mode:
 
 ### Why the port shuffle
 
-Chrome (since ~v111) ignores `--remote-debugging-address=0.0.0.0` and always binds CDP to `127.0.0.1` inside the container. `entrypoint.sh` runs Chrome on a private loopback port (9223) and uses `socat` to forward `CDP_PORT` to it.
-
-### Connecting chrome-devtools-mcp directly (single-container)
-
-```json
-{
-  "mcpServers": {
-    "chrome-devtools": {
-      "command": "npx",
-      "args": ["-y", "chrome-devtools-mcp@latest", "--browserUrl", "http://localhost:9322"]
-    }
-  }
-}
-```
-
-If `--browserUrl` doesn't fit, the only other connect flag is **`--wsEndpoint`** (alias `-w`), which takes a full WebSocket URL. There is no `--cdp-endpoint` or `--browserWSEndpoint` — those flags do not exist. Fetch the WebSocket URL with:
-
-```bash
-curl -s http://localhost:9322/json/version | jq -r .webSocketDebuggerUrl
-# then: chrome-devtools-mcp --wsEndpoint ws://localhost:9322/devtools/browser/<id>
-```
+Chrome (since ~v111) ignores `--remote-debugging-address=0.0.0.0` and always binds CDP to `127.0.0.1` inside the container. `entrypoint.sh` runs Chrome on a private loopback port (9223) and uses `socat` to forward `CDP_PORT` to it — which is how the gateway (over the internal network, never the host) reaches each browser's CDP.
 
 ---
 
@@ -237,7 +190,7 @@ The container starts as **root** only long enough for `entrypoint.sh` to chown t
 ## Security
 
 - **CDP has no authentication.** chikin never publishes a Chrome port to the host. In fleet mode the only host-exposed surface is the gateway on `127.0.0.1:8080`, and `/b/<name>/` requires a bearer token; the control-plane network is `internal: true`.
-- **Linux caveat:** on a Linux host you can still reach a container's CDP by its *container IP* (e.g. `http://172.x.x.x:9222`) because the host routes to Docker bridges directly — `internal: true` does not change this. The boundary chikin provides is "not reachable from other machines and not on any host port," matching the single-container model. If you need to block host-local access too, add a `DOCKER-USER` iptables rule; that's outside chikin's scope.
+- **Linux caveat:** on a Linux host you can still reach a container's CDP by its *container IP* (e.g. `http://172.x.x.x:9222`) because the host routes to Docker bridges directly — `internal: true` does not change this. The boundary chikin provides is "not reachable from other machines and not on any host port." If you need to block host-local access too, add a `DOCKER-USER` iptables rule; that's outside chikin's scope.
 - **Scoped Docker access.** The gateway reaches Docker only through `tecnativa/docker-socket-proxy` with a read-only socket mount, scoped to containers/volumes/images (+POST). `exec`, `info`, swarm, and secrets are denied — verify with the proxy returning `403` on `/info` and `/exec/...`.
 - `--no-sandbox` is in use. Treat a profile volume as a fully compromised browser profile after visiting untrusted content.
 - Never change the gateway's host port binding from `127.0.0.1`.
@@ -246,16 +199,18 @@ The container starts as **root** only long enough for `entrypoint.sh` to chown t
 
 ## Verify script
 
-`verify/verify.js` is a host-side Node (≥20) tool that proves a chikin Chrome is non-headless. Point it at any reachable CDP endpoint:
+`verify/verify-fleet.js` proves a fleet browser is non-headless — it drives a browser **through the gateway** (the fleet never exposes CDP to the host) and runs the probe. Easiest via `make verify`:
 
 ```bash
+make verify                                        # provisions a browser, checks it
+# or directly:
 cd verify && npm install
-node verify.js --host http://localhost:9322        # single-container
-node verify.js --json                              # machine-readable
-node verify.js --skip-sannysoft                    # probe only (offline / CI)
+node verify-fleet.js                               # against http://localhost:8080
+node verify-fleet.js --json                        # machine-readable
+node verify-fleet.js --sannysoft                   # also scrape bot.sannysoft.com
 ```
 
-Exit codes: `0` all required checks passed · `1` a required check failed · `2` couldn't connect · `3` unexpected error.
+Exit codes: `0` all required checks passed · `1` a required check failed · `2` couldn't connect to the gateway · `3` unexpected error.
 
 ## Gateway development
 
@@ -278,7 +233,7 @@ The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTranspor
 
 **"fleet is full" (429).** Raise `MAX_FLEET` or let an idle browser get reaped.
 
-**`verify.js` says UA contains `HeadlessChrome`.** A `--headless` flag snuck into `entrypoint.sh`.
+**`make verify` says UA contains `HeadlessChrome`.** A `--headless` flag snuck into `entrypoint.sh`.
 
 ## License
 
