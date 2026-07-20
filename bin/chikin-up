@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# chikin-up — wait for the Docker daemon to be ready, then bring the fleet up.
+#
+# Invoked at login by the autostart unit (systemd --user on Linux, launchd
+# LaunchAgent on macOS). Two reasons this is a script and not a bare
+# `docker compose up`:
+#   1. Docker may not be ready yet at login — Docker Desktop on macOS takes
+#      ~10-30s to start, and on Arch the daemon is socket-activated (disabled),
+#      so it isn't running until a client touches the socket. Polling `docker
+#      info` both waits AND socket-activates the daemon (this is the fix for
+#      issue #16 — nothing else pokes the socket at boot/login).
+#   2. `up -d` reruns the one-shot shared-init service, re-chmod'ing the tmpfs
+#      /tmp/chikin-shared that a reboot wipes.
+#
+# The autostart unit passes DOCKER=<abs path to docker> so this works under the
+# minimal PATH a systemd/launchd unit runs with.
+set -euo pipefail
+
+DOCKER="${DOCKER:-docker}"
+
+# Resolve the repo dir, following symlinks (portable: no `readlink -f` on macOS).
+src="$0"
+case "$src" in */*) ;; *) src="$(command -v "$src")" ;; esac
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" >/dev/null && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+REPO="$(dirname "$(cd -P "$(dirname "$src")" >/dev/null && pwd)")"
+
+cd "$REPO"
+
+# Wait up to ~2 min for the daemon. `docker info` touching the socket is what
+# socket-activates a disabled daemon on Arch.
+for _ in $(seq 1 60); do
+  if "$DOCKER" info >/dev/null 2>&1; then
+    exec "$DOCKER" compose up -d
+  fi
+  sleep 2
+done
+
+echo "chikin-up: Docker daemon not ready after 2 min; is Docker (Desktop) running?" >&2
+exit 1
