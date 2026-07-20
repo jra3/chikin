@@ -7,17 +7,21 @@ name: chikin
 #                                            └─ provisions chikin-chrome-<name>
 #                                               on demand (internal chikin-net)
 #
-# Bring up the control plane:
-#   docker compose build chrome-image    # builds chikin:local (the fleet image)
-#   GATEWAY_TOKEN=... docker compose up -d
-# Browsers are created on demand by the gateway; they are NOT compose services.
+# Bring up the control plane (pulls pinned images from ghcr — builds nothing):
+#   docker compose --profile build pull   # fetch gateway + fleet browser images
+#   docker compose up -d
+# Developers build locally instead by layering docker-compose.dev.yml on top
+# (see that file, or `make dev-build`). Pin the image tag with CHIKIN_VERSION
+# in .env. Browsers are created on demand by the gateway; NOT compose services.
 
 services:
-  # Build-only helper: produces the chikin:local fleet image. Never started
-  # (the gateway provisions chrome containers from this image at runtime).
+  # Pull anchor for the fleet browser image. Not a running service (the gateway
+  # provisions chrome containers from this image at runtime) — it exists only so
+  # `docker compose --profile build pull` fetches the image locally, satisfying
+  # the gateway's startup image check. The "build" profile keeps it out of
+  # `up`. Developers build it locally via docker-compose.dev.yml.
   chrome-image:
-    build: .
-    image: chikin:local
+    image: ghcr.io/jra3/chikin:${CHIKIN_VERSION:-latest}
     profiles: ["build"]
     entrypoint: ["true"]
     restart: "no"
@@ -53,8 +57,7 @@ services:
     restart: unless-stopped
 
   gateway:
-    build: ./gateway
-    image: chikin-gateway:local
+    image: ghcr.io/jra3/chikin-gateway:${CHIKIN_VERSION:-latest}
     container_name: chikin-gateway
     init: true
     restart: unless-stopped
@@ -79,7 +82,7 @@ services:
       # "--experimentalPageIdRouting" to bypass the sticky page binding.
       CDM_EXTRA_ARGS: "${CDM_EXTRA_ARGS:-}"
       NAV_VERIFY_DELAY_MS: "${NAV_VERIFY_DELAY_MS:-2500}"
-      CHROME_IMAGE: "chikin:local"
+      CHROME_IMAGE: "ghcr.io/jra3/chikin:${CHIKIN_VERSION:-latest}"
       # Golden-profile seed volume. Empty = off; set to chikin-seed and populate
       # it with bin/chikin-snapshot to have new browsers start logged in.
       SEED_VOLUME: "${SEED_VOLUME:-}"

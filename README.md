@@ -41,14 +41,15 @@ Real (non-headless) Google Chrome in Docker, for browser automation that should 
 
 ## Quickstart (fleet)
 
-Prerequisites: Docker 20.10+ with Compose v2, and ~1.5 GB disk for the first build (installing Chrome + noVNC takes a few minutes).
+Prerequisites: Docker 20.10+ with Compose v2, and ~1.5 GB disk for the images (the first pull takes a few minutes).
 
 ```bash
-# 1. Build the fleet Chrome image (chikin:local) used to provision browsers.
-docker compose build chrome-image
+# 1. Pull the pinned gateway + fleet browser images from ghcr (builds nothing).
+cp .env.example .env
+# Optionally pin CHIKIN_VERSION in .env to a release tag; default is `latest`.
+docker compose --profile build pull
 
 # 2. Bring up the gateway + socket-proxy.
-cp .env.example .env
 # The gateway binds 127.0.0.1 only, so a bearer is optional. Leave GATEWAY_TOKEN
 # empty for no-auth local use, or set one to require it:
 #   sed -i "s/^GATEWAY_TOKEN=.*/GATEWAY_TOKEN=$(openssl rand -hex 32)/" .env
