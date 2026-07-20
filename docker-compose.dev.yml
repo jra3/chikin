@@ -1,0 +1,23 @@
+name: chikin
+
+# Developer build overrides — build the two chikin images locally instead of
+# pulling the pinned ghcr images. Layer it on top of the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile build build
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# (or `make dev-build` / `make dev-up`). The base docker-compose.yml pulls
+# `ghcr.io/jra3/chikin{,-gateway}:${CHIKIN_VERSION}`; this file swaps both back
+# to local builds and points the gateway's provisioner at the locally-built
+# fleet image so nothing reaches for ghcr.
+
+services:
+  chrome-image:
+    build: .
+    image: chikin:local
+
+  gateway:
+    build: ./gateway
+    image: chikin-gateway:local
+    environment:
+      CHROME_IMAGE: "chikin:local"

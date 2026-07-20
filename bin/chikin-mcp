@@ -15,8 +15,18 @@
 #   CHIKIN_TOKEN    bearer token, if the gateway has GATEWAY_TOKEN set
 set -euo pipefail
 
-SELF="$(readlink -f "$0")"
-REPO="$(dirname "$(dirname "$SELF")")"
+# Resolve this script's real location, following symlinks (it's symlinked onto
+# PATH, e.g. ~/.local/bin/chikin-mcp -> <repo>/bin/chikin-mcp). Portable across
+# GNU and BSD/macOS — macOS's readlink has no `-f`, so walk the links by hand.
+src="$0"
+case "$src" in */*) ;; *) src="$(command -v "$src")" ;; esac   # found via PATH
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" >/dev/null && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac             # relative link target
+done
+BIN_DIR="$(cd -P "$(dirname "$src")" >/dev/null && pwd)"
+REPO="$(dirname "$BIN_DIR")"
 
 GATEWAY="${CHIKIN_GATEWAY:-http://localhost:8080}"
 RAW="${CHIKIN_NAME:-inst-$PPID}"
