@@ -278,6 +278,7 @@ banner() {
   cat <<EOF
 
   Dashboard:  $GATEWAY_URL/     (watch any browser live over noVNC)
+  Prove it's non-headless:      make verify
 
   Just run 'claude' — every instance automatically gets its own isolated
   browser. Pin a sticky, persistent one by name:  chikin-claude <name>

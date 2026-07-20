@@ -4,7 +4,7 @@
 COMPOSE = docker compose
 DEV     = docker compose -f docker-compose.yml -f docker-compose.dev.yml
 
-.PHONY: pull up down update dev-build dev-up uninstall purge
+.PHONY: pull up down update verify dev-build dev-up uninstall purge
 
 # Fetch the pinned gateway + fleet browser images from ghcr (builds nothing).
 pull:
@@ -20,6 +20,10 @@ down:
 # Run `git pull` first to move CHIKIN_VERSION / code forward.
 update: pull up
 	cd client && npm install --omit=dev
+
+# Prove a fleet browser is non-headless by driving one through the gateway MCP.
+verify:
+	cd verify && npm install --silent && node verify-fleet.js
 
 # Developer path: build both images locally instead of pulling.
 dev-build:
