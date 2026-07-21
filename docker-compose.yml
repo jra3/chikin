@@ -41,6 +41,12 @@ services:
   # the raw socket. Read-only socket mount; only the path groups we need are
   # enabled (containers + volumes + images + networks; POST for create/start/
   # stop). No EXEC, no host info, no swarm, etc.
+  #
+  # This proxy is an effective root-on-host primitive (POST /containers/create
+  # accepts arbitrary host binds), so it lives on the dedicated chikin-control
+  # network shared ONLY with the gateway. Browsers are NOT on chikin-control and
+  # therefore have no route to :2375 — a compromised Browser cannot reach the
+  # Docker API. See CHK-001 / docs/adr/0002.
   docker-socket-proxy:
     image: tecnativa/docker-socket-proxy:latest
     container_name: chikin-socket-proxy
@@ -53,7 +59,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
-      - chikin-net
+      - chikin-control
     restart: unless-stopped
 
   gateway:
@@ -97,9 +103,12 @@ services:
       docker-socket-proxy:
         condition: service_started
     networks:
-      # chikin-net (internal) reaches the socket-proxy and the chrome CDP
-      # endpoints; chikin-egress is non-internal so the published 8080 port can
-      # actually accept ingress from the host (internal-only nets can't).
+      # chikin-control (internal) reaches the socket-proxy; chikin-net (internal)
+      # reaches the chrome CDP/VNC endpoints; chikin-egress is non-internal so
+      # the published 8080 port can actually accept ingress from the host
+      # (internal-only nets can't). The gateway is the ONLY member of both
+      # chikin-control (with the proxy) and chikin-net (with the browsers).
+      - chikin-control
       - chikin-net
       - chikin-egress
     healthcheck:
@@ -113,9 +122,16 @@ services:
       retries: 5
 
 networks:
-  # Control plane: gateway <-> socket-proxy <-> chrome CDP. internal: true means
-  # no external connectivity, so a no-auth CDP endpoint can never be reached
-  # from outside Docker. The gateway's published port (ingress) still works.
+  # Control plane: gateway <-> socket-proxy ONLY. internal: true (no external
+  # connectivity) and, crucially, browsers are not attached — so the Docker API
+  # proxy is unreachable from any Browser. See CHK-001 / docs/adr/0002.
+  chikin-control:
+    name: chikin-control
+    internal: true
+  # Gateway <-> Browser data plane: CDP (9222) and VNC (6080). internal: true
+  # means a no-auth CDP endpoint can never be reached from outside Docker. NOTE:
+  # browsers still share this network with each other (cross-Browser isolation is
+  # deferred to CHK-002 / per-name networks); it no longer carries the proxy.
   chikin-net:
     name: chikin-net
     internal: true
