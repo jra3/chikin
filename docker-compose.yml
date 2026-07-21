@@ -72,6 +72,9 @@ services:
       # Empty disables bearer auth — fine because the published port is bound to
       # 127.0.0.1 only (loopback-trusted). Set a token to require one.
       GATEWAY_TOKEN: "${GATEWAY_TOKEN:-}"
+      # Extra allowed Origins for the noVNC control websocket (comma-separated).
+      # Default loopback set applies when empty. See CHK-006/CHK-016.
+      DASHBOARD_ORIGINS: "${DASHBOARD_ORIGINS:-}"
       MAX_FLEET: "${MAX_FLEET:-8}"
       IDLE_TTL_SEC: "${IDLE_TTL_SEC:-900}"
       REAP_INTERVAL_SEC: "${REAP_INTERVAL_SEC:-30}"
