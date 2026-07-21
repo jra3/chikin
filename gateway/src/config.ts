@@ -22,6 +22,11 @@ export const config = {
   // Bearer token required on /b/<name>/. Empty disables auth (dev only).
   token: process.env.GATEWAY_TOKEN ?? "",
 
+  // Extra browser Origins trusted by the loopback Origin/Host guard (noVNC
+  // websocket + rebinding checks), comma-separated full origins — e.g. an
+  // SSH-tunnel hostname. Empty = loopback-only. See CHK-006.
+  dashboardOrigins: str("DASHBOARD_ORIGINS", ""),
+
   // Docker access via the scoped tecnativa/docker-socket-proxy (HTTP, no TLS).
   dockerHost: str("DOCKER_PROXY_HOST", "docker-socket-proxy"),
   dockerPort: int("DOCKER_PROXY_PORT", 2375),
