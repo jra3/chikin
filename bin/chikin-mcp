@@ -29,9 +29,16 @@ BIN_DIR="$(cd -P "$(dirname "$src")" >/dev/null && pwd)"
 REPO="$(dirname "$BIN_DIR")"
 
 GATEWAY="${CHIKIN_GATEWAY:-http://localhost:8080}"
-RAW="${CHIKIN_NAME:-inst-$PPID}"
-# Gateway names must match [a-z0-9-]{1,32}.
-NAME="$(printf '%s' "$RAW" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-32)"
+NAME="${CHIKIN_NAME:-inst-$PPID}"
+# Gateway names must match [a-z0-9-]{1,32}. Fail closed on an out-of-charset or
+# over-length CHIKIN_NAME rather than silently folding it (tr/cut) — folding is
+# non-injective, so `work.alice` and `work_alice` would collapse onto the same
+# browser + profile volume (CHK-011). Mirrors chikin-claude's check. The default
+# inst-<ppid> is always valid.
+if ! [[ "$NAME" =~ ^[a-z0-9-]{1,32}$ ]]; then
+  echo "chikin-mcp: invalid CHIKIN_NAME '$NAME' (must be [a-z0-9-], 1-32 chars)" >&2
+  exit 64
+fi
 
 URL="${GATEWAY}/b/${NAME}/"
 
