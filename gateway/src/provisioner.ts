@@ -148,6 +148,17 @@ export class Provisioner {
         ShmSize: 2 * 1024 * 1024 * 1024,
         NetworkMode: config.network,
         RestartPolicy: { Name: "unless-stopped" },
+        // Least-privilege hardening (CHK-005). Drop all Linux capabilities, then
+        // add back only what the entrypoint's root bootstrap needs before it
+        // setpriv-drops to the chrome user: CHOWN + DAC_OVERRIDE to chown the
+        // fresh /data profile volume, SETUID/SETGID for the privilege drop, and
+        // KILL so tini (PID 1, root) can signal the unprivileged child on stop.
+        // Chrome itself then runs with no capabilities. no-new-privileges blocks
+        // regaining privileges via setuid binaries. (Verified: container boots,
+        // CDP answers, /data chowned to 1100, graceful stop works.)
+        CapDrop: ["ALL"],
+        CapAdd: ["CHOWN", "DAC_OVERRIDE", "SETUID", "SETGID", "KILL"],
+        SecurityOpt: ["no-new-privileges"],
       },
     };
   }
