@@ -7,6 +7,18 @@ import { Reaper } from "./reaper.js";
 import { createApp, makeUpgradeHandler } from "./server.js";
 
 async function main(): Promise<void> {
+  // Backstop: a rejected promise outside any request handler (background reaper
+  // sweep, bridge SSE pump, provisioner task) must not crash the single shared
+  // gateway under Node's default unhandled-rejection policy. Log and carry on.
+  // Request-handler rejections are already caught by the Express error backstop
+  // in server.ts. See CHK-013.
+  process.on("unhandledRejection", (reason) => {
+    log.error(
+      "unhandledRejection",
+      reason instanceof Error ? (reason.stack ?? reason.message) : String(reason),
+    );
+  });
+
   if (!config.token) {
     log.warn("GATEWAY_TOKEN is empty — bearer auth is DISABLED. Set it in production.");
   }

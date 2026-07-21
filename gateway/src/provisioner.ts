@@ -25,10 +25,27 @@ export interface FleetMember {
 
 export class Provisioner {
   private docker: Docker;
+  // Serializes the fleet-cap check-and-create critical section (CHK-010). The
+  // cap is a read-then-act (listFleet → compare → create); without this, N
+  // concurrent provisions of distinct new names each observe the same pre-create
+  // fleet size, all pass the check, and overshoot MAX_FLEET. Only the fast
+  // docker calls run under the lock; the slow waitHealthy poll stays outside, so
+  // concurrent cold-starts still warm up in parallel.
+  private createGate: Promise<unknown> = Promise.resolve();
 
   constructor(docker?: Docker) {
     this.docker =
       docker ?? new Docker({ host: config.dockerHost, port: config.dockerPort, protocol: "http" });
+  }
+
+  /** Run `fn` after all previously-gated calls settle (a simple async mutex). */
+  private serializeCreate<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.createGate.then(fn, fn);
+    this.createGate = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   /** Fail fast at startup if the fleet image is missing (issue #5). */
@@ -190,22 +207,28 @@ export class Provisioner {
       }
     } else {
       // New browser — enforce the cap against everything we already manage.
-      const fleet = await this.listFleet();
-      const existing = fleet.filter((m) => m.name !== name).length;
-      if (existing >= config.maxFleet) {
-        throw new FleetFullError(config.maxFleet);
-      }
-      await this.ensureVolume(name);
-      log.info(`provisioner: creating container ${cname}`);
-      const created = await this.docker.createContainer(this.buildCreateOptions(name));
-      // Attach the egress network so the browser can reach the internet; the
-      // primary chikin-net is internal-only (CDP isolated from the host).
-      try {
-        await this.docker.getNetwork(config.egressNetwork).connect({ Container: created.id });
-      } catch (e) {
-        log.warn(`provisioner: could not attach ${cname} to ${config.egressNetwork}`, String(e));
-      }
-      await created.start();
+      // The check-and-create runs under createGate so concurrent provisions of
+      // distinct names can't all pass the cap and overshoot MAX_FLEET (CHK-010).
+      // createContainer makes the container visible to the next listFleet(), so
+      // serialization is enough to keep the count honest.
+      await this.serializeCreate(async () => {
+        const fleet = await this.listFleet();
+        const existing = fleet.filter((m) => m.name !== name).length;
+        if (existing >= config.maxFleet) {
+          throw new FleetFullError(config.maxFleet);
+        }
+        await this.ensureVolume(name);
+        log.info(`provisioner: creating container ${cname}`);
+        const created = await this.docker.createContainer(this.buildCreateOptions(name));
+        // Attach the egress network so the browser can reach the internet; the
+        // primary chikin-net is internal-only (CDP isolated from the host).
+        try {
+          await this.docker.getNetwork(config.egressNetwork).connect({ Container: created.id });
+        } catch (e) {
+          log.warn(`provisioner: could not attach ${cname} to ${config.egressNetwork}`, String(e));
+        }
+        await created.start();
+      });
     }
 
     const ip = await this.resolveIp(name);
