@@ -38,6 +38,8 @@ Real (non-headless) Google Chrome in Docker, for browser automation that should 
 
 ## Quickstart (fleet)
 
+> **Just want it running?** `git clone https://github.com/jra3/chikin.git && cd chikin && ./install.sh` — the guided installer checks preconditions, pulls the images, wires up the MCP server, and sets up login autostart. See **[docs/INSTALL.md](docs/INSTALL.md)** for the full walkthrough (macOS + Linux, updates, uninstall). The steps below are the manual path.
+
 Prerequisites: Docker 20.10+ with Compose v2, and ~1.5 GB disk for the images (the first pull takes a few minutes).
 
 ```bash
