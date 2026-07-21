@@ -49,6 +49,20 @@ function nameMiddleware(req: Request, res: Response, next: NextFunction): void {
   next();
 }
 
+/**
+ * Wrap an async route handler so a rejected promise is forwarded to Express's
+ * error middleware instead of surfacing as an unhandledRejection — which, under
+ * Node's default policy, crashes the single shared gateway and disconnects every
+ * client until restart. Express 4 does not await handlers, so this is required
+ * on any `async` route. See CHK-013.
+ */
+type AsyncRoute = (req: Request, res: Response) => Promise<unknown>;
+function asyncRoute(fn: AsyncRoute) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    fn(req, res).catch(next);
+  };
+}
+
 export function createApp(deps: ServerDeps): express.Express {
   const app = express();
   app.disable("x-powered-by");
@@ -74,7 +88,7 @@ export function createApp(deps: ServerDeps): express.Express {
   // MCP endpoint, one logical browser per <name>. Bearer-protected.
   const b = express.Router({ mergeParams: true });
 
-  b.post("/", async (req: Request, res: Response) => {
+  b.post("/", asyncRoute(async (req: Request, res: Response) => {
     const name = req.params.name;
     const sid = req.header("mcp-session-id");
 
@@ -131,10 +145,10 @@ export function createApp(deps: ServerDeps): express.Express {
     }
     deps.registry.add(session);
     await session.http.handleRequest(req, res, req.body);
-  });
+  }));
 
   // Server->client SSE stream. Track attachment so the reaper leaves it alone.
-  b.get("/", async (req: Request, res: Response) => {
+  b.get("/", asyncRoute(async (req: Request, res: Response) => {
     const sid = req.header("mcp-session-id");
     const session = sid ? deps.registry.getBySessionId(sid) : undefined;
     if (!session || session.name !== req.params.name) {
@@ -151,10 +165,10 @@ export function createApp(deps: ServerDeps): express.Express {
     deps.registry.streamOpened(session.name);
     res.on("close", () => deps.registry.streamClosed(session.name));
     await session.http.handleRequest(req, res);
-  });
+  }));
 
   // Explicit session termination.
-  b.delete("/", async (req: Request, res: Response) => {
+  b.delete("/", asyncRoute(async (req: Request, res: Response) => {
     const sid = req.header("mcp-session-id");
     const session = sid ? deps.registry.getBySessionId(sid) : undefined;
     if (!session || session.name !== req.params.name) {
@@ -162,9 +176,22 @@ export function createApp(deps: ServerDeps): express.Express {
       return;
     }
     await session.http.handleRequest(req, res);
-  });
+  }));
 
   app.use("/b/:name", authMiddleware, nameMiddleware, express.json({ limit: "4mb" }), b);
+
+  // Error backstop: any handler rejection/throw lands here instead of becoming
+  // an unhandledRejection that crashes the shared process. If the response has
+  // already started streaming (SSE), we can't send a JSON error — delegate to
+  // Express's default handler, which closes the socket. See CHK-013.
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    log.error("unhandled request error", err instanceof Error ? (err.stack ?? err.message) : String(err));
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    res.status(500).json(rpcError(RPC.INTERNAL, "internal gateway error"));
+  });
 
   return app;
 }

@@ -14,6 +14,7 @@ export function rpcError(code: number, message: string, id: unknown = null) {
 export const RPC = {
   PARSE_ERROR: -32700,
   INVALID_REQUEST: -32600,
+  INTERNAL: -32603,
   // Application range for gateway-specific conditions.
   UNAUTHORIZED: -32001,
   NOT_FOUND: -32002,
