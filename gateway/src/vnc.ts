@@ -11,22 +11,22 @@ const proxy = httpProxy.createProxyServer({ ws: true, changeOrigin: true });
 
 // Host:port values we consider "ourselves" for the loopback-trusted dashboard.
 // The gateway is published on 127.0.0.1:<port>; a browser reaching it uses one
-// of these as its Origin/Host. An optional DASHBOARD_ORIGINS env (comma-list of
-// origins, e.g. for an SSH-tunnel hostname) extends the set.
-const selfHosts = new Set<string>([
-  `127.0.0.1:${config.port}`,
-  `localhost:${config.port}`,
-  `[::1]:${config.port}`,
-]);
-for (const o of (process.env.DASHBOARD_ORIGINS ?? "").split(",")) {
-  const trimmed = o.trim();
-  if (!trimmed) continue;
-  try {
-    selfHosts.add(new URL(trimmed).host);
-  } catch {
-    log.warn(`vnc: ignoring unparseable DASHBOARD_ORIGINS entry '${trimmed}'`);
+// of these as its Origin/Host. An optional DASHBOARD_ORIGINS config (comma-list
+// of origins, e.g. for an SSH-tunnel hostname) extends the set.
+export function buildSelfHosts(port: number, originsCsv: string): Set<string> {
+  const hosts = new Set<string>([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
+  for (const o of originsCsv.split(",")) {
+    const trimmed = o.trim();
+    if (!trimmed) continue;
+    try {
+      hosts.add(new URL(trimmed).host);
+    } catch {
+      log.warn(`vnc: ignoring unparseable DASHBOARD_ORIGINS entry '${trimmed}'`);
+    }
   }
+  return hosts;
 }
+const selfHosts = buildSelfHosts(config.port, config.dashboardOrigins);
 
 /** True if the request's Host header is one of ours (DNS-rebinding guard). */
 export function hostOk(req: IncomingMessage): boolean {
