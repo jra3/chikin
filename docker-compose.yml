@@ -29,7 +29,9 @@ services:
   # One-shot: make the shared scratch dir world-writable (1777, sticky) before
   # any browser mounts it as ~/Downloads. Idempotent — safe every `up`.
   shared-init:
-    image: busybox
+    # Pinned by digest (busybox:1.36) — this runs as root against a host bind
+    # mount, so the exact bytes matter. See CHK-008.
+    image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
     container_name: chikin-shared-init
     user: root
     command: ["chmod", "1777", "/shared"]
@@ -42,7 +44,10 @@ services:
   # enabled (containers + volumes + images + networks; POST for create/start/
   # stop). No EXEC, no host info, no swarm, etc.
   docker-socket-proxy:
-    image: tecnativa/docker-socket-proxy:latest
+    # Pinned by digest — this is the enforcement point for the Docker control
+    # plane (holds the RO /var/run/docker.sock mount), so a mutable :latest here
+    # is the single highest-value tag to lock down. See CHK-008.
+    image: tecnativa/docker-socket-proxy:0.3.0@sha256:9e4b9e7517a6b660f2cc903a19b257b1852d5b3344794e3ea334ff00ae677ac2
     container_name: chikin-socket-proxy
     environment:
       CONTAINERS: "1"
