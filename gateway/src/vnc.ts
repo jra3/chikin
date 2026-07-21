@@ -29,7 +29,7 @@ for (const o of (process.env.DASHBOARD_ORIGINS ?? "").split(",")) {
 }
 
 /** True if the request's Host header is one of ours (DNS-rebinding guard). */
-function hostOk(req: IncomingMessage): boolean {
+export function hostOk(req: IncomingMessage): boolean {
   const host = req.headers.host;
   return typeof host === "string" && selfHosts.has(host);
 }

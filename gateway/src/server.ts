@@ -9,7 +9,7 @@ import { Registry } from "./registry.js";
 import { Provisioner, FleetFullError, ProvisionError } from "./provisioner.js";
 import { createSession } from "./bridge.js";
 import { renderDashboard } from "./dashboard.js";
-import { vncHttpHandler, vncUpgradeHandler } from "./vnc.js";
+import { vncHttpHandler, vncUpgradeHandler, hostOk } from "./vnc.js";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
@@ -44,6 +44,22 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
 function nameMiddleware(req: Request, res: Response, next: NextFunction): void {
   if (!isValidName(req.params.name)) {
     res.status(400).json(rpcError(RPC.INVALID_REQUEST, `invalid browser name '${req.params.name}'`));
+    return;
+  }
+  next();
+}
+
+// DNS-rebinding guard for the MCP endpoint (CHK-006a). The `application/json`
+// body forces a CORS preflight, which blocks a *cross-origin* POST — but not a
+// rebinding attack: once an attacker page rebinds its own hostname to
+// 127.0.0.1, the request is same-origin (no preflight), and with an empty
+// GATEWAY_TOKEN (the shipped default) nothing else stops it driving the fleet.
+// So require the Host to be one we published on, reusing the /vnc guard's set
+// (loopback + DASHBOARD_ORIGINS). A set token already blunts this; this closes
+// the no-token default too.
+function hostMiddleware(req: Request, res: Response, next: NextFunction): void {
+  if (!hostOk(req)) {
+    res.status(403).json(rpcError(RPC.UNAUTHORIZED, "forbidden host"));
     return;
   }
   next();
@@ -170,7 +186,7 @@ export function createApp(deps: ServerDeps): express.Express {
     await session.http.handleRequest(req, res);
   });
 
-  app.use("/b/:name", authMiddleware, nameMiddleware, express.json({ limit: "4mb" }), b);
+  app.use("/b/:name", hostMiddleware, authMiddleware, nameMiddleware, express.json({ limit: "4mb" }), b);
 
   return app;
 }

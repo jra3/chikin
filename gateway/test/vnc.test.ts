@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { IncomingMessage } from "node:http";
-import { vncUpgradeAllowed } from "../src/vnc.js";
+import { vncUpgradeAllowed, hostOk } from "../src/vnc.js";
 
 // config.port defaults to 8080 in tests (no PORT env), so the trusted set is
 // {127.0.0.1:8080, localhost:8080, [::1]:8080}.
@@ -45,4 +45,16 @@ test("vnc upgrade: rejects a wrong port", () => {
     vncUpgradeAllowed(req({ origin: "http://127.0.0.1:9999", host: "127.0.0.1:9999" })),
     false,
   );
+});
+
+// hostOk also backs the MCP endpoint's DNS-rebinding guard (CHK-006a).
+test("hostOk: accepts our own loopback Host", () => {
+  assert.equal(hostOk(req({ host: "127.0.0.1:8080" })), true);
+  assert.equal(hostOk(req({ host: "localhost:8080" })), true);
+});
+
+test("hostOk: rejects a rebinding Host and a missing Host", () => {
+  assert.equal(hostOk(req({ host: "attacker.test" })), false, "foreign Host (DNS-rebinding) rejected");
+  assert.equal(hostOk(req({ host: "127.0.0.1:9999" })), false, "wrong port rejected");
+  assert.equal(hostOk(req({})), false, "missing Host rejected");
 });
