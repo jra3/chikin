@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
@@ -17,6 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libnss3 libpango-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 \
       libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 \
       libxrender1 libxss1 libxtst6 xdg-utils \
+  && : "KNOWN RESIDUAL NON-REPRODUCIBILITY (CHK-009/M4): google-chrome-stable" \
+  && : "below comes from Google's floating apt repo, which only serves the newest" \
+  && : "version — so this layer is not pinned to an exact Chrome version. Exact" \
+  && : "apt-version pinning is fragile here (old versions vanish and break builds)," \
+  && : "so it is intentionally left unpinned. Base image + npm deps ARE pinned." \
   && if [ "$TARGETARCH" = "amd64" ]; then \
        wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
          | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg && \

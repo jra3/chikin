@@ -1,5 +1,5 @@
 # --- build stage: compile TypeScript -----------------------------------------
-FROM node:22-bookworm-slim AS build
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS build
 WORKDIR /app
 # chrome-devtools-mcp pulls puppeteer-core; never fetch a browser (we connect
 # to the fleet over CDP via --browserUrl).
@@ -14,7 +14,7 @@ COPY test ./test
 RUN npm run build
 
 # --- runtime stage ------------------------------------------------------------
-FROM node:22-bookworm-slim AS runtime
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PUPPETEER_SKIP_DOWNLOAD=1 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1
