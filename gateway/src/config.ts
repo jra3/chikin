@@ -22,10 +22,11 @@ export const config = {
   // Bearer token required on /b/<name>/. Empty disables auth (dev only).
   token: process.env.GATEWAY_TOKEN ?? "",
 
-  // Extra browser Origins trusted by the loopback Origin/Host guard (noVNC
-  // websocket + rebinding checks), comma-separated full origins — e.g. an
-  // SSH-tunnel hostname. Empty = loopback-only. See CHK-006.
-  dashboardOrigins: str("DASHBOARD_ORIGINS", ""),
+  // Extra browser Origins trusted by ALL the loopback Origin/Host guards —
+  // dashboard (/), noVNC websocket (/vnc), and the MCP Host check (/b) —
+  // comma-separated full origins, e.g. an SSH-tunnel hostname. Empty =
+  // loopback-only. See CHK-006/CHK-006a.
+  extraOrigins: str("GATEWAY_EXTRA_ORIGINS", ""),
 
   // Docker access via the scoped tecnativa/docker-socket-proxy (HTTP, no TLS).
   dockerHost: str("DOCKER_PROXY_HOST", "docker-socket-proxy"),
@@ -38,8 +39,10 @@ export const config = {
   // every NEW per-name profile so browsers start already logged in. Populate it
   // with `bin/chikin-snapshot`. Empty = disabled (browsers start fresh).
   seedVolume: str("SEED_VOLUME", ""),
-  // Control-plane network (internal: true): gateway <-> socket-proxy <-> chrome
-  // CDP. Egress network gives the browsers actual internet access for browsing.
+  // Gateway <-> Browser data plane (internal: true): CDP + VNC. The Docker
+  // control plane (socket-proxy) lives on the separate chikin-control network,
+  // which browsers cannot reach (see docs/adr/0002). Egress network gives the
+  // browsers actual internet access for browsing.
   network: str("CHIKIN_NETWORK", "chikin-net"),
   egressNetwork: str("CHIKIN_EGRESS_NETWORK", "chikin-egress"),
 

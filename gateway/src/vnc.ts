@@ -9,10 +9,10 @@ import { log } from "./log.js";
 // Single shared proxy for all /vnc/<name>/ traffic, websocket upgrades included.
 const proxy = httpProxy.createProxyServer({ ws: true, changeOrigin: true });
 
-// Host:port values we consider "ourselves" for the loopback-trusted dashboard.
+// Host:port values we consider "ourselves" for the loopback-trusted surfaces.
 // The gateway is published on 127.0.0.1:<port>; a browser reaching it uses one
-// of these as its Origin/Host. An optional DASHBOARD_ORIGINS config (comma-list
-// of origins, e.g. for an SSH-tunnel hostname) extends the set.
+// of these as its Origin/Host. An optional GATEWAY_EXTRA_ORIGINS config (comma-
+// list of origins, e.g. for an SSH-tunnel hostname) extends the set.
 export function buildSelfHosts(port: number, originsCsv: string): Set<string> {
   const hosts = new Set<string>([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
   for (const o of originsCsv.split(",")) {
@@ -21,12 +21,12 @@ export function buildSelfHosts(port: number, originsCsv: string): Set<string> {
     try {
       hosts.add(new URL(trimmed).host);
     } catch {
-      log.warn(`vnc: ignoring unparseable DASHBOARD_ORIGINS entry '${trimmed}'`);
+      log.warn(`vnc: ignoring unparseable GATEWAY_EXTRA_ORIGINS entry '${trimmed}'`);
     }
   }
   return hosts;
 }
-const selfHosts = buildSelfHosts(config.port, config.dashboardOrigins);
+const selfHosts = buildSelfHosts(config.port, config.extraOrigins);
 
 /** True if the request's Host header is one of ours (DNS-rebinding guard). */
 export function hostOk(req: IncomingMessage): boolean {

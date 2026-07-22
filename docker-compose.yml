@@ -83,9 +83,10 @@ services:
       # Empty disables bearer auth — fine because the published port is bound to
       # 127.0.0.1 only (loopback-trusted). Set a token to require one.
       GATEWAY_TOKEN: "${GATEWAY_TOKEN:-}"
-      # Extra allowed Origins for the noVNC control websocket (comma-separated).
-      # Default loopback set applies when empty. See CHK-006/CHK-016.
-      DASHBOARD_ORIGINS: "${DASHBOARD_ORIGINS:-}"
+      # Extra Origins trusted by every Origin/Host guard: dashboard, noVNC
+      # websocket, and the MCP Host check (comma-separated). Default loopback
+      # set applies when empty. See CHK-006/CHK-006a/CHK-016.
+      GATEWAY_EXTRA_ORIGINS: "${GATEWAY_EXTRA_ORIGINS:-}"
       MAX_FLEET: "${MAX_FLEET:-8}"
       IDLE_TTL_SEC: "${IDLE_TTL_SEC:-900}"
       REAP_INTERVAL_SEC: "${REAP_INTERVAL_SEC:-30}"

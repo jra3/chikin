@@ -66,7 +66,7 @@ test("buildSelfHosts: loopback-only by default", () => {
   );
 });
 
-test("buildSelfHosts: DASHBOARD_ORIGINS extends the set; garbage is ignored", () => {
+test("buildSelfHosts: GATEWAY_EXTRA_ORIGINS extends the set; garbage is ignored", () => {
   const hosts = buildSelfHosts(8080, " https://tunnel.example:9443 , not a url , http://box.lan:8080 ,");
   assert.ok(hosts.has("tunnel.example:9443"), "valid extra origin trusted");
   assert.ok(hosts.has("box.lan:8080"), "second extra origin trusted");

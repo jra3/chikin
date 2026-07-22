@@ -49,14 +49,14 @@ function nameMiddleware(req: Request, res: Response, next: NextFunction): void {
   next();
 }
 
-// DNS-rebinding guard for the MCP endpoint (CHK-006a). The `application/json`
-// body forces a CORS preflight, which blocks a *cross-origin* POST — but not a
-// rebinding attack: once an attacker page rebinds its own hostname to
-// 127.0.0.1, the request is same-origin (no preflight), and with an empty
-// GATEWAY_TOKEN (the shipped default) nothing else stops it driving the fleet.
-// So require the Host to be one we published on, reusing the /vnc guard's set
-// (loopback + DASHBOARD_ORIGINS). A set token already blunts this; this closes
-// the no-token default too.
+// DNS-rebinding guard for the MCP endpoint and dashboard (CHK-006a). The
+// `application/json` body forces a CORS preflight, which blocks a
+// *cross-origin* POST — but not a rebinding attack: once an attacker page
+// rebinds its own hostname to 127.0.0.1, the request is same-origin (no
+// preflight), and with an empty GATEWAY_TOKEN (the shipped default) nothing
+// else stops it driving the fleet. So require the Host to be one we published
+// on, reusing the /vnc guard's set (loopback + GATEWAY_EXTRA_ORIGINS). A set
+// token already blunts this; this closes the no-token default too.
 function hostMiddleware(req: Request, res: Response, next: NextFunction): void {
   if (!hostOk(req)) {
     res.status(403).json(rpcError(RPC.UNAUTHORIZED, "forbidden host"));
@@ -95,7 +95,10 @@ export function createApp(deps: ServerDeps): express.Express {
   // two surfaces rely on loopback binding plus the Origin/Host guard in vnc.ts
   // (CHK-006). A set token therefore does NOT harden a shared/multi-user host —
   // keep the box single-trusted-user. See CHK-016.
-  app.get("/", async (_req, res) => {
+  //
+  // hostMiddleware keeps a DNS-rebinding page from reading fleet names/status
+  // off the dashboard HTML — the last unguarded rebinding surface (issue #47).
+  app.get("/", hostMiddleware, async (_req, res) => {
     try {
       res.type("html").send(await renderDashboard(deps.provisioner, deps.registry));
     } catch (e) {
