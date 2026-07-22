@@ -1,0 +1,453 @@
+#!/usr/bin/env node
+// chikin-record <name> [--mp4] [--gif] [--seconds N] [--url URL] [--out DIR] [--fps N] [--width W]
+//
+// Record a video (mp4) and/or an animated GIF of a named chikin browser and
+// assemble it on the host with ffmpeg. Packages the flow a recording scout
+// proved end-to-end (it recorded the live mulm site through the `mulm` browser).
+//
+// HOW IT WORKS (the verified recipe)
+//   The fleet never publishes Chrome's CDP port 9222 to the host — by design.
+//   But the host shares chikin's docker bridge network, so we reach CDP directly
+//   at the container's IP (chikin-chrome-<name>:9222). Over the CDP WebSocket we
+//   enable Page, optionally Page.navigate to --url, then Page.startScreencast
+//   (jpeg). Screencast frames are EVENT-DRIVEN — Chrome emits one only when the
+//   page changes visually, NOT at a fixed fps — so we record for the requested
+//   wall-clock duration and keep each frame's own metadata.timestamp. ffmpeg's
+//   concat demuxer then stitches the frames back with their real per-frame
+//   durations (constant-fps assembly would speed up idle stretches and warp
+//   motion). Stop with Page.stopScreencast after --seconds.
+//
+//   The MCP `take_screenshot` tool is NOT a viable basis: its filePath is
+//   sandboxed to the gateway workspace and can't write host paths.
+//
+// REMOTE-HOST FALLBACK (out of scope for v1 — future work)
+//   This direct-CDP-via-container-IP path needs the host to be able to route to
+//   the docker bridge network (true when chikin runs on this machine). On a
+//   remote or locked-down host where the container IP isn't reachable, a future
+//   fallback could screen-record the noVNC display with ffmpeg's x11grab against
+//   the container's Xvfb. Not built here — see README "Recording".
+//
+// Preflight: requires `ffmpeg` and `docker` on the host, and a Node with the
+// global WebSocket (Node >= 22). The container chikin-chrome-<name> must already
+// be running — a client has to connect to /b/<name>/ once to provision it.
+"use strict";
+
+const { spawn, spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const PROG = "chikin-record";
+
+// Browser names map into Docker container/volume names and DNS labels, so the
+// gateway restricts them to a conservative DNS-safe charset. Mirror the
+// canonical rule from gateway/src/names.ts exactly: [a-z0-9-], 1-32 chars, no
+// leading/trailing dash. Fail closed on a bad name rather than let docker error.
+const NAME_RE = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
+
+function die(msg, code = 1) {
+  process.stderr.write(`${PROG}: ${msg}\n`);
+  process.exit(code);
+}
+
+const USAGE = `usage: ${PROG} <name> [--mp4] [--gif] [--seconds N] [--url URL] [--out DIR] [--fps N] [--width W]
+
+Record a video (mp4) and/or animated GIF of the chikin browser <name>
+(container chikin-chrome-<name>) via CDP screencast, assembled with ffmpeg.
+
+Arguments:
+  <name>          browser name (container chikin-chrome-<name>); [a-z0-9-], 1-32 chars
+  --mp4           produce an mp4 (default when neither --mp4 nor --gif is given)
+  --gif           produce an animated GIF
+  --seconds N     record duration in seconds (default 8)
+  --url URL       navigate here before recording (default: record the current page)
+  --out DIR       output directory (default: current dir)
+  --fps N         output frame rate (default 15 for mp4, 10 for gif)
+  --width W       output width in px, height auto (default 1280 for mp4, 800 for gif)
+  -h, --help      show this help
+
+Outputs are named <name>-<timestamp>.mp4 / .gif in the output dir.
+
+Prerequisites: ffmpeg and docker on the host, Node >= 22, and the browser must be
+running (connect a client to /b/<name>/ once to provision chikin-chrome-<name>).`;
+
+function parseArgs(argv) {
+  const a = {
+    name: undefined,
+    mp4: false,
+    gif: false,
+    seconds: 8,
+    url: undefined,
+    out: process.cwd(),
+    fps: undefined, // per-format default applied later
+    width: undefined,
+    fpsSet: false,
+    widthSet: false,
+  };
+  const needVal = (v, i) => {
+    if (i + 1 >= argv.length) die(`${v} requires a value`, 64);
+    return argv[i + 1];
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const v = argv[i];
+    if (v === "-h" || v === "--help") {
+      process.stdout.write(USAGE + "\n");
+      process.exit(0);
+    } else if (v === "--mp4") a.mp4 = true;
+    else if (v === "--gif") a.gif = true;
+    else if (v === "--seconds") { a.seconds = Number(needVal(v, i)); i++; }
+    else if (v === "--url") { a.url = needVal(v, i); i++; }
+    else if (v === "--out") { a.out = needVal(v, i); i++; }
+    else if (v === "--fps") { a.fps = Number(needVal(v, i)); a.fpsSet = true; i++; }
+    else if (v === "--width") { a.width = Number(needVal(v, i)); a.widthSet = true; i++; }
+    else if (v.startsWith("-")) die(`unknown option '${v}'\n\n${USAGE}`, 64);
+    else if (a.name === undefined) a.name = v;
+    else die(`unexpected argument '${v}'\n\n${USAGE}`, 64);
+  }
+
+  if (a.name === undefined) die(`missing <name>\n\n${USAGE}`, 64);
+  if (!NAME_RE.test(a.name)) {
+    die(`invalid browser name '${a.name}': must match [a-z0-9-], 1-32 chars, no leading/trailing dash`, 64);
+  }
+  // Default output: an mp4 when the caller picked nothing.
+  if (!a.mp4 && !a.gif) a.mp4 = true;
+  if (!Number.isFinite(a.seconds) || a.seconds <= 0) die(`--seconds must be a positive number`, 64);
+  if (a.fpsSet && (!Number.isFinite(a.fps) || a.fps <= 0)) die(`--fps must be a positive number`, 64);
+  if (a.widthSet && (!Number.isInteger(a.width) || a.width <= 0)) die(`--width must be a positive integer`, 64);
+  return a;
+}
+
+// --- preflight ------------------------------------------------------------
+
+function preflight() {
+  if (typeof WebSocket === "undefined") {
+    die(
+      "this Node has no global WebSocket (need Node >= 22).\n" +
+        `  running: ${process.version}. Install a newer Node and re-run.`,
+      69,
+    );
+  }
+  if (spawnSync("ffmpeg", ["-version"], { stdio: "ignore" }).error) {
+    die(
+      "ffmpeg not found on PATH.\n" +
+        "  install it, e.g.:  sudo apt install ffmpeg   (or: brew install ffmpeg)",
+      69,
+    );
+  }
+  if (spawnSync("docker", ["version", "--format", "{{.Client.Version}}"], { stdio: "ignore" }).error) {
+    die("docker not found on PATH — chikin browsers run in docker; install docker and retry.", 69);
+  }
+}
+
+// Resolve chikin-chrome-<name>'s bridge IP, erroring clearly if it isn't running.
+function resolveContainerIp(name) {
+  const container = `chikin-chrome-${name}`;
+  const running = spawnSync("docker", ["inspect", "-f", "{{.State.Running}}", container], {
+    encoding: "utf8",
+  });
+  if (running.status !== 0 || running.stdout.trim() !== "true") {
+    die(
+      `browser '${name}' is not running (container ${container} absent or stopped).\n` +
+        `  Provision it by connecting a client to the browser once, e.g.:\n` +
+        `      chikin-claude ${name}\n` +
+        `  or open  http://localhost:8080/b/${name}/  — then re-run ${PROG}.`,
+      69,
+    );
+  }
+  // A container can sit on several networks; take the first non-empty IP.
+  const insp = spawnSync(
+    "docker",
+    ["inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", container],
+    { encoding: "utf8" },
+  );
+  const ip = (insp.stdout || "").trim().split(/\s+/).filter(Boolean)[0];
+  if (!ip) die(`could not resolve an IP for ${container} — is it attached to chikin's docker network?`, 69);
+  return ip;
+}
+
+// Pick the CDP page target's WebSocket debugger URL.
+async function pageTargetWs(ip) {
+  const base = `http://${ip}:9222`;
+  let list;
+  try {
+    const res = await fetch(`${base}/json`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    list = await res.json();
+  } catch (e) {
+    die(
+      `could not reach the browser's CDP endpoint at ${base}/json (${e.message}).\n` +
+        `  On a remote/locked-down host the container IP may be unreachable — see the README "Recording" fallback note.`,
+      69,
+    );
+  }
+  const page = (list || []).find((t) => t.type === "page" && t.webSocketDebuggerUrl);
+  if (!page) die(`no CDP 'page' target on ${base}/json — the browser has no open page to record.`, 69);
+  return page.webSocketDebuggerUrl;
+}
+
+// --- CDP screencast -------------------------------------------------------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Minimal CDP client over the global WebSocket: send commands with incrementing
+// ids and resolve on the matching id; fan events out to any number of listeners
+// registered with onEvent() (so the frame writer and a one-shot load waiter can
+// both watch the stream).
+function cdpConnect(wsUrl) {
+  const ws = new WebSocket(wsUrl);
+  const pending = new Map();
+  const listeners = new Set();
+  let nextId = 1;
+
+  ws.addEventListener("message", (ev) => {
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    if (msg.id !== undefined && pending.has(msg.id)) {
+      const { resolve, reject } = pending.get(msg.id);
+      pending.delete(msg.id);
+      if (msg.error) reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+      else resolve(msg.result);
+    } else if (msg.method) {
+      for (const fn of listeners) fn(msg.method, msg.params);
+    }
+  });
+
+  const ready = new Promise((resolve, reject) => {
+    ws.addEventListener("open", () => resolve());
+    ws.addEventListener("error", () => reject(new Error("CDP WebSocket error")));
+  });
+
+  const send = (method, params = {}) =>
+    new Promise((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, { resolve, reject });
+      ws.send(JSON.stringify({ id, method, params }));
+    });
+
+  // Returns an unsubscribe fn.
+  const onEvent = (fn) => {
+    listeners.add(fn);
+    return () => listeners.delete(fn);
+  };
+
+  return { ready, send, onEvent, close: () => ws.close() };
+}
+
+async function capture(wsUrl, args, framesDir) {
+  const cdp = cdpConnect(wsUrl);
+  await cdp.ready;
+
+  const frames = []; // { file, t } — t is CDP metadata.timestamp (epoch seconds)
+  let seq = 0;
+  cdp.onEvent((method, params) => {
+    if (method !== "Page.screencastFrame") return;
+    const file = path.join(framesDir, `frame-${String(seq++).padStart(6, "0")}.jpg`);
+    fs.writeFileSync(file, Buffer.from(params.data, "base64"));
+    frames.push({ file, t: params.metadata && params.metadata.timestamp });
+    // Ack so Chrome keeps sending frames (it stops without acks).
+    cdp.send("Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
+  });
+
+  await cdp.send("Page.enable");
+  if (args.url) {
+    const loaded = new Promise((resolve) => {
+      const off = cdp.onEvent((method) => {
+        if (method === "Page.loadEventFired") {
+          off();
+          resolve();
+        }
+      });
+    });
+    await cdp.send("Page.navigate", { url: args.url });
+    // Don't hang forever if load never fires (SPA, streaming download, etc.).
+    await Promise.race([loaded, sleep(Math.min(args.seconds, 15) * 1000)]);
+  }
+
+  await cdp.send("Page.startScreencast", { format: "jpeg", quality: 80, everyNthFrame: 1 });
+  // CDP frame metadata.timestamp is seconds-since-epoch, so Date.now()/1000 is
+  // on the same clock. Bracket the take with [startEpoch, endEpoch] so timing is
+  // anchored to the real recording window: metadata.timestamp is the COMPOSITOR
+  // frame time, so on a static page the first delivered frame can be stamped
+  // back at page-load (before startScreencast). Clamping into this window keeps
+  // the assembled duration at ~--seconds instead of inflating from a stale stamp.
+  const startEpoch = Date.now() / 1000;
+  await sleep(args.seconds * 1000);
+  const endEpoch = Date.now() / 1000;
+  await cdp.send("Page.stopScreencast").catch(() => {});
+  cdp.close();
+
+  return { frames, startEpoch, endEpoch };
+}
+
+// --- ffmpeg assembly ------------------------------------------------------
+
+// Expand the event-driven captured frames into a CONSTANT-fps image sequence
+// covering the whole [startEpoch, endEpoch] recording window, then let ffmpeg
+// read that clean sequence at a fixed -framerate. This sidesteps ffmpeg's
+// concat-demuxer per-frame-duration quirks entirely (the `fps` filter and the
+// "repeat last frame" trick both mis-hold the tail on a static page, doubling
+// the length) and honors --fps / --width exactly.
+//
+// Screencast frames fire only on visual change, so a static stretch emits none;
+// we simply hold whichever frame was last shown at each output tick — including
+// the long static tail after the final change, which is what makes the video
+// span the full --seconds. metadata.timestamp is the COMPOSITOR frame time, so a
+// static page's first frame can carry a pre-startScreencast stamp; clamping each
+// timestamp into the recording window keeps timing anchored to real wall clock.
+//
+// Frames are hardlinked (falling back to copy) into seqDir as f_%06d.jpg — near
+// zero disk/time even for hundreds of ticks. Returns the frame count written.
+function buildSequence(frames, startEpoch, endEpoch, fps, seqDir) {
+  const window = Math.max(endEpoch - startEpoch, 1 / fps);
+  // Per-frame display-start times, clamped into the window and forced monotonic.
+  // Fall back to even spacing if timestamps are missing/degenerate.
+  let times = frames.map((f) =>
+    Number.isFinite(f.t) ? Math.min(Math.max(f.t, startEpoch), endEpoch) : undefined,
+  );
+  if (times.some((t) => t === undefined)) {
+    times = frames.map((_, i) => startEpoch + (window * i) / frames.length);
+  }
+  for (let i = 1; i < times.length; i++) {
+    if (times[i] < times[i - 1]) times[i] = times[i - 1];
+  }
+
+  const n = Math.max(1, Math.round(window * fps));
+  let cursor = 0;
+  for (let k = 0; k < n; k++) {
+    // Sample the middle of each output tick and pick the last frame shown by then.
+    const t = startEpoch + (k + 0.5) / fps;
+    while (cursor + 1 < times.length && times[cursor + 1] <= t) cursor++;
+    const src = frames[cursor].file;
+    const dst = path.join(seqDir, `f_${String(k).padStart(6, "0")}.jpg`);
+    try {
+      fs.linkSync(src, dst);
+    } catch {
+      fs.copyFileSync(src, dst);
+    }
+  }
+  return n;
+}
+
+function runFfmpeg(argsList, cwd) {
+  return new Promise((resolve, reject) => {
+    const p = spawn("ffmpeg", argsList, { cwd, stdio: ["ignore", "ignore", "pipe"] });
+    let err = "";
+    p.stderr.on("data", (d) => (err += d));
+    p.on("close", (code) =>
+      code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}:\n${err.slice(-1200)}`)),
+    );
+  });
+}
+
+// Assemble outputs from a pre-expanded constant-fps sequence (see buildSequence).
+// Each output builds its own sequence dir because mp4 and gif default to
+// different fps. The input is already at `fps`, so no fps/vsync gymnastics.
+async function assembleMp4(frames, startEpoch, endEpoch, outPath, workDir, args) {
+  const width = args.widthSet ? args.width : 1280;
+  const fps = args.fpsSet ? args.fps : 15;
+  const seqDir = fs.mkdtempSync(path.join(workDir, "mp4-"));
+  buildSequence(frames, startEpoch, endEpoch, fps, seqDir);
+  await runFfmpeg(
+    [
+      "-y", "-framerate", String(fps), "-i", "f_%06d.jpg",
+      "-vf", `scale=${width}:-2:flags=lanczos`,
+      "-pix_fmt", "yuv420p", "-r", String(fps),
+      "-c:v", "libx264", "-crf", "28", "-movflags", "+faststart",
+      outPath,
+    ],
+    seqDir,
+  );
+}
+
+async function assembleGif(frames, startEpoch, endEpoch, outPath, workDir, args) {
+  const width = args.widthSet ? args.width : 800;
+  const fps = args.fpsSet ? args.fps : 10;
+  const seqDir = fs.mkdtempSync(path.join(workDir, "gif-"));
+  buildSequence(frames, startEpoch, endEpoch, fps, seqDir);
+  await runFfmpeg(
+    [
+      "-y", "-framerate", String(fps), "-i", "f_%06d.jpg",
+      "-vf",
+      `scale=${width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`,
+      "-loop", "0",
+      outPath,
+    ],
+    seqDir,
+  );
+}
+
+// --- main -----------------------------------------------------------------
+
+// Compact filesystem-safe timestamp (UTC): YYYYMMDD-HHMMSS.
+function stamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return (
+    `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}` +
+    `-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`
+  );
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  preflight();
+
+  if (!fs.existsSync(args.out)) die(`--out directory does not exist: ${args.out}`, 66);
+  const outStat = fs.statSync(args.out);
+  if (!outStat.isDirectory()) die(`--out is not a directory: ${args.out}`, 66);
+
+  const ip = resolveContainerIp(args.name);
+  const wsUrl = await pageTargetWs(ip);
+
+  const framesDir = fs.mkdtempSync(path.join(os.tmpdir(), `${PROG}-${args.name}-`));
+  // Always clean up the temp frames dir, even on error / signal.
+  const cleanup = () => {
+    try {
+      fs.rmSync(framesDir, { recursive: true, force: true });
+    } catch {}
+  };
+  process.on("exit", cleanup);
+  process.on("SIGINT", () => { cleanup(); process.exit(130); });
+  process.on("SIGTERM", () => { cleanup(); process.exit(143); });
+
+  process.stderr.write(
+    `${PROG}: recording ${args.name} (${ip}:9222) for ${args.seconds}s` +
+      `${args.url ? ` at ${args.url}` : ""}...\n`,
+  );
+
+  const { frames, startEpoch, endEpoch } = await capture(wsUrl, args, framesDir);
+  if (frames.length === 0) {
+    die(
+      "captured 0 frames — screencast frames fire only on visual change, so a fully static page can yield none.\n" +
+        "  Try recording a page with motion, navigate with --url, or increase --seconds.",
+      70,
+    );
+  }
+  process.stderr.write(`${PROG}: captured ${frames.length} frames; assembling...\n`);
+
+  const base = path.join(path.resolve(args.out), `${args.name}-${stamp()}`);
+  const produced = [];
+  if (args.mp4) {
+    const out = `${base}.mp4`;
+    await assembleMp4(frames, startEpoch, endEpoch, out, framesDir, args);
+    produced.push(out);
+  }
+  if (args.gif) {
+    const out = `${base}.gif`;
+    await assembleGif(frames, startEpoch, endEpoch, out, framesDir, args);
+    produced.push(out);
+  }
+
+  for (const f of produced) {
+    const sz = fs.statSync(f).size;
+    process.stdout.write(`${f}  (${(sz / 1024).toFixed(0)} KiB)\n`);
+  }
+}
+
+main().catch((e) => {
+  die(e.stack || e.message || String(e), 70);
+});
