@@ -29,7 +29,7 @@ export function buildSelfHosts(port: number, originsCsv: string): Set<string> {
 const selfHosts = buildSelfHosts(config.port, config.dashboardOrigins);
 
 /** True if the request's Host header is one of ours (DNS-rebinding guard). */
-function hostOk(req: IncomingMessage): boolean {
+export function hostOk(req: IncomingMessage): boolean {
   const host = req.headers.host;
   return typeof host === "string" && selfHosts.has(host);
 }
