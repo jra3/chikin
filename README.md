@@ -104,6 +104,28 @@ claude mcp add --transport http bob   http://localhost:8080/b/bob/ \
 
 Open the dashboard at <http://localhost:8080/> and click **open noVNC** next to any running browser, or go straight to `http://localhost:8080/vnc/<name>/`. You can drive that Chrome window by hand — useful for logging in or clearing a captcha while the MCP client keeps the session.
 
+### Recording (video / GIF)
+
+`chikin-record` captures a running browser to an **mp4** and/or animated **GIF** in one command. It records the browser over CDP `Page.startScreencast` (reached at the container's IP on chikin's docker network — the fleet never publishes port 9222 to the host) and assembles the frames with `ffmpeg`.
+
+```bash
+# 8s mp4 of the current page in browser "giard"
+chikin-record giard
+
+# navigate first, produce both an mp4 and a GIF, into ./clips
+chikin-record giard --mp4 --gif --url https://example.com --seconds 10 --out ./clips
+
+chikin-record --help    # full options: --seconds --fps --width --out …
+```
+
+Outputs are named `<name>-<timestamp>.mp4` / `.gif`. If neither `--mp4` nor `--gif` is given it defaults to an mp4.
+
+**Prerequisites:** `ffmpeg` and Node ≥ 22 on the **host** (the global `WebSocket` used to drive CDP needs Node ≥ 22), plus a running browser — connect a client to `/b/<name>/` once (e.g. `chikin-claude <name>`) to provision `chikin-chrome-<name>` before recording.
+
+**Timing note:** screencast frames are **event-driven** — Chrome emits one only when the page changes visually, not at a fixed fps — so `chikin-record` timestamps every frame and reconstructs real timing (a mostly-static page still yields a full-length clip by holding the last frame). A page with no visual change at all can emit very few frames.
+
+**Remote-host caveat:** this uses the direct-CDP-via-container-IP path, which needs the host to be able to route to chikin's docker bridge network (true when the fleet runs on this machine). On a remote or locked-down host where the container IP isn't reachable, a future fallback could screen-record the noVNC/Xvfb display with ffmpeg's `x11grab`; that fallback is **not** built yet.
+
 ### Pre-authenticated browsers (golden profile)
 
 Each browser starts with a fresh profile, so you'd normally have to log into sites every time. Instead, seed every new browser from a **golden** profile you log into once:

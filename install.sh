@@ -21,7 +21,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 REPO="$(cd -P "$(dirname "$0")" >/dev/null && pwd)"
 BIN_TARGET="$HOME/.local/bin"
-TOOLS=(chikin-mcp chikin-claude chikin-snapshot)
+TOOLS=(chikin-mcp chikin-claude chikin-snapshot chikin-record)
 GATEWAY_URL="http://localhost:8080"
 
 # tput colors only when stdout is a tty
