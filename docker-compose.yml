@@ -26,18 +26,12 @@ services:
     entrypoint: ["true"]
     restart: "no"
 
-  # One-shot: make the shared scratch dir world-writable (1777, sticky) before
-  # any browser mounts it as ~/Downloads. Idempotent — safe every `up`.
-  shared-init:
-    # Pinned by digest (busybox:1.36) — this runs as root against a host bind
-    # mount, so the exact bytes matter. See CHK-008.
-    image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
-    container_name: chikin-shared-init
-    user: root
-    command: ["chmod", "1777", "/shared"]
-    volumes:
-      - /tmp/chikin-shared:/shared
-    restart: "no"
+  # Per-name shared-scratch isolation (M2 / CHK-007): each browser mounts only
+  # its own ${SHARED_DIR}/<name> subdir, which Docker auto-creates as root:0755
+  # on first mount and the browser entrypoint chowns to the chrome user. The
+  # old world-writable (1777) `shared-init` one-shot is gone — there is no longer
+  # a shared-across-clients dir to pre-create or loosen; the parent
+  # /tmp/chikin-shared is auto-created by Docker as the nested bind's parent.
 
   # Scoped Docker API. The gateway provisions browsers through this proxy, never
   # the raw socket. Read-only socket mount; only the path groups we need are
@@ -107,8 +101,6 @@ services:
       DOCKER_PROXY_HOST: "docker-socket-proxy"
       DOCKER_PROXY_PORT: "2375"
     depends_on:
-      shared-init:
-        condition: service_completed_successfully
       docker-socket-proxy:
         condition: service_started
     networks:

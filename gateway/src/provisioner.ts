@@ -1,5 +1,6 @@
 import Docker from "dockerode";
 import { config, containerName, volumeName } from "./config.js";
+// buildCreateOptions is exported above and used both here and by tests.
 import { log } from "./log.js";
 
 export class FleetFullError extends Error {
@@ -41,6 +42,66 @@ export function resourceLimits(): Partial<Docker.HostConfig> {
     limits.Ulimits = [{ Name: "nofile", Soft: config.nofile, Hard: config.nofile }];
   }
   return limits;
+}
+
+/**
+ * Container create options for a fleet browser. Exported (module-level, no
+ * instance state) so the mount config is unit-testable at this seam.
+ *
+ * Shared-scratch isolation (M2 / CHK-007): each browser mounts ONLY its own
+ * `${SHARED_DIR}/<name>` subdir — never the bare shared root — both as
+ * ~/Downloads and mirrored at the verbatim host path so chrome-devtools-mcp
+ * `upload_file` works with a real host path (issue #8). Peers never mount each
+ * other's subdir, so isolation is structural, not permission-based. `<name>` is
+ * charset-validated upstream (names.ts), so the path can't traverse; we still
+ * build it only from the validated name. Docker auto-creates the per-name host
+ * dir as root:0755 on first mount; the entrypoint chowns ~/Downloads to chrome.
+ */
+export function buildCreateOptions(name: string): Docker.ContainerCreateOptions {
+  const shared = config.sharedDir;
+  const scratch = `${shared}/${name}`;
+  return {
+    name: containerName(name),
+    Image: config.image,
+    Labels: { "chikin.fleet": "1", "chikin.name": name },
+    Env: [
+      "ENABLE_VNC=1",
+      `VNC_PORT=${config.vncPort}`,
+      `CDP_PORT=${config.cdpPort}`,
+      `WINDOW_SIZE=${config.windowSize}`,
+    ],
+    HostConfig: {
+      Binds: [
+        `${volumeName(name)}:/data`,
+        // Per-name scratch: ~/Downloads + upload path, mirrored at the verbatim
+        // host path so chrome-devtools-mcp upload_file works (issue #8). Scoped
+        // to ${SHARED_DIR}/<name> for cross-browser isolation (M2 / CHK-007).
+        `${scratch}:/home/chrome/Downloads:rw`,
+        `${scratch}:${scratch}:rw`,
+      ],
+      ShmSize: 2 * 1024 * 1024 * 1024,
+      NetworkMode: config.network,
+      RestartPolicy: { Name: "unless-stopped" },
+      // Least-privilege hardening (CHK-005). Drop all Linux capabilities, then
+      // add back only what the entrypoint's root bootstrap needs before it
+      // setpriv-drops to the chrome user: CHOWN + DAC_OVERRIDE to chown the
+      // fresh /data profile volume and ~/Downloads, SETUID/SETGID for the
+      // privilege drop, and KILL so tini (PID 1, root) can signal the
+      // unprivileged child on stop. Chrome itself then runs with no
+      // capabilities. no-new-privileges blocks regaining privileges via setuid
+      // binaries.
+      CapDrop: ["ALL"],
+      CapAdd: ["CHOWN", "DAC_OVERRIDE", "SETUID", "SETGID", "KILL"],
+      SecurityOpt: ["no-new-privileges"],
+      // Per-container resource caps (M3). MAX_FLEET bounds the count of
+      // browsers; these bound what one browser can consume so a single
+      // hostile/runaway page can't OOM, fork-bomb, or CPU-starve the host and
+      // take down every other client's browser. All configurable via env
+      // (config.ts); each knob is omitted entirely when its config is 0 so the
+      // default is "capped" but an operator can opt back out.
+      ...resourceLimits(),
+    },
+  };
 }
 
 export interface FleetMember {
@@ -169,51 +230,6 @@ export class Provisioner {
     }
   }
 
-  private buildCreateOptions(name: string): Docker.ContainerCreateOptions {
-    const shared = config.sharedDir;
-    return {
-      name: containerName(name),
-      Image: config.image,
-      Labels: { "chikin.fleet": "1", "chikin.name": name },
-      Env: [
-        "ENABLE_VNC=1",
-        `VNC_PORT=${config.vncPort}`,
-        `CDP_PORT=${config.cdpPort}`,
-        `WINDOW_SIZE=${config.windowSize}`,
-      ],
-      HostConfig: {
-        Binds: [
-          `${volumeName(name)}:/data`,
-          // Shared scratch: ~/Downloads + upload path, mirrored at the host
-          // path so chrome-devtools-mcp upload_file works verbatim (issue #8).
-          `${shared}:/home/chrome/Downloads:rw`,
-          `${shared}:${shared}:rw`,
-        ],
-        ShmSize: 2 * 1024 * 1024 * 1024,
-        NetworkMode: config.network,
-        RestartPolicy: { Name: "unless-stopped" },
-        // Least-privilege hardening (CHK-005). Drop all Linux capabilities, then
-        // add back only what the entrypoint's root bootstrap needs before it
-        // setpriv-drops to the chrome user: CHOWN + DAC_OVERRIDE to chown the
-        // fresh /data profile volume, SETUID/SETGID for the privilege drop, and
-        // KILL so tini (PID 1, root) can signal the unprivileged child on stop.
-        // Chrome itself then runs with no capabilities. no-new-privileges blocks
-        // regaining privileges via setuid binaries. (Verified: container boots,
-        // CDP answers, /data chowned to 1100, graceful stop works.)
-        CapDrop: ["ALL"],
-        CapAdd: ["CHOWN", "DAC_OVERRIDE", "SETUID", "SETGID", "KILL"],
-        SecurityOpt: ["no-new-privileges"],
-        // Per-container resource caps (M3). MAX_FLEET bounds the count of
-        // browsers; these bound what one browser can consume so a single
-        // hostile/runaway page can't OOM, fork-bomb, or CPU-starve the host and
-        // take down every other client's browser. All configurable via env
-        // (config.ts); each knob is omitted entirely when its config is 0 so the
-        // default is "capped" but an operator can opt back out.
-        ...resourceLimits(),
-      },
-    };
-  }
-
   /**
    * Ensure `chikin-chrome-<name>` exists and is running, then block until its
    * CDP endpoint answers. Creates the container (and volume) on first use,
@@ -253,7 +269,7 @@ export class Provisioner {
         }
         await this.ensureVolume(name);
         log.info(`provisioner: creating container ${cname}`);
-        const created = await this.docker.createContainer(this.buildCreateOptions(name));
+        const created = await this.docker.createContainer(buildCreateOptions(name));
         // Attach the egress network so the browser can reach the internet; the
         // primary chikin-net is internal-only (CDP isolated from the host).
         try {
