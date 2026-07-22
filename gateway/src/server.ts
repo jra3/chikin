@@ -72,7 +72,13 @@ export function createApp(deps: ServerDeps): express.Express {
     res.json({ status: "ok" });
   });
 
-  // Fleet dashboard (loopback-trusted, no bearer).
+  // Fleet dashboard and the noVNC proxy below are intentionally NOT bearer-
+  // gated, even when GATEWAY_TOKEN is set: they're driven by a browser, which
+  // can't attach an Authorization header to a plain navigation or a noVNC
+  // websocket. GATEWAY_TOKEN protects the MCP endpoint (/b/<name>/) ONLY. These
+  // two surfaces rely on loopback binding plus the Origin/Host guard in vnc.ts
+  // (CHK-006). A set token therefore does NOT harden a shared/multi-user host —
+  // keep the box single-trusted-user. See CHK-016.
   app.get("/", async (_req, res) => {
     try {
       res.type("html").send(await renderDashboard(deps.provisioner, deps.registry));
@@ -81,8 +87,8 @@ export function createApp(deps: ServerDeps): express.Express {
     }
   });
 
-  // noVNC reverse proxy (loopback-trusted). Mounted as a catch-all so all of
-  // noVNC's relative asset requests under /vnc/<name>/ are forwarded.
+  // noVNC reverse proxy. Mounted as a catch-all so all of noVNC's relative asset
+  // requests under /vnc/<name>/ are forwarded. Origin/Host-guarded in vnc.ts.
   app.use("/vnc/:name", vncHttpHandler);
 
   // MCP endpoint, one logical browser per <name>. Bearer-protected.
