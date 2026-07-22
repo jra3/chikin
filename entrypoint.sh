@@ -22,6 +22,15 @@ if [ "$(id -u)" = "0" ]; then
     echo "entrypoint: chowning /data to $CHROME_UID:$CHROME_GID (was uid=$cur_owner)" >&2
     chown -R "$CHROME_UID:$CHROME_GID" /data || true
   fi
+  # The per-name shared-scratch dir (~/Downloads + upload path, M2/CHK-007) is a
+  # host bind Docker auto-creates as root:0755 on first mount. Chrome runs as
+  # CHROME_UID, so ensure it can write downloads here. Non-recursive and guarded
+  # so we don't churn a client's existing files on every restart.
+  dl_owner="$(stat -c %u /home/chrome/Downloads 2>/dev/null || echo "")"
+  if [ -n "$dl_owner" ] && [ "$dl_owner" != "$CHROME_UID" ]; then
+    echo "entrypoint: chowning /home/chrome/Downloads to $CHROME_UID:$CHROME_GID (was uid=$dl_owner)" >&2
+    chown "$CHROME_UID:$CHROME_GID" /home/chrome/Downloads || true
+  fi
   # Hand off to the unprivileged user, preserving env and supplementary groups.
   exec setpriv --reuid="$CHROME_UID" --regid="$CHROME_GID" --init-groups -- "$0" "$@"
 fi

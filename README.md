@@ -8,7 +8,7 @@ Real (non-headless) Google Chrome in Docker, for browser automation that should 
 - **Per-name sticky profiles**: connect as `alice` and you always get the same cookies/history; `bob` is fully isolated.
 - **On-demand lifecycle**: browsers are provisioned on first connect and reaped when idle — nothing runs until someone asks for it.
 - **noVNC** for every browser, so a human can watch or solve a captcha from one dashboard.
-- A shared host directory wired into every browser as `~/Downloads` for file upload/download.
+- A per-browser host directory (`/tmp/chikin-shared/<name>`) wired into that browser as `~/Downloads` for file upload/download.
 
 ## What you do NOT get
 
@@ -122,9 +122,9 @@ chikin-snapshot                            # clones golden's profile -> chikin-s
 
 From then on **every new browser is cloned from the seed and starts logged in** — and the MCP automation sees those cookies (it shares the persistent profile context). Re-run `chikin-snapshot` whenever sessions expire. It works because every container uses Chrome's keyring-less `basic` cookie store, so the encryption key travels in the copied `Local State` and decrypts in the clones. Caveat: all seeded browsers share one identity, so sites that forbid concurrent sessions may re-challenge.
 
-### Shared files
+### Scratch files (per-browser)
 
-Everything dropped in `/tmp/chikin-shared` on the host appears inside **every** browser as `~/Downloads` (and at the same `/tmp/chikin-shared` path, which is what `upload_file` expects). Downloads triggered in any browser land back in that host directory. Scratch files are shared across clients; only cookies/profile are per-name isolated.
+Each browser `<name>` gets its own host directory `/tmp/chikin-shared/<name>`, mounted **only** into that browser as `~/Downloads` (and at the same `/tmp/chikin-shared/<name>` path, which is what `upload_file` expects). Drop upload files under the per-name dir; downloads triggered in that browser land back there. Scratch files are **not** shared across clients — each browser sees only its own subdir (M2 / CHK-007); cookies/profile are per-name isolated too.
 
 ---
 

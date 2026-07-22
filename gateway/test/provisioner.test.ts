@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { resourceLimits } from "../src/provisioner.js";
-import { config } from "../src/config.js";
+import { resourceLimits, buildCreateOptions } from "../src/provisioner.js";
+import { config, volumeName } from "../src/config.js";
 
 test("resourceLimits maps the default env config onto HostConfig caps (M3)", () => {
   const limits = resourceLimits();
@@ -77,4 +77,37 @@ test("a limit set to 0 is omitted so operators can opt out", () => {
   assert.equal(limits.PidsLimit, undefined);
   assert.equal(limits.NanoCpus, undefined);
   assert.equal(limits.Ulimits, undefined);
+});
+
+// --- Per-name Downloads isolation (M2 / CHK-007 / issue #24) ----------------
+// Each browser must mount only its own ${SHARED_DIR}/<name> subdir, never the
+// bare shared root. Structural isolation: peers can't name each other's dirs.
+test("buildCreateOptions scopes the shared scratch to a per-name subdir (M2)", () => {
+  const opts = buildCreateOptions("alice");
+  const binds = opts.HostConfig?.Binds ?? [];
+
+  // ~/Downloads and the verbatim host-path mirror are both the per-name subdir.
+  assert.ok(
+    binds.includes(`${config.sharedDir}/alice:/home/chrome/Downloads:rw`),
+    "Downloads bind is the per-name subdir",
+  );
+  assert.ok(
+    binds.includes(`${config.sharedDir}/alice:${config.sharedDir}/alice:rw`),
+    "verbatim host-path mirror is the per-name subdir (upload_file, issue #8)",
+  );
+
+  // Regression guard for the leak: no bind may reference the bare shared root.
+  // The whole-dir mount (${SHARED_DIR}:...) is gone.
+  for (const b of binds) {
+    assert.ok(
+      !b.startsWith(`${config.sharedDir}:`),
+      `no bind references the bare shared root: ${b}`,
+    );
+  }
+
+  // The /data profile bind is unchanged.
+  assert.ok(
+    binds.includes(`${volumeName("alice")}:/data`),
+    "profile volume bind unchanged",
+  );
 });
