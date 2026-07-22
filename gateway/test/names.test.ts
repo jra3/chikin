@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isValidName, assertValidName } from "../src/names.js";
+import { isValidName, assertValidName, isValidHandle } from "../src/names.js";
 import { containerName, volumeName } from "../src/config.js";
 
 test("accepts dns-safe names", () => {
@@ -31,6 +31,15 @@ test("rejects unsafe names", () => {
 test("assertValidName throws on bad input", () => {
   assert.throws(() => assertValidName("Bad Name"));
   assert.doesNotThrow(() => assertValidName("good-name"));
+});
+
+test("isValidHandle: same slug rule as names, and non-strings rejected", () => {
+  for (const h of ["mulm-login-fix", "a", "x-9", "a".repeat(32)]) {
+    assert.ok(isValidHandle(h), `expected valid handle: ${h}`);
+  }
+  for (const h of ["", "-a", "a-", "Cap", "a b", "a".repeat(33), undefined, null, 42, {}]) {
+    assert.ok(!isValidHandle(h), `expected invalid handle: ${String(h)}`);
+  }
 });
 
 test("derived docker identifiers", () => {

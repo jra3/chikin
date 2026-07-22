@@ -60,6 +60,14 @@ async function teardown({ client, transport }) {
   } catch {}
 }
 
+// chikin_identify is required before any browser tool (breaking-change gate).
+async function identify(client, handle, description) {
+  return client.callTool({
+    name: "chikin_identify",
+    arguments: { handle, ...(description ? { description } : {}) },
+  });
+}
+
 // evaluate a function in the page and return the raw text payload
 async function evalText(client, fn) {
   const r = await client.callTool({ name: "evaluate_script", arguments: { function: fn } });
@@ -89,9 +97,23 @@ try {
   check("alice initialize", alice.client.getServerVersion()?.name === "chrome_devtools");
   const tools = await alice.client.listTools();
   check("alice exposes chrome-devtools tools", tools.tools.length > 20, `got ${tools.tools.length}`);
+  const toolNames = new Set(tools.tools.map((t) => t.name));
+  check("tools/list includes chikin_identify", toolNames.has("chikin_identify"));
+  check("tools/list includes chikin_reset", toolNames.has("chikin_reset"));
+
+  console.log("== Identify gate ==");
+  const blocked = await alice.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
+  check(
+    "browser tool before identify -> instructive error",
+    blocked.isError === true && /chikin_identify/.test((blocked.content ?? []).map((c) => c.text ?? "").join("")),
+    JSON.stringify(blocked).slice(0, 120),
+  );
+  const ident = await identify(alice.client, "alice-itest", "itest driver");
+  check("chikin_identify succeeds", ident.isError !== true, JSON.stringify(ident).slice(0, 120));
+
   await alice.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
   const aliceTitle = await evalText(alice.client, "() => document.title");
-  check("alice browsed example.com (egress works)", /Example Domain/.test(aliceTitle), aliceTitle.slice(0, 80));
+  check("alice browsed example.com (egress works, post-identify)", /Example Domain/.test(aliceTitle), aliceTitle.slice(0, 80));
 
   console.log("== Single active session per name ==");
   const dupe = await rawPost("/b/alice/", { token: TOKEN });
@@ -106,6 +128,13 @@ try {
 
   const bob = await connect("bob");
   sessions.push(bob);
+  const dupeHandle = await identify(bob.client, "alice-itest");
+  check(
+    "handle already held by a live session -> error",
+    dupeHandle.isError === true && /already in use/.test((dupeHandle.content ?? []).map((c) => c.text ?? "").join("")),
+    JSON.stringify(dupeHandle).slice(0, 120),
+  );
+  await identify(bob.client, "bob-itest");
   await bob.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
   const bobRead = await evalText(bob.client, "() => String(localStorage.getItem('chikin'))");
   check(
@@ -134,6 +163,7 @@ try {
   const vncBody = await vnc.text();
   check("/vnc/alice/vnc.html 200", vnc.status === 200, `got ${vnc.status}`);
   check("vnc.html looks like noVNC", /noVNC|canvas|vnc/i.test(vncBody));
+  check("vnc.html title carries alice's handle", /<title>alice-itest · chikin<\/title>/.test(vncBody), vncBody.slice(0, 200));
   const vncAsset = await fetch(`${BASE}/vnc/alice/app/ui.js`);
   check("vnc static asset proxied", vncAsset.status === 200, `got ${vncAsset.status}`);
 
@@ -147,6 +177,7 @@ try {
   check("bob reconnects after terminateSession", bob2.client.getServerVersion()?.name === "chrome_devtools");
   // profile persisted: bob set nothing, but the container/volume is reused
   const bobOrigin = await (async () => {
+    await identify(bob2.client, "bob-itest"); // handle freed when bob disconnected
     await bob2.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
     return evalText(bob2.client, "() => location.origin");
   })();

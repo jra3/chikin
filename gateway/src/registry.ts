@@ -19,6 +19,7 @@ export interface Activity {
 export class Registry {
   private byName = new Map<string, Session>();
   private bySessionId = new Map<string, Session>();
+  private byHandle = new Map<string, Session>();
   private pending = new Set<string>();
   private activity = new Map<string, Activity>();
 
@@ -62,6 +63,30 @@ export class Registry {
     return this.byName.get(name);
   }
 
+  /**
+   * Claim a chikin_identify handle for a session, enforcing global uniqueness
+   * across live sessions (the analogue of the single-session-per-name guard, but
+   * for the display/correlation label). Returns false if the handle is already
+   * held by a *different* live session, so the driving agent can pick another.
+   * Idempotent for the same session; re-identifying with a new handle frees the
+   * session's previous one. Sets `session.handle` on success so the map and the
+   * field never drift.
+   */
+  claimHandle(handle: string, session: Session): boolean {
+    const holder = this.byHandle.get(handle);
+    if (holder && holder !== session && !holder.isClosed) return false;
+    if (session.handle && session.handle !== handle) {
+      if (this.byHandle.get(session.handle) === session) this.byHandle.delete(session.handle);
+    }
+    this.byHandle.set(handle, session);
+    session.handle = handle;
+    return true;
+  }
+
+  getByHandle(handle: string): Session | undefined {
+    return this.byHandle.get(handle);
+  }
+
   getBySessionId(sessionId: string): Session | undefined {
     return this.bySessionId.get(sessionId);
   }
@@ -74,6 +99,11 @@ export class Registry {
     }
     if (session.sessionId && this.bySessionId.get(session.sessionId) === session) {
       this.bySessionId.delete(session.sessionId);
+    }
+    // Free the handle so the driving instance (or another) can reuse it on the
+    // next connect. The handle is per-session, not sticky like the profile.
+    if (session.handle && this.byHandle.get(session.handle) === session) {
+      this.byHandle.delete(session.handle);
     }
     this.touch(session.name, now);
   }

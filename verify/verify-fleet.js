@@ -66,6 +66,12 @@ function extractJson(result) {
     .filter((c) => c.type === "text")
     .map((c) => c.text)
     .join("\n");
+  // A tool that errored (e.g. the identify gate blocking a premature browser
+  // call) can carry braces in its message — don't silently misparse that as the
+  // probe value. Surface it so the failure is obvious, not undefined-everywhere.
+  if (result?.isError) {
+    throw new Error(`tool call returned an error result:\n${text}`);
+  }
   // chrome-devtools-mcp wraps the value in a ```json … ``` fence; fall back to
   // brace/bracket matching. Handles both objects (probe) and arrays (scrape).
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -98,6 +104,18 @@ async function main() {
   }
 
   try {
+    // The gateway blocks every browser tool until the session identifies itself
+    // (chikin_identify). Do that first, on THIS session, before any navigate.
+    const ident = await client.callTool({
+      name: "chikin_identify",
+      arguments: { handle: args.name, description: "fleet non-headless verification" },
+    });
+    if (ident?.isError) {
+      const text = (ident.content ?? []).map((c) => c.text ?? "").join("\n");
+      console.error(`chikin_identify failed: ${text}`);
+      process.exit(3);
+    }
+
     // Provision + land on a real document so evaluate_script has a selected page.
     await client.callTool({ name: "navigate_page", arguments: { type: "url", url: args.url } });
 

@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
 import { Session } from "./session.js";
 import { log } from "./log.js";
+import { isValidHandle, HANDLE_RULE } from "./names.js";
 import type { Registry } from "./registry.js";
 import type { Provisioner } from "./provisioner.js";
 import { ProvisionError } from "./provisioner.js";
@@ -71,6 +72,93 @@ const RESET_TOOL = {
     "tools have stopped having any effect.",
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
 };
+
+// Synthetic gateway-owned tool. THE session MUST call this before any browser
+// tool: it labels the driving instance with a unique, human-friendly handle that
+// surfaces in the dashboard, logs, and noVNC title, making an otherwise anonymous
+// `inst-<pid>` session correlatable to what it's doing. The description is written
+// to be fully self-explanatory so a naive MCP client reaches correct usage from
+// the tool schema alone (see also the augmented initialize `instructions` and the
+// gating error). Kept in lockstep with the RESET_TOOL pattern above.
+const IDENTIFY_TOOL = {
+  name: "chikin_identify",
+  description:
+    "REQUIRED FIRST STEP — call this before using ANY browser tool. Every other " +
+    "browser tool is blocked until you identify. Give this chikin session a unique, " +
+    "human-friendly `handle` describing what you (the driving instance) are doing, so " +
+    "the session is correlatable in the dashboard, logs, and noVNC title. " +
+    `The handle must be ${HANDLE_RULE}. It must be unique across all live sessions — ` +
+    "if the one you pick is already taken you'll get an error naming the conflict; just " +
+    "choose another. Optionally pass a short free-text `description` for richer context. " +
+    'Example: { "handle": "mulm-login-fix", "description": "debugging the MULM OAuth callback" }. ' +
+    "You must re-identify after any reconnect.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      handle: {
+        type: "string",
+        description: `Unique short slug identifying this session (${HANDLE_RULE}), e.g. "mulm-login-fix".`,
+      },
+      description: {
+        type: "string",
+        description: "Optional one-line free-text description of what this session is doing.",
+      },
+    },
+    required: ["handle"],
+    additionalProperties: false,
+  },
+};
+
+// Prepended to the upstream chrome-devtools-mcp `instructions` so a caller with
+// zero prior knowledge of chikin learns the contract up front, before ever
+// touching a browser tool. Layer 1 of the self-directing design.
+const CHIKIN_INSTRUCTIONS =
+  "This is a chikin browser gateway. Before using ANY browser tool, you MUST call " +
+  "`chikin_identify` with a unique short `handle` (e.g. `mulm-login-fix`) describing what " +
+  "you're doing; the handle labels this session everywhere it surfaces. Browser tools are " +
+  "blocked until you identify. `chikin_reset` hard-resets a wedged browser.";
+
+// Control methods/tools a not-yet-identified session may always use. `initialize`
+// and `tools/list` are MCP methods (never `tools/call`); the two chikin_* tools
+// are gateway-owned and handled without a browser.
+const ALWAYS_ALLOWED_TOOLS = new Set([IDENTIFY_TOOL.name, RESET_TOOL.name]);
+
+export type FrameAction = "forward" | "identify" | "reset" | "block";
+
+// Pure routing/gate decision for a client->child frame, given whether the
+// session has identified. Extracted as a seam so the gate can be unit-tested
+// without a live browser. Only `tools/call` is gated — every other MCP method
+// (initialize, tools/list, ping, notifications, …) forwards untouched.
+export function classifyClientFrame(
+  f: { method?: string; params?: { name?: string } },
+  identified: boolean,
+): FrameAction {
+  if (f?.method !== "tools/call") return "forward";
+  const tool = f.params?.name;
+  if (tool === IDENTIFY_TOOL.name) return "identify";
+  if (tool === RESET_TOOL.name) return "reset";
+  if (!identified && !ALWAYS_ALLOWED_TOOLS.has(tool ?? "")) return "block";
+  return "forward";
+}
+
+// Layer 3 of the self-directing design: the actionable error a blocked browser
+// tool returns, naming chikin_identify, the handle format, and a worked example
+// so a caller that just starts browsing self-corrects on its first call.
+export function identifyRequiredMessage(tool: string | undefined): string {
+  return (
+    `This chikin browser is not yet identified, so '${tool ?? "that tool"}' is blocked. ` +
+    "Before using any browser tool, call `chikin_identify` with a unique `handle` — a short slug " +
+    `(${HANDLE_RULE}) describing what you're doing, ` +
+    'e.g. { "handle": "mulm-login-fix" } (optionally add a "description"). Then retry.'
+  );
+}
+
+// Merge chikin's contract into whatever instructions the upstream child returned,
+// preserving the upstream text. Mutates the initialize result in place.
+export function augmentInstructions(result: { instructions?: string }): void {
+  const upstream = typeof result.instructions === "string" ? result.instructions.trim() : "";
+  result.instructions = upstream ? `${CHIKIN_INSTRUCTIONS}\n\n${upstream}` : CHIKIN_INSTRUCTIONS;
+}
 
 /**
  * Provision (or reuse) the named browser, spawn its chrome-devtools-mcp child,
@@ -180,10 +268,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       const f = msg as Frame;
       if (f && f.id !== undefined) {
         inflight.delete(f.id);
-        // Append the gateway's synthetic tool to tools/list replies.
+        // Append the gateway's synthetic tools to tools/list replies.
         if (toolsListIds.has(f.id)) {
           toolsListIds.delete(f.id);
-          if (Array.isArray(f.result?.tools)) f.result.tools.push(RESET_TOOL);
+          if (Array.isArray(f.result?.tools)) f.result.tools.push(RESET_TOOL, IDENTIFY_TOOL);
+        }
+        // Layer 1 of the self-directing design: fold chikin's contract into the
+        // initialize result's `instructions` before the client sees it. This is
+        // the genuine handshake reply (respawn replays are swallowed elsewhere).
+        if (initId !== undefined && f.id === initId && f.result && typeof f.result === "object") {
+          augmentInstructions(f.result as { instructions?: string });
         }
         // A nav tool replied: schedule out-of-band verification against the
         // browser's real CDP (the wedge reports success while doing nothing).
@@ -362,6 +456,57 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       .catch((e) => log.warn(`session[${name}]: reset reply failed`, String(e)));
   }
 
+  // Reply to a gateway-owned tool call on the gateway's own behalf (never
+  // forwarded to the child), mirroring handleReset's MCP tool-result shape.
+  const replyTool = (id: string | number | undefined, text: string, isError: boolean): void => {
+    if (id === undefined || session?.isClosed) return;
+    http
+      .send({
+        jsonrpc: "2.0",
+        id,
+        result: { content: [{ type: "text", text }], isError },
+      } as JSONRPCMessage)
+      .catch((e) => log.warn(`session[${name}]: tool reply failed`, String(e)));
+  };
+
+  // The client is identifying this session (chikin_identify). Validate the
+  // handle, enforce global uniqueness across live sessions, record it for
+  // display/correlation, then unlock browser tools. Never forwarded to the child.
+  function handleIdentify(id: string | number | undefined, args: Record<string, unknown> | undefined): void {
+    const handle = args?.handle;
+    const description = args?.description;
+    if (!isValidHandle(handle)) {
+      replyTool(
+        id,
+        `Invalid handle ${JSON.stringify(handle)}: must be ${HANDLE_RULE}. ` +
+          'Example: { "handle": "mulm-login-fix" }.',
+        true,
+      );
+      return;
+    }
+    if (description !== undefined && typeof description !== "string") {
+      replyTool(id, "`description` must be a string when provided.", true);
+      return;
+    }
+    if (!deps.registry.claimHandle(handle, session)) {
+      replyTool(
+        id,
+        `Handle '${handle}' is already in use by another live chikin session. ` +
+          "Pick a different unique handle and call chikin_identify again.",
+        true,
+      );
+      return;
+    }
+    session.handleDescription = description;
+    log.info(`session[${name}] (${handle}): identified${description ? ` — ${description}` : ""}`);
+    replyTool(
+      id,
+      `Identified as '${handle}'${description ? ` (${description})` : ""}. ` +
+        "Browser tools are now unlocked for this session.",
+      false,
+    );
+  }
+
   // Client -> child pump. Cache initialize; track requests; fail fast while a
   // respawn is in flight so the client retries instead of hanging.
   http.onmessage = (msg) => {
@@ -371,10 +516,24 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       initFrame = msg;
       initId = f.id;
     }
-    // Gateway-owned tool: handle here, never forward.
-    if (f && f.method === "tools/call" && f.params?.name === RESET_TOOL.name) {
-      void handleReset(f.id);
-      return;
+    // Gateway-owned tools + the identify gate. Only tools/call is affected;
+    // initialize / tools/list / notifications always fall through to forward.
+    if (f && f.method === "tools/call") {
+      const action = classifyClientFrame(f, session.handle !== undefined);
+      if (action === "reset") {
+        void handleReset(f.id);
+        return;
+      }
+      if (action === "identify") {
+        handleIdentify(f.id, f.params?.arguments);
+        return;
+      }
+      if (action === "block") {
+        // Layer 3: instructive error until the session identifies. Not tracked
+        // in inflight (never forwarded), so nothing to fail on respawn.
+        replyTool(f.id, identifyRequiredMessage(f.params?.name), true);
+        return;
+      }
     }
     const tracked = f && f.method !== undefined && f.id !== undefined;
     if (tracked) {
