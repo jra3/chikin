@@ -28,7 +28,7 @@
 // just another reconnect trigger. Ping replies are swallowed.
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { readFileSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync, mkdirSync, lstatSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 
@@ -78,21 +78,43 @@ let shuttingDown = false;
 // symlink at the predictable path to redirect our write (CHK-014). The frame
 // itself carries no bearer (that rides the HTTP Authorization header), but it
 // does leak the in-use browser name + MCP capabilities.
-const runtimeDir =
-  process.env.XDG_RUNTIME_DIR || join(tmpdir(), `chikin-${userInfo().uid}`);
-if (!process.env.XDG_RUNTIME_DIR) {
-  mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+//
+// The fallback path (/tmp/chikin-<uid>) is predictable, and mkdirSync with
+// { recursive: true } is a no-op on an existing directory — it neither throws
+// nor re-chmods — so a co-located user could pre-create it under their own
+// ownership and lax perms before we first run, and mkdirSync would silently
+// accept it (CHK-014a). So after creating it, lstat the fallback dir and refuse
+// to persist unless it is a real directory we own, mode 0700, not a symlink.
+// Dropping persistence is safe: the frame is a crash-recovery optimization, so
+// its absence just costs one initialize replay after a hard crash.
+let runtimeDir = process.env.XDG_RUNTIME_DIR;
+if (!runtimeDir) {
+  const uid = userInfo().uid;
+  const fallback = join(tmpdir(), `chikin-${uid}`);
+  try {
+    mkdirSync(fallback, { recursive: true, mode: 0o700 });
+    const st = lstatSync(fallback);
+    if (st.isDirectory() && st.uid === uid && (st.mode & 0o777) === 0o700) {
+      runtimeDir = fallback;
+    } else {
+      log(`refusing crash-recovery persistence: ${fallback} is not a private ${uid}-owned 0700 dir`);
+    }
+  } catch (e) {
+    log(`crash-recovery dir unusable (${fallback}): ${e?.message ?? e}`);
+  }
 }
-const initPath = join(
-  runtimeDir,
-  `chikin-bridge${new URL(url).pathname.replace(/[^a-zA-Z0-9-]+/g, "-")}init.json`,
-);
+
+const initPath = runtimeDir
+  ? join(runtimeDir, `chikin-bridge${new URL(url).pathname.replace(/[^a-zA-Z0-9-]+/g, "-")}init.json`)
+  : null;
 let initFrame = null;
-try {
-  initFrame = JSON.parse(readFileSync(initPath, "utf8"));
-  log(`recovered persisted initialize (${initPath}); resuming session after respawn`);
-} catch {
-  /* no persisted frame — normal fresh start */
+if (initPath) {
+  try {
+    initFrame = JSON.parse(readFileSync(initPath, "utf8"));
+    log(`recovered persisted initialize (${initPath}); resuming session after respawn`);
+  } catch {
+    /* no persisted frame — normal fresh start */
+  }
 }
 
 const pingIds = new Set(); // internal heartbeat ids we must not forward
@@ -210,7 +232,7 @@ stdio.onmessage = (m) => {
   if (m && m.method === "initialize") {
     initFrame = m;
     try {
-      writeFileSync(initPath, JSON.stringify(m), { mode: 0o600 }); // survive a hard crash + respawn
+      if (initPath) writeFileSync(initPath, JSON.stringify(m), { mode: 0o600 }); // survive a hard crash + respawn
     } catch (e) {
       log(`initialize persist failed: ${e?.message ?? e}`);
     }
@@ -253,7 +275,7 @@ function shutdown(why, code = 0) {
   clearInterval(hb);
   log(why);
   try {
-    unlinkSync(initPath); // clean exit: the session is over, drop the crash-recovery frame
+    if (initPath) unlinkSync(initPath); // clean exit: the session is over, drop the crash-recovery frame
   } catch {}
   http?.close().catch(() => {});
   setTimeout(() => {
