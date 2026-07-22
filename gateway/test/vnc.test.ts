@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { IncomingMessage } from "node:http";
-import { vncUpgradeAllowed, hostOk, buildSelfHosts } from "../src/vnc.js";
+import { vncUpgradeAllowed, hostOk, buildSelfHosts, rewriteVncTitle } from "../src/vnc.js";
 
 // config.port defaults to 8080 in tests (no PORT env), so the trusted set is
 // {127.0.0.1:8080, localhost:8080, [::1]:8080}.
@@ -57,6 +57,20 @@ test("hostOk: rejects a rebinding Host and a missing Host", () => {
   assert.equal(hostOk(req({ host: "attacker.test" })), false, "foreign Host (DNS-rebinding) rejected");
   assert.equal(hostOk(req({ host: "127.0.0.1:9999" })), false, "wrong port rejected");
   assert.equal(hostOk(req({})), false, "missing Host rejected");
+});
+
+test("rewriteVncTitle: injects the handle, HTML-escaped, leaves rest intact", () => {
+  const html = "<html><head><title>noVNC</title></head><body>x</body></html>";
+  const out = rewriteVncTitle(html, "mulm-login-fix");
+  assert.match(out, /<title>mulm-login-fix · chikin<\/title>/);
+  assert.match(out, /<body>x<\/body>/, "body untouched");
+  // A handle can only be a slug, but escape defensively anyway.
+  assert.match(rewriteVncTitle("<title>x</title>", "a<b&c"), /<title>a&lt;b&amp;c · chikin<\/title>/);
+});
+
+test("rewriteVncTitle: no <title> present -> returns html unchanged", () => {
+  const html = "<html><body>no title here</body></html>";
+  assert.equal(rewriteVncTitle(html, "handle"), html);
 });
 
 test("buildSelfHosts: loopback-only by default", () => {

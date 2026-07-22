@@ -5,6 +5,29 @@ import type { Duplex } from "node:stream";
 import { config, vncUrl } from "./config.js";
 import { isValidName } from "./names.js";
 import { log } from "./log.js";
+import type { Registry } from "./registry.js";
+
+// noVNC document requests we tag for <title> rewriting: the top-level page and
+// its index. Assets (.js/.css/images) and the websocket are left untouched.
+function isVncDocument(url: string): boolean {
+  const path = url.split("?")[0];
+  return path === "/" || path.endsWith("/vnc.html") || path.endsWith("/vnc_lite.html");
+}
+
+/**
+ * Inject the session handle into the noVNC page <title> so an operator can tell
+ * at a glance which driving instance owns the browser. Pure/testable. Preserves
+ * everything else in the HTML; if there's no <title> to replace, returns the
+ * html unchanged (best-effort — a missing title just means no label).
+ */
+export function rewriteVncTitle(html: string, handle: string): string {
+  const escaped = handle.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
+  return html.replace(/<title>[^<]*<\/title>/i, `<title>${escaped} · chikin</title>`);
+}
+
+// Requests flagged for title injection carry the resolved handle here; the
+// shared proxyRes handler below buffers and rewrites only those responses.
+type TaggedReq = IncomingMessage & { __chikinHandle?: string };
 
 // Single shared proxy for all /vnc/<name>/ traffic, websocket upgrades included.
 const proxy = httpProxy.createProxyServer({ ws: true, changeOrigin: true });
@@ -56,6 +79,34 @@ export function vncUpgradeAllowed(req: IncomingMessage): boolean {
   return originOk(req) && hostOk(req);
 }
 
+// Title injection for the noVNC document. Fires for every proxied response but
+// only acts on requests we tagged with a handle AND flagged selfHandleResponse
+// for (so http-proxy leaves the write to us). We can only safely rewrite an
+// uncompressed HTML body — if it's content-encoded, pipe it through untouched.
+proxy.on("proxyRes", (proxyRes, req, res) => {
+  const handle = (req as TaggedReq).__chikinHandle;
+  if (handle === undefined) return; // not tagged: http-proxy handled it normally
+  const encoding = proxyRes.headers["content-encoding"];
+  const headers = { ...proxyRes.headers };
+  if (encoding) {
+    (res as ServerResponse).writeHead(proxyRes.statusCode ?? 200, headers);
+    proxyRes.pipe(res as ServerResponse);
+    return;
+  }
+  const chunks: Buffer[] = [];
+  proxyRes.on("data", (c: Buffer) => chunks.push(c));
+  proxyRes.on("end", () => {
+    const body = rewriteVncTitle(Buffer.concat(chunks).toString("utf8"), handle);
+    const buf = Buffer.from(body, "utf8");
+    delete headers["content-length"];
+    headers["content-length"] = String(buf.byteLength);
+    const sres = res as ServerResponse;
+    sres.writeHead(proxyRes.statusCode ?? 200, headers);
+    sres.end(buf);
+  });
+  proxyRes.on("error", () => (res as ServerResponse).destroy());
+});
+
 proxy.on("error", (err, _req, target) => {
   log.warn("vnc: upstream error", String(err));
   const res = target as ServerResponse | Duplex | undefined;
@@ -73,20 +124,27 @@ proxy.on("error", (err, _req, target) => {
  * The dashboard links to `/vnc/<name>/vnc.html?...&path=vnc/<name>/websockify`
  * so the page's relative asset + websocket URLs resolve back through here.
  */
-export function vncHttpHandler(req: Request, res: Response): void {
-  const name = req.params.name;
-  if (!isValidName(name)) {
-    res.status(400).send("invalid browser name");
-    return;
-  }
-  // DNS-rebinding guard: only serve the noVNC page/assets to a request that
-  // addressed us as one of our own loopback hosts (CHK-006). Origin is not
-  // checked here — top-level navigations legitimately send none.
-  if (!hostOk(req)) {
-    res.status(403).send("forbidden");
-    return;
-  }
-  proxy.web(req, res, { target: vncUrl(name) });
+export function makeVncHttpHandler(registry: Registry) {
+  return function vncHttpHandler(req: Request, res: Response): void {
+    const name = req.params.name;
+    if (!isValidName(name)) {
+      res.status(400).send("invalid browser name");
+      return;
+    }
+    // DNS-rebinding guard: only serve the noVNC page/assets to a request that
+    // addressed us as one of our own loopback hosts (CHK-006). Origin is not
+    // checked here — top-level navigations legitimately send none.
+    if (!hostOk(req)) {
+      res.status(403).send("forbidden");
+      return;
+    }
+    // Rewrite the <title> of the noVNC document to the session handle, if any.
+    // Express strips the mount prefix, so req.url is the container-relative path.
+    const handle = registry.getByName(name)?.handle;
+    const inject = handle !== undefined && isVncDocument(req.url);
+    if (inject) (req as unknown as TaggedReq).__chikinHandle = handle;
+    proxy.web(req, res, { target: vncUrl(name), selfHandleResponse: inject });
+  };
 }
 
 /**

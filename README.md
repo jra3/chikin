@@ -100,9 +100,28 @@ claude mcp add --transport http bob   http://localhost:8080/b/bob/ \
 
 `alice` and `bob` get fully isolated profiles (volumes `chikin-profile-alice`, `chikin-profile-bob`); the gateway provisions each browser on first use. Only one client may hold a given name at a time — a second concurrent connect to `alice` is rejected with `409`. This is exactly the form any streamable-HTTP MCP client uses; `chikin-mcp` is just a convenience wrapper that fills in the name (and the bearer) for you.
 
+### Identify your session first (`chikin_identify`) — **required**
+
+> **Breaking change to the client contract.** Every session must now identify itself before it can use any browser tool.
+
+A session's browser name (`inst-<pid>`) says *which profile* it drives, not *what the driving instance is doing*. So the gateway injects a synthetic **`chikin_identify`** tool, and **blocks every browser tool until the session calls it**:
+
+```jsonc
+// first tool call on a fresh session
+{ "name": "chikin_identify",
+  "arguments": { "handle": "mulm-login-fix",           // required: unique slug, [a-z0-9-], 1–32 chars
+                 "description": "debugging the OAuth callback" } }  // optional free text
+```
+
+- **Required first.** Any browser tool (`navigate_page`, `new_page`, …) called before identifying returns an instructive error naming `chikin_identify`, the handle format, and an example. `initialize`, `tools/list`, `chikin_identify`, and `chikin_reset` are never blocked.
+- **`handle` is required, unique across live sessions.** A handle already held by another live session is rejected with a clear error — pick another. It's a display/correlation label only; the sticky profile stays keyed by the browser *name* (identifying is orthogonal to the profile, and must be re-done on each reconnect).
+- **Surfaces everywhere:** a **handle** column in the dashboard, the session's log lines, and the noVNC page title.
+
+**Self-directing — no docs required.** A caller with zero prior knowledge of chikin is steered to correct usage by the MCP itself: the `initialize` result's `instructions` state the contract up front, `chikin_identify`'s own tool description is fully self-explanatory (format, uniqueness rule, worked example), and the gating error on any premature browser tool is actionable. A Claude-driven client therefore adapts automatically — no client changes needed beyond letting it read the MCP's own context.
+
 ### Watch a browser / solve a captcha
 
-Open the dashboard at <http://localhost:8080/> and click **open noVNC** next to any running browser, or go straight to `http://localhost:8080/vnc/<name>/`. You can drive that Chrome window by hand — useful for logging in or clearing a captcha while the MCP client keeps the session.
+Open the dashboard at <http://localhost:8080/> and click **open noVNC** next to any running browser, or go straight to `http://localhost:8080/vnc/<name>/`. You can drive that Chrome window by hand — useful for logging in or clearing a captcha while the MCP client keeps the session. The page title and the dashboard's **handle** column show which session (`chikin_identify` handle) owns each browser.
 
 ### Recording (video / GIF)
 
@@ -176,7 +195,7 @@ Set in `.env` (see `.env.example`) or the environment.
 `chrome-devtools-mcp` (≤1.1.1) can bind to a stale page target after an SPA route change or cross-origin navigation: navigation tools then return success but silently no-op while Chrome itself is healthy. The gateway defends in three layers:
 
 1. **Nav watchdog** — after the child reports a navigation succeeded, the gateway checks the container's CDP `/json/list` (ground truth). Two consecutive navs that provably went nowhere force a transparent child respawn, which re-binds the browser's real current target. Repeated CDP connection failures on the child's stderr (e.g. the container was removed out-of-band) trigger the same respawn.
-2. **`chikin_reset` tool** — injected into every `tools/list`, so the model itself can hard-reset a wedged browser (container recreated, profile/logins preserved) without human help.
+2. **`chikin_reset` tool** — injected into every `tools/list` (alongside `chikin_identify`, see [Identify your session first](#identify-your-session-first-chikin_identify--required)), so the model itself can hard-reset a wedged browser (container recreated, profile/logins preserved) without human help.
 3. **Self-healing transports** — both the client bridge and the gateway replay the cached `initialize` over a rebuilt link, so none of the above ever drops the client's MCP session.
 
 Gateway responses use JSON-RPC error envelopes with these HTTP statuses: `401` (bad/missing token), `400` (invalid name or non-initialize without a session), `409` (a name already has an active session), `429` (fleet full), `503` (provisioning failed).

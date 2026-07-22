@@ -43,6 +43,33 @@ test("session id binding and removal; name reusable but activity persists", () =
   assert.ok(r.getActivity("bob"), "activity persists after remove");
 });
 
+test("claimHandle enforces uniqueness across live sessions; frees on remove", () => {
+  const r = new Registry();
+  r.reserve("alice");
+  const a = fakeSession("alice", r);
+  r.add(a);
+  r.reserve("bob");
+  const b = fakeSession("bob", r);
+  r.add(b);
+
+  assert.equal(r.claimHandle("login-fix", a), true, "first claim wins");
+  assert.equal(a.handle, "login-fix", "claim sets the session field");
+  assert.equal(r.getByHandle("login-fix"), a);
+  assert.equal(r.claimHandle("login-fix", b), false, "another live session is rejected");
+  assert.equal(r.claimHandle("login-fix", a), true, "same session re-claim is idempotent");
+
+  // Re-identify frees the old handle.
+  assert.equal(r.claimHandle("other-work", a), true);
+  assert.equal(r.getByHandle("login-fix"), undefined, "old handle freed on re-identify");
+  assert.equal(r.getByHandle("other-work"), a);
+  // Now bob may take the freed handle.
+  assert.equal(r.claimHandle("login-fix", b), true, "freed handle reusable by another session");
+
+  // Removing a session frees its handle for reuse.
+  r.remove(a);
+  assert.equal(r.getByHandle("other-work"), undefined, "handle freed when session removed");
+});
+
 test("stream open/close tracking", () => {
   const r = new Registry();
   r.touch("x", 0);

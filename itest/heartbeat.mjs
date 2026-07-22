@@ -48,6 +48,8 @@ try {
     clientInfo: { name: "hbtest", version: "0.0.0" },
   });
   send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  // chikin_identify is required before any browser tool (breaking-change gate).
+  await rpc(10, "tools/call", { name: "chikin_identify", arguments: { handle: "hb-itest" } });
   await rpc(2, "tools/call", { name: "new_page", arguments: { url: "https://example.com/" } });
   const before = await rpc(3, "tools/call", { name: "list_pages", arguments: {} });
   console.log(`  PASS  first list_pages ok (${(before.result?.content?.[0]?.text || "").slice(0, 30)}...)`);

@@ -23,6 +23,15 @@ export class Session {
 
   sessionId: string | undefined;
 
+  // Self-directing identity (chikin_identify). Orthogonal to `name`: `name`
+  // keys the sticky profile/container, while `handle` is a per-session,
+  // human-friendly correlation label the driving instance sets on connect. The
+  // Registry owns the handle->session uniqueness map; these fields mirror it for
+  // display (dashboard, logs, noVNC title). Undefined until the session has
+  // successfully identified — the bridge gates all browser tools until then.
+  handle: string | undefined;
+  handleDescription: string | undefined;
+
   private closed = false;
   private readonly onClose: (s: Session, reason: string) => void;
   private readonly closeChild: () => Promise<void>;

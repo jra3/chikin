@@ -18,8 +18,14 @@ function row(m: FleetMember, registry: Registry, now: number): string {
     `vnc/${m.name}/websockify`,
   )}`;
   const running = m.state === "running";
+  // The handle is the driving instance's self-chosen label (chikin_identify),
+  // set per session and independent of the sticky browser name above.
+  const handle = session?.handle
+    ? `<code title="${esc(session.handleDescription ?? "")}">${esc(session.handle)}</code>`
+    : "—";
   return `<tr>
     <td><code>${name}</code></td>
+    <td>${handle}</td>
     <td><span class="state ${running ? "up" : "down"}">${esc(m.state)}</span></td>
     <td>${esc(m.status)}</td>
     <td>${session ? "live" : "—"}</td>
@@ -45,7 +51,7 @@ export async function renderDashboard(
 
   const rows = members.length
     ? members.map((m) => row(m, registry, now)).join("\n")
-    : `<tr><td colspan="7" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> to spin one up.</td></tr>`;
+    : `<tr><td colspan="8" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> to spin one up.</td></tr>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -72,7 +78,7 @@ export async function renderDashboard(
   ${err ? `<p class="err">Could not list fleet: ${esc(err)}</p>` : ""}
   <table>
     <thead>
-      <tr><th>name</th><th>state</th><th>status</th><th>session</th><th>attached</th><th>idle</th><th>view</th></tr>
+      <tr><th>name</th><th>handle</th><th>state</th><th>status</th><th>session</th><th>attached</th><th>idle</th><th>view</th></tr>
     </thead>
     <tbody>
 ${rows}

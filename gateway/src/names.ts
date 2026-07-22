@@ -13,3 +13,12 @@ export function assertValidName(name: string): void {
     );
   }
 }
+
+// A session "handle" (chikin_identify) is a human-friendly display/correlation
+// label for the *instance driving* a browser. It shares this same DNS-safe
+// charset rule but is orthogonal to the browser name / profile-volume identity.
+export const HANDLE_RULE = "1-32 chars, lowercase letters/digits/dashes, no leading or trailing dash";
+
+export function isValidHandle(handle: unknown): handle is string {
+  return typeof handle === "string" && NAME_RE.test(handle);
+}

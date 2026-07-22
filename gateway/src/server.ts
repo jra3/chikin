@@ -9,7 +9,7 @@ import { Registry } from "./registry.js";
 import { Provisioner, FleetFullError, ProvisionError } from "./provisioner.js";
 import { createSession } from "./bridge.js";
 import { renderDashboard } from "./dashboard.js";
-import { vncHttpHandler, vncUpgradeHandler, hostOk } from "./vnc.js";
+import { makeVncHttpHandler, vncUpgradeHandler, hostOk } from "./vnc.js";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
@@ -108,7 +108,7 @@ export function createApp(deps: ServerDeps): express.Express {
 
   // noVNC reverse proxy. Mounted as a catch-all so all of noVNC's relative asset
   // requests under /vnc/<name>/ are forwarded. Origin/Host-guarded in vnc.ts.
-  app.use("/vnc/:name", vncHttpHandler);
+  app.use("/vnc/:name", makeVncHttpHandler(deps.registry));
 
   // MCP endpoint, one logical browser per <name>. Bearer-protected.
   const b = express.Router({ mergeParams: true });
