@@ -89,7 +89,7 @@ setup_env() {
     ok ".env already present — leaving it untouched"
   else
     cp "$REPO/.env.example" "$REPO/.env"
-    ok "created .env from .env.example (no auth, no seed, CHIKIN_VERSION=latest)"
+    ok "created .env from .env.example (no auth, no seed, pinned CHIKIN_VERSION)"
   fi
 }
 

@@ -21,7 +21,7 @@ services:
   # the gateway's startup image check. The "build" profile keeps it out of
   # `up`. Developers build it locally via docker-compose.dev.yml.
   chrome-image:
-    image: ghcr.io/jra3/chikin:${CHIKIN_VERSION:-latest}
+    image: ghcr.io/jra3/chikin:${CHIKIN_VERSION:-sha-e1b3e92}
     profiles: ["build"]
     entrypoint: ["true"]
     restart: "no"
@@ -62,7 +62,7 @@ services:
     restart: unless-stopped
 
   gateway:
-    image: ghcr.io/jra3/chikin-gateway:${CHIKIN_VERSION:-latest}
+    image: ghcr.io/jra3/chikin-gateway:${CHIKIN_VERSION:-sha-e1b3e92}
     container_name: chikin-gateway
     init: true
     restart: unless-stopped
@@ -91,7 +91,7 @@ services:
       # "--experimentalPageIdRouting" to bypass the sticky page binding.
       CDM_EXTRA_ARGS: "${CDM_EXTRA_ARGS:-}"
       NAV_VERIFY_DELAY_MS: "${NAV_VERIFY_DELAY_MS:-2500}"
-      CHROME_IMAGE: "ghcr.io/jra3/chikin:${CHIKIN_VERSION:-latest}"
+      CHROME_IMAGE: "ghcr.io/jra3/chikin:${CHIKIN_VERSION:-sha-e1b3e92}"
       # Golden-profile seed volume. Empty = off; set to chikin-seed and populate
       # it with bin/chikin-snapshot to have new browsers start logged in.
       SEED_VOLUME: "${SEED_VOLUME:-}"
