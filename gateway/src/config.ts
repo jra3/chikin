@@ -8,6 +8,16 @@ function int(name: string, def: number): number {
   return n;
 }
 
+function num(name: string, def: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return def;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new Error(`env ${name}=${raw} is not a number`);
+  }
+  return n;
+}
+
 function str(name: string, def: string): string {
   const raw = process.env[name];
   return raw === undefined || raw === "" ? def : raw;
@@ -51,6 +61,29 @@ export const config = {
   idleTtlMs: int("IDLE_TTL_SEC", 900) * 1000,
   reapIntervalMs: int("REAP_INTERVAL_SEC", 30) * 1000,
   provisionTimeoutMs: int("PROVISION_TIMEOUT_SEC", 90) * 1000,
+
+  // Per-container resource caps (M3). MAX_FLEET bounds the *count* of browsers;
+  // these bound what any *one* browser can consume, so a single hostile or
+  // runaway page can't OOM, fork-bomb, or CPU-starve the host and take down
+  // every other client's browser. Applied to each container's HostConfig.
+  //
+  // memoryMb: hard memory ceiling. Note the 2g ShmSize below is a tmpfs whose
+  // usage is charged to the same memory cgroup, so this MUST exceed 2g to leave
+  // Chrome room above a full /dev/shm — 3g gives ~1g of headroom. Swap is pinned
+  // equal to Memory (MemorySwap=Memory) so a container can't escape the cap into
+  // swap. 0 disables the memory cap.
+  memoryMb: int("BROWSER_MEMORY_MB", 3072),
+  // pidsLimit: max processes/threads — the fork-bomb guard. Chrome spawns a
+  // process per tab/renderer plus threads; 512 is ample for typical use. 0/-1
+  // = unlimited.
+  pidsLimit: int("BROWSER_PIDS_LIMIT", 512),
+  // cpus: CPU cap in whole/fractional cores, converted to Docker NanoCpus. 2.0
+  // lets a browser use two cores flat-out but no more. 0 disables the CPU cap.
+  cpus: num("BROWSER_CPUS", 2.0),
+  // nofile: open-file-descriptor ceiling (soft=hard) to stop one browser
+  // exhausting the host's fd table. Chrome is fd-hungry, so keep this generous;
+  // 8192 bounds abuse while leaving real pages plenty. 0 disables the ulimit.
+  nofile: int("BROWSER_NOFILE", 8192),
 
   // Shared host scratch dir, mounted as ~/Downloads + the upload path on every
   // browser (issue #8). Resolved on the Docker host, not inside the gateway.

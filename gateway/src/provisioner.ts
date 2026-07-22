@@ -16,6 +16,33 @@ export class ProvisionError extends Error {
   }
 }
 
+/**
+ * Per-container resource caps (M3), read from the central env config. Returned
+ * as a partial HostConfig so buildCreateOptions can spread it in. Each knob is
+ * omitted when its config value is 0/≤0, so the shipped defaults are "capped"
+ * while an operator can still opt an individual limit back out via env.
+ */
+export function resourceLimits(): Partial<Docker.HostConfig> {
+  const limits: Partial<Docker.HostConfig> = {};
+  if (config.memoryMb > 0) {
+    const bytes = config.memoryMb * 1024 * 1024;
+    limits.Memory = bytes;
+    // Pin swap to Memory so the container can't escape the RAM cap into swap.
+    limits.MemorySwap = bytes;
+  }
+  if (config.pidsLimit > 0) {
+    limits.PidsLimit = config.pidsLimit;
+  }
+  if (config.cpus > 0) {
+    // Docker's single-knob CPU cap. 1 CPU == 1e9 NanoCpus; round to an integer.
+    limits.NanoCpus = Math.round(config.cpus * 1e9);
+  }
+  if (config.nofile > 0) {
+    limits.Ulimits = [{ Name: "nofile", Soft: config.nofile, Hard: config.nofile }];
+  }
+  return limits;
+}
+
 export interface FleetMember {
   name: string;
   containerId: string;
@@ -176,6 +203,13 @@ export class Provisioner {
         CapDrop: ["ALL"],
         CapAdd: ["CHOWN", "DAC_OVERRIDE", "SETUID", "SETGID", "KILL"],
         SecurityOpt: ["no-new-privileges"],
+        // Per-container resource caps (M3). MAX_FLEET bounds the count of
+        // browsers; these bound what one browser can consume so a single
+        // hostile/runaway page can't OOM, fork-bomb, or CPU-starve the host and
+        // take down every other client's browser. All configurable via env
+        // (config.ts); each knob is omitted entirely when its config is 0 so the
+        // default is "capped" but an operator can opt back out.
+        ...resourceLimits(),
       },
     };
   }
