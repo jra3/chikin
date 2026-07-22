@@ -42,6 +42,27 @@ test("a browser idle within the TTL is not reaped", async () => {
   assert.deepEqual(stopped, [], "within TTL -> not reaped");
 });
 
+test("a mid-provision (pending) browser is not reaped even when idle past the TTL", async () => {
+  const reg = new Registry();
+  // reserve() stamps a reap-eligible activity record (streams=0) up front, but
+  // the name stays pending until provisioning finishes — a slow cold start must
+  // not be torn down mid-flight (CHK-015).
+  reg.reserve("provisioning", 0);
+  const { provisioner, stopped, removed } = fakeProvisioner();
+  const reaper = new Reaper(reg, provisioner as never);
+
+  await reaper.sweep(config.idleTtlMs + 5000);
+
+  assert.deepEqual(stopped, [], "pending name spared while mid-provision");
+  assert.deepEqual(removed, [], "pending container not removed");
+  assert.ok(reg.getActivity("provisioning"), "activity record preserved");
+
+  // Once promoted to a live session (no longer pending) and left idle, it reaps.
+  reg.release("provisioning"); // simulate provision resolving to no live session
+  await reaper.sweep(config.idleTtlMs * 2 + 5000);
+  assert.deepEqual(stopped, ["provisioning"], "reaped once no longer pending and idle");
+});
+
 test("orphan running containers are adopted, then reaped after the TTL", async () => {
   const reg = new Registry();
   const { provisioner, stopped } = fakeProvisioner([{ name: "orphan", state: "running" }]);

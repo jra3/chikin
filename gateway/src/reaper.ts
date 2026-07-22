@@ -55,6 +55,7 @@ export class Reaper {
     for (const name of this.registry.activityNames()) {
       const a = this.registry.getActivity(name);
       if (!a) continue;
+      if (this.registry.isPending(name)) continue; // mid-provision -> not idle (CHK-015)
       if (a.streams > 0) continue; // attached client -> never reap
       if (now - a.last <= config.idleTtlMs) continue;
 

@@ -27,6 +27,11 @@ export class Registry {
     return this.byName.has(name) || this.pending.has(name);
   }
 
+  /** True while a name is reserved but not yet a live session (mid-provision). */
+  isPending(name: string): boolean {
+    return this.pending.has(name);
+  }
+
   /**
    * Atomically claim a name for provisioning. Returns false if the name is
    * already live or pending. Race-free as long as it's called synchronously

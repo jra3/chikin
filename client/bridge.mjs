@@ -28,8 +28,8 @@
 // just another reconnect trigger. Ping replies are swallowed.
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 
 const url = process.argv[2];
@@ -72,8 +72,19 @@ let shuttingDown = false;
 // the recovered frame. A live client's own `initialize` always overwrites a
 // (possibly stale) recovered frame before any replay can use it, so a leftover
 // file from a previous crash is harmless on a genuinely fresh session.
+// Prefer XDG_RUNTIME_DIR (already per-user, mode 0700). The /tmp fallback is
+// world-writable, so keep the frame in a private per-user subdir (0700) instead
+// of directly in /tmp — a co-located user then can't read it or pre-plant a
+// symlink at the predictable path to redirect our write (CHK-014). The frame
+// itself carries no bearer (that rides the HTTP Authorization header), but it
+// does leak the in-use browser name + MCP capabilities.
+const runtimeDir =
+  process.env.XDG_RUNTIME_DIR || join(tmpdir(), `chikin-${userInfo().uid}`);
+if (!process.env.XDG_RUNTIME_DIR) {
+  mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+}
 const initPath = join(
-  process.env.XDG_RUNTIME_DIR || tmpdir(),
+  runtimeDir,
   `chikin-bridge${new URL(url).pathname.replace(/[^a-zA-Z0-9-]+/g, "-")}init.json`,
 );
 let initFrame = null;
@@ -199,7 +210,7 @@ stdio.onmessage = (m) => {
   if (m && m.method === "initialize") {
     initFrame = m;
     try {
-      writeFileSync(initPath, JSON.stringify(m)); // survive a hard crash + respawn
+      writeFileSync(initPath, JSON.stringify(m), { mode: 0o600 }); // survive a hard crash + respawn
     } catch (e) {
       log(`initialize persist failed: ${e?.message ?? e}`);
     }
