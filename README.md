@@ -136,6 +136,10 @@ Set in `.env` (see `.env.example`) or the environment.
 |---|---|---|
 | `GATEWAY_TOKEN` | *(empty)* | Bearer token clients must present. **Empty disables auth** — safe because the port is bound to `127.0.0.1`. Set one (`openssl rand -hex 32`) to require it. |
 | `MAX_FLEET` | `8` | Max concurrent browsers. Provisioning past the cap is rejected with HTTP 429 instead of OOMing the host. |
+| `BROWSER_MEMORY_MB` | `3072` | Hard RAM cap per browser (swap pinned equal — no swap escape). Must exceed the 2g `/dev/shm` each browser gets (that tmpfs is charged to the same cgroup); `3072` leaves ~1g headroom for Chrome above a full shm. `0` disables. |
+| `BROWSER_PIDS_LIMIT` | `512` | Max processes/threads per browser — the fork-bomb guard. `0` disables. |
+| `BROWSER_CPUS` | `2.0` | CPU cap per browser in cores (fractions allowed, e.g. `1.5`); mapped to Docker `NanoCpus`. `0` disables. |
+| `BROWSER_NOFILE` | `8192` | Open-file-descriptor ceiling per browser (soft=hard). Kept generous because Chrome is fd-hungry. `0` disables. |
 | `SEED_VOLUME` | *(empty)* | Docker volume cloned into every new profile so browsers start logged in. Empty = off. Populate with `bin/chikin-snapshot` (see [Pre-authenticated browsers](#pre-authenticated-browsers-golden-profile)). |
 | `IDLE_TTL_SEC` | `900` | Idle seconds (no attached client stream) before a browser is reaped. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
