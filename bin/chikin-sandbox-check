@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+// chikin-sandbox-check [<name>] [--cdp URL] [--json]
+//
+// Report whether a chikin browser's renderer is REALLY sandboxed by reading
+// Chrome's own chrome://sandbox page over CDP (H1 hardening). This is the
+// authoritative check: DO NOT trust /proc/<pid>/status Seccomp: — it shows 2
+// even for the unsandboxed --no-sandbox baseline (that's the container-wide
+// Docker seccomp, not Chrome's sandbox). A working sandbox reports
+// "Layer 1 Sandbox: Namespace", PID/Network namespaces Yes, Seccomp-BPF Yes,
+// and "You are adequately sandboxed."
+//
+// The fleet never publishes Chrome's CDP to the host, but the host shares
+// chikin's docker network, so we reach CDP at the container's IP (the same
+// trick bin/chikin-record uses). Pass a name to resolve its container, or an
+// explicit --cdp URL (e.g. a standalone container with -p 127.0.0.1:9333:9222).
+//
+// Exit: 0 adequately sandboxed · 1 NOT sandboxed · 2 couldn't reach the browser.
+import { execFileSync } from "node:child_process";
+
+function parseArgs(argv) {
+  const a = { name: "", cdp: "", json: false };
+  for (let i = 0; i < argv.length; i++) {
+    const v = argv[i];
+    if (v === "--json") a.json = true;
+    else if (v === "--cdp") a.cdp = argv[++i];
+    else if (!v.startsWith("-")) a.name = v;
+    else {
+      console.error(`unknown argument: ${v}`);
+      process.exit(2);
+    }
+  }
+  return a;
+}
+
+// Resolve a fleet browser's CDP base URL from its container IP (host shares the
+// docker network). Prefer the internal chikin-net; fall back to any IP.
+function cdpForName(name) {
+  const cname = `chikin-chrome-${name}`;
+  let out;
+  try {
+    out = execFileSync(
+      "docker",
+      [
+        "inspect",
+        "-f",
+        "{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}} {{end}}",
+        cname,
+      ],
+      { encoding: "utf8" },
+    ).trim();
+  } catch {
+    console.error(`could not docker inspect ${cname} — is that browser provisioned?`);
+    process.exit(2);
+  }
+  const nets = Object.fromEntries(
+    out.split(/\s+/).filter(Boolean).map((kv) => kv.split("=")),
+  );
+  const ip = nets["chikin-net"] || Object.values(nets).find(Boolean);
+  if (!ip) {
+    console.error(`${cname} has no IP address (not running?)`);
+    process.exit(2);
+  }
+  return `http://${ip}:9222`;
+}
+
+async function jget(url, init) {
+  const res = await fetch(url, init);
+  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+  return res.json();
+}
+
+async function readSandboxPage(base) {
+  // Open chrome://sandbox in a fresh tab (PUT is required on newer Chrome).
+  let tab;
+  try {
+    tab = await jget(`${base}/json/new?chrome://sandbox`, { method: "PUT" });
+  } catch {
+    tab = await jget(`${base}/json/new?chrome://sandbox`);
+  }
+  const wsUrl = tab.webSocketDebuggerUrl;
+  if (!wsUrl) throw new Error("no webSocketDebuggerUrl on the new target");
+
+  const ws = new WebSocket(wsUrl);
+  let id = 0;
+  const pending = new Map();
+  const send = (method, params = {}) =>
+    new Promise((resolve, reject) => {
+      const mid = ++id;
+      pending.set(mid, { resolve, reject });
+      ws.send(JSON.stringify({ id: mid, method, params }));
+    });
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.id && pending.has(m.id)) {
+      const { resolve, reject } = pending.get(m.id);
+      pending.delete(m.id);
+      m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result);
+    }
+  };
+  await new Promise((r, j) => {
+    ws.onopen = r;
+    ws.onerror = () => j(new Error("CDP websocket failed"));
+  });
+  try {
+    await send("Page.enable");
+    await new Promise((r) => setTimeout(r, 1500)); // let the status table render
+    const { result } = await send("Runtime.evaluate", {
+      expression: "document.body ? document.body.innerText : ''",
+      returnByValue: true,
+    });
+    return result.value || "";
+  } finally {
+    ws.close();
+  }
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const base = args.cdp || (args.name ? cdpForName(args.name) : "");
+  if (!base) {
+    console.error("usage: chikin-sandbox-check <name> | --cdp http://host:port");
+    process.exit(2);
+  }
+
+  let text;
+  try {
+    text = await readSandboxPage(base);
+  } catch (e) {
+    console.error(`could not read chrome://sandbox from ${base}: ${e.message}`);
+    process.exit(2);
+  }
+
+  const adequate = /adequately sandboxed/i.test(text);
+  if (args.json) {
+    console.log(JSON.stringify({ base, adequate, text: text.trim() }, null, 2));
+  } else {
+    console.log(`chrome://sandbox @ ${base}`);
+    console.log("----------------------------------------");
+    console.log(text.trim());
+    console.log("----------------------------------------");
+    console.log(adequate ? "RESULT: adequately sandboxed ✅" : "RESULT: NOT sandboxed ❌");
+  }
+  process.exit(adequate ? 0 : 1);
+}
+
+main().catch((e) => {
+  console.error(e.stack || e.message);
+  process.exit(2);
+});

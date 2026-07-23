@@ -23,6 +23,12 @@ ENV PUPPETEER_SKIP_DOWNLOAD=1 PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=1
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+# Bundle the browser seccomp profile (H1 hardening). The gateway reads it once
+# at runtime and inlines its JSON into each browser's SecurityOpt over the Docker
+# API (a file path won't work over the API — see gateway/src/seccomp.ts). Lands
+# at /app/seccomp/chikin-browser.json, which dist/src/seccomp.js resolves as
+# ../../seccomp/.
+COPY seccomp ./seccomp
 
 # Drop root: the gateway needs no privileges at runtime (it reaches Docker only
 # over TCP to the socket-proxy, and binds 8080 which is unprivileged). Run as the

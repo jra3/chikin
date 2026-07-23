@@ -1,6 +1,6 @@
 import { config } from "./config.js";
 import type { Registry } from "./registry.js";
-import type { Provisioner, FleetMember } from "./provisioner.js";
+import type { Provisioner, FleetMember, SandboxStatus } from "./provisioner.js";
 
 function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
@@ -8,7 +8,27 @@ function esc(s: string): string {
   );
 }
 
-function row(m: FleetMember, registry: Registry, now: number): string {
+// Render a browser's renderer-sandbox posture (H1). "sandboxed" is the safe
+// state; "fell-back"/"disabled" mean a renderer exploit is in-container RCE.
+function sandboxCell(status: SandboxStatus): string {
+  const label: Record<SandboxStatus, string> = {
+    sandboxed: "sandboxed",
+    "fell-back": "fell back ⚠",
+    disabled: "disabled ⚠",
+    failed: "failed ✗",
+    unknown: "—",
+  };
+  const cls =
+    status === "sandboxed" ? "sb-on" : status === "unknown" ? "sb-unknown" : "sb-off";
+  return `<span class="sandbox ${cls}">${esc(label[status])}</span>`;
+}
+
+function row(
+  m: FleetMember,
+  registry: Registry,
+  now: number,
+  sandbox: SandboxStatus,
+): string {
   const session = registry.getByName(m.name);
   const act = registry.getActivity(m.name);
   const idle = act ? `${Math.round((now - act.last) / 1000)}s` : "—";
@@ -28,6 +48,7 @@ function row(m: FleetMember, registry: Registry, now: number): string {
     <td>${handle}</td>
     <td><span class="state ${running ? "up" : "down"}">${esc(m.state)}</span></td>
     <td>${esc(m.status)}</td>
+    <td>${sandboxCell(sandbox)}</td>
     <td>${session ? "live" : "—"}</td>
     <td>${attached}</td>
     <td>${idle}</td>
@@ -49,9 +70,18 @@ export async function renderDashboard(
     err = e instanceof Error ? e.message : String(e);
   }
 
+  // Per-browser renderer-sandbox posture (H1), parsed from each container's logs.
+  // Best-effort and cached in the provisioner, so this is cheap on re-render.
+  const sandbox = new Map<string, SandboxStatus>();
+  await Promise.all(
+    members.map(async (m) => {
+      sandbox.set(m.name, m.state === "running" ? await provisioner.sandboxStatus(m.containerId) : "unknown");
+    }),
+  );
+
   const rows = members.length
-    ? members.map((m) => row(m, registry, now)).join("\n")
-    : `<tr><td colspan="8" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> to spin one up.</td></tr>`;
+    ? members.map((m) => row(m, registry, now, sandbox.get(m.name) ?? "unknown")).join("\n")
+    : `<tr><td colspan="9" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> to spin one up.</td></tr>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -68,6 +98,9 @@ export async function renderDashboard(
   code { background: #f4f4f4; padding: 0 .25rem; border-radius: 3px; }
   .state.up { color: #137333; font-weight: 600; }
   .state.down { color: #a50e0e; }
+  .sandbox.sb-on { color: #137333; font-weight: 600; }
+  .sandbox.sb-off { color: #a50e0e; font-weight: 600; }
+  .sandbox.sb-unknown { color: #888; }
   .empty { color: #888; text-align: center; padding: 1.2rem; }
   .err { color: #a50e0e; }
   .meta { color: #777; font-size: .85rem; margin-top: 1.5rem; }
@@ -78,7 +111,7 @@ export async function renderDashboard(
   ${err ? `<p class="err">Could not list fleet: ${esc(err)}</p>` : ""}
   <table>
     <thead>
-      <tr><th>name</th><th>handle</th><th>state</th><th>status</th><th>session</th><th>attached</th><th>idle</th><th>view</th></tr>
+      <tr><th>name</th><th>handle</th><th>state</th><th>status</th><th>sandbox</th><th>session</th><th>attached</th><th>idle</th><th>view</th></tr>
     </thead>
     <tbody>
 ${rows}
@@ -86,7 +119,9 @@ ${rows}
   </table>
   <p class="meta">MAX_FLEET=${config.maxFleet} · idle reap after ${Math.round(
     config.idleTtlMs / 1000,
-  )}s with no attached client</p>
+  )}s with no attached client · sandbox policy <code>CHIKIN_SANDBOX=${esc(
+    config.sandbox,
+  )}</code></p>
 </body>
 </html>`;
 }

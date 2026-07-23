@@ -1,7 +1,36 @@
 import Docker from "dockerode";
 import { config, containerName, volumeName } from "./config.js";
+import { seccompProfile } from "./seccomp.js";
 // buildCreateOptions is exported above and used both here and by tests.
 import { log } from "./log.js";
+
+/**
+ * Build the browser container's SecurityOpt (H1 renderer-sandbox hardening).
+ *
+ * Always keeps `no-new-privileges` on. For sandbox mode auto|on it also inlines
+ * the custom seccomp profile so Chrome's user-namespace sandbox can build its
+ * namespaces + chroot the renderer under CapDrop:["ALL"] (see seccomp.ts). The
+ * entrypoint makes the per-browser launch decision (probe host userns, sandbox
+ * or fall back); attaching the widened seccomp is inert on a host that can't do
+ * unprivileged userns (the kernel still denies CLONE_NEWUSER regardless), so
+ * carrying it in the auto-fallback case grants a compromised renderer nothing.
+ * Mode `off` is exactly the pre-hardening posture: Docker's default seccomp.
+ */
+export function securityOpt(): string[] {
+  const opt = ["no-new-privileges"];
+  if (config.sandbox === "off") return opt;
+  const profile = seccompProfile();
+  if (profile) {
+    opt.push(`seccomp=${profile}`);
+  } else if (config.sandbox === "on") {
+    // Forced on but we can't even attach the profile — the entrypoint probe will
+    // then fail and (mode=on) abort the container. Surface the root cause here.
+    log.error(
+      "CHIKIN_SANDBOX=on but the seccomp profile could not be loaded; browsers will fail to boot",
+    );
+  }
+  return opt;
+}
 
 export class FleetFullError extends Error {
   constructor(max: number) {
@@ -69,6 +98,10 @@ export function buildCreateOptions(name: string): Docker.ContainerCreateOptions 
       `VNC_PORT=${config.vncPort}`,
       `CDP_PORT=${config.cdpPort}`,
       `WINDOW_SIZE=${config.windowSize}`,
+      // The entrypoint makes the actual sandbox launch decision (probe host
+      // userns; sandbox or fall back). The gateway attaches the matching seccomp
+      // profile in securityOpt() below. See config.sandbox / entrypoint.sh.
+      `CHIKIN_SANDBOX=${config.sandbox}`,
     ],
     HostConfig: {
       Binds: [
@@ -92,7 +125,10 @@ export function buildCreateOptions(name: string): Docker.ContainerCreateOptions 
       // binaries.
       CapDrop: ["ALL"],
       CapAdd: ["CHOWN", "DAC_OVERRIDE", "SETUID", "SETGID", "KILL"],
-      SecurityOpt: ["no-new-privileges"],
+      // no-new-privileges always on; for sandbox mode auto|on this also inlines
+      // the custom seccomp profile that lets Chrome's userns sandbox run without
+      // adding any capability (H1 hardening). See securityOpt() / seccomp.ts.
+      SecurityOpt: securityOpt(),
       // Per-container resource caps (M3). MAX_FLEET bounds the count of
       // browsers; these bound what one browser can consume so a single
       // hostile/runaway page can't OOM, fork-bomb, or CPU-starve the host and
@@ -111,8 +147,16 @@ export interface FleetMember {
   status: string;
 }
 
+/** What the entrypoint decided for a browser's renderer sandbox (from its logs). */
+export type SandboxStatus = "sandboxed" | "fell-back" | "disabled" | "failed" | "unknown";
+
 export class Provisioner {
   private docker: Docker;
+  // Per-container sandbox decision, parsed once from the container's logs and
+  // cached by containerId (the decision is fixed for a container's lifetime; a
+  // recreated container gets a fresh id and is re-read). Surfaced on the
+  // dashboard so an operator can see each browser's real posture (H1).
+  private sandboxCache = new Map<string, SandboxStatus>();
   // Serializes the fleet-cap check-and-create critical section (CHK-010). The
   // cap is a read-then-act (listFleet → compare → create); without this, N
   // concurrent provisions of distinct new names each observe the same pre-create
@@ -124,6 +168,30 @@ export class Provisioner {
   constructor(docker?: Docker) {
     this.docker =
       docker ?? new Docker({ host: config.dockerHost, port: config.dockerPort, protocol: "http" });
+  }
+
+  /**
+   * Create a container, keeping the config OUT of the request URL.
+   *
+   * dockerode/docker-modem mirrors the ENTIRE create config into the request
+   * query string (not just `?name=`), then ALSO sends it in the POST body. A
+   * small config happens to fit — which is why the pre-sandbox fleet worked —
+   * but the ~10KB inlined seccomp profile URL-encodes to ~25KB and overflows the
+   * socket-proxy's (haproxy) request-line buffer, which rejects it with a bare
+   * 400. Using docker-modem's `_query`/`_body` convention keeps only the name in
+   * the URL and the config (profile included) in the body where it belongs.
+   */
+  private createContainer(opts: Docker.ContainerCreateOptions): Promise<Docker.Container> {
+    const { name, platform, ...body } = opts as Docker.ContainerCreateOptions & {
+      platform?: string;
+    };
+    const query: Record<string, unknown> = {};
+    if (name !== undefined) query.name = name;
+    if (platform !== undefined) query.platform = platform;
+    return this.docker.createContainer({
+      _query: query,
+      _body: body,
+    } as unknown as Docker.ContainerCreateOptions);
   }
 
   /** Run `fn` after all previously-gated calls settle (a simple async mutex). */
@@ -269,7 +337,7 @@ export class Provisioner {
         }
         await this.ensureVolume(name);
         log.info(`provisioner: creating container ${cname}`);
-        const created = await this.docker.createContainer(buildCreateOptions(name));
+        const created = await this.createContainer(buildCreateOptions(name));
         // Attach the egress network so the browser can reach the internet; the
         // primary chikin-net is internal-only (CDP isolated from the host).
         try {
@@ -284,6 +352,37 @@ export class Provisioner {
     const ip = await this.resolveIp(name);
     await this.waitHealthy(name, ip);
     return ip;
+  }
+
+  /**
+   * The renderer-sandbox decision a running browser's entrypoint made, parsed
+   * from the `CHIKIN_SANDBOX_STATUS=` marker it logs at launch. Cached by
+   * containerId. Best-effort: returns "unknown" if logs are unreadable or the
+   * marker hasn't been emitted yet. Read over the Docker API (GET .../logs) via
+   * the socket-proxy, which the CONTAINERS scope already permits.
+   */
+  async sandboxStatus(containerId: string): Promise<SandboxStatus> {
+    const cached = this.sandboxCache.get(containerId);
+    if (cached) return cached;
+    try {
+      const buf = (await this.docker.getContainer(containerId).logs({
+        stdout: true,
+        stderr: true,
+        tail: 400,
+        follow: false,
+      })) as unknown as Buffer;
+      // The log stream is multiplexed with 8-byte frame headers, but each marker
+      // is a whole line inside a single frame, so it survives as contiguous ASCII.
+      const matches = buf.toString("utf8").match(/CHIKIN_SANDBOX_STATUS=([a-z-]+)/g);
+      if (matches && matches.length) {
+        const status = matches[matches.length - 1].split("=")[1] as SandboxStatus;
+        this.sandboxCache.set(containerId, status);
+        return status;
+      }
+    } catch (e) {
+      log.debug(`provisioner: could not read sandbox status for ${containerId}: ${String(e)}`);
+    }
+    return "unknown";
   }
 
   /** The container's IP on the control network (used for CDP by IP). */

@@ -81,6 +81,10 @@ services:
       # websocket, and the MCP Host check (comma-separated). Default loopback
       # set applies when empty. See CHK-006/CHK-006a/CHK-016.
       GATEWAY_EXTRA_ORIGINS: "${GATEWAY_EXTRA_ORIGINS:-}"
+      # Renderer-sandbox policy (H1 hardening): auto|on|off. auto (default) runs
+      # Chrome sandboxed where the host permits unprivileged user namespaces and
+      # falls back to --no-sandbox (loud WARN) where it doesn't. See README.
+      CHIKIN_SANDBOX: "${CHIKIN_SANDBOX:-auto}"
       MAX_FLEET: "${MAX_FLEET:-8}"
       IDLE_TTL_SEC: "${IDLE_TTL_SEC:-900}"
       REAP_INTERVAL_SEC: "${REAP_INTERVAL_SEC:-30}"

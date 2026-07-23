@@ -176,6 +176,7 @@ Set in `.env` (see `.env.example`) or the environment.
 | Variable | Default | Meaning |
 |---|---|---|
 | `GATEWAY_TOKEN` | *(empty)* | Bearer token clients must present. **Empty disables auth** — safe because the port is bound to `127.0.0.1`. Set one (`openssl rand -hex 32`) to require it. |
+| `CHIKIN_SANDBOX` | `auto` | Chrome renderer-sandbox policy (H1). `auto` sandboxes where the host permits unprivileged user namespaces and falls back to `--no-sandbox` (loud WARN) where it doesn't; `on` forces it (fails loudly if unsupported); `off` forces `--no-sandbox`. See [Renderer sandbox](#renderer-sandbox-h1). |
 | `MAX_FLEET` | `8` | Max concurrent browsers. Provisioning past the cap is rejected with HTTP 429 instead of OOMing the host. |
 | `BROWSER_MEMORY_MB` | `3072` | Hard RAM cap per browser (swap pinned equal — no swap escape). Must exceed the 2g `/dev/shm` each browser gets (that tmpfs is charged to the same cgroup); `3072` leaves ~1g headroom for Chrome above a full shm. `0` disables. |
 | `BROWSER_PIDS_LIMIT` | `512` | Max processes/threads per browser — the fork-bomb guard. `0` disables. |
@@ -213,6 +214,7 @@ Environment variables read by `entrypoint.sh` (the fleet sets these when it prov
 | `DISPLAY_NUM` | `99` | Which `:N` display Xvfb creates. |
 | `ENABLE_VNC` | `0` | `1` to start x11vnc + noVNC on `VNC_PORT`. The fleet sets this automatically. |
 | `VNC_PORT` | `6080` | noVNC/websockify port inside the container. |
+| `CHIKIN_SANDBOX` | `auto` | Renderer-sandbox policy `auto`\|`on`\|`off` (H1). The fleet passes this down from the gateway; the entrypoint probes the host's unprivileged-userns support and drops (or keeps) `--no-sandbox` accordingly. See [Renderer sandbox](#renderer-sandbox-h1). |
 | `EXTRA_CHROME_ARGS` | *(empty)* | Appended to Chrome's argv. |
 
 ### Why the port shuffle
@@ -239,8 +241,28 @@ The container starts as **root** only long enough for `entrypoint.sh` to chown t
 - **CDP has no authentication.** chikin never publishes a Chrome port to the host. In fleet mode the only host-exposed surface is the gateway on `127.0.0.1:8080`, and `/b/<name>/` requires a bearer token; the control-plane network is `internal: true`.
 - **Linux caveat:** on a Linux host you can still reach a container's CDP by its *container IP* (e.g. `http://172.x.x.x:9222`) because the host routes to Docker bridges directly — `internal: true` does not change this. The boundary chikin provides is "not reachable from other machines and not on any host port." If you need to block host-local access too, add a `DOCKER-USER` iptables rule; that's outside chikin's scope.
 - **Scoped Docker access.** The gateway reaches Docker only through `tecnativa/docker-socket-proxy` with a read-only socket mount, scoped to containers/volumes/images (+POST). `exec`, `info`, swarm, and secrets are denied — verify with the proxy returning `403` on `/info` and `/exec/...`.
-- `--no-sandbox` is in use. Treat a profile volume as a fully compromised browser profile after visiting untrusted content.
+- **Chrome's renderer sandbox is ON by default** where the host supports it (see [Renderer sandbox](#renderer-sandbox-h1) below). This closes the H1 audit finding: a renderer exploit from a hostile page no longer means immediate in-container code execution — it now *also* needs a sandbox escape. On a host that can't sandbox, chikin falls back to `--no-sandbox` (loud WARN); there, still treat a profile volume as a fully compromised browser profile after visiting untrusted content.
 - Never change the gateway's host port binding from `127.0.0.1`.
+
+### Renderer sandbox (H1)
+
+Chrome runs each renderer in its **user-namespace sandbox**, so a renderer RCE from a malicious page is contained instead of being immediate code execution as the container's `chrome` user (uid 1100). This holds together with chikin's existing least-privilege posture — **no capability is added** and **`no-new-privileges` stays on**; the only change is a custom seccomp profile (Docker's own default plus one allow group for the five syscalls Chrome's sandbox needs: `clone`, `clone3`, `unshare`, `setns`, `chroot`) so the sandbox can build its namespaces under `CapDrop: ["ALL"]`. Every other default-deny rule (`mount`, `bpf`, `ptrace`, `kexec`, keyring, `perf_event_open`, …) stays intact.
+
+**Host requirement:** the sandbox needs the host to permit **unprivileged user namespaces** (most modern Linux; e.g. `sysctl kernel.unprivileged_userns_clone=1`, and on Ubuntu ≥23.10 `kernel.apparmor_restrict_unprivileged_userns=0` or a permissive profile). Where that isn't available Chrome *hard-fails to boot* rather than silently downgrading, so chikin detects the prerequisite and acts on the `CHIKIN_SANDBOX` knob:
+
+| `CHIKIN_SANDBOX` | Behavior |
+|---|---|
+| `auto` *(default)* | Run sandboxed when the host permits unprivileged user namespaces; otherwise fall back to `--no-sandbox` so the browser still boots, logging a loud **WARN** that the sandbox is disabled and why. |
+| `on` | Force sandboxed. If the host can't support it, the browser fails loudly to boot rather than silently degrading. |
+| `off` | Force `--no-sandbox` (the pre-hardening behavior). |
+
+Per-browser posture is shown on the dashboard (a **sandbox** column: `sandboxed` / `fell back` / `disabled`) and in each container's log (`CHIKIN_SANDBOX_STATUS=…`). Confirm a specific browser's *real* state authoritatively with:
+
+```bash
+node bin/chikin-sandbox-check <name>     # reads chrome://sandbox over CDP → "adequately sandboxed"
+```
+
+Do **not** trust `/proc/<pid>/status` `Seccomp:` for this — it reads `2` even for the unsandboxed `--no-sandbox` baseline (that's the container-wide Docker seccomp, not Chrome's sandbox). `chrome://sandbox` is the ground truth.
 
 ---
 
@@ -255,7 +277,10 @@ cd verify && npm install
 node verify-fleet.js                               # against http://localhost:8080
 node verify-fleet.js --json                        # machine-readable
 node verify-fleet.js --sannysoft                   # also scrape bot.sannysoft.com
+node verify-fleet.js --expect-sandbox              # also REQUIRE chrome://sandbox == "adequately sandboxed" (H1)
 ```
+
+`--expect-sandbox` (or `CHIKIN_EXPECT_SANDBOX=1`) makes the run assert Chrome's [renderer sandbox](#renderer-sandbox-h1) is real — use it on a userns-capable host (CI does, so a silent drop back to `--no-sandbox` is caught). Without it the sandbox status is still reported, just informationally. For a one-off check of a single browser, `node bin/chikin-sandbox-check <name>`.
 
 Exit codes: `0` all required checks passed · `1` a required check failed · `2` couldn't connect to the gateway · `3` unexpected error.
 
