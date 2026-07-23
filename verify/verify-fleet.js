@@ -15,7 +15,7 @@
 // · 2 couldn't connect to the gateway · 3 unexpected error.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { interpretProbe, PROBE_EXPRESSION } from "./probe.js";
+import { interpretProbe, isAdequatelySandboxed, PROBE_EXPRESSION } from "./probe.js";
 import { formatPretty, formatJson } from "./format.js";
 
 const SANNYSOFT_URL = "https://bot.sannysoft.com";
@@ -165,7 +165,7 @@ async function main() {
     } catch (e) {
       sandboxErr = e instanceof Error ? e.message : String(e);
     }
-    const adequate = /adequately sandboxed/i.test(sandboxText);
+    const adequate = isAdequatelySandboxed(sandboxText);
     rows.push({
       id: "sandbox",
       label: "chrome://sandbox reports adequately sandboxed (H1 renderer sandbox)",

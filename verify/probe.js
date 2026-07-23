@@ -17,6 +17,15 @@ export const PROBE_EXPRESSION = `
   })()
 `;
 
+// True only when chrome://sandbox AFFIRMATIVELY reports the renderer is
+// sandboxed (H1). Anchored to Chrome's full success phrase so it does NOT also
+// match the failure wording "You are NOT adequately sandboxed." — a bare
+// /adequately sandboxed/ matches both and would report PASS on an unsandboxed
+// browser.
+export function isAdequatelySandboxed(text) {
+  return /you are adequately sandboxed/i.test(String(text || ""));
+}
+
 export function interpretProbe(raw) {
   const rows = [];
 

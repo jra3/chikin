@@ -130,7 +130,10 @@ async function main() {
     process.exit(2);
   }
 
-  const adequate = /adequately sandboxed/i.test(text);
+  // Anchor to Chrome's full success phrase — a bare /adequately sandboxed/ also
+  // matches the failure wording "You are NOT adequately sandboxed." and would
+  // report PASS on an unsandboxed browser.
+  const adequate = /you are adequately sandboxed/i.test(text);
   if (args.json) {
     console.log(JSON.stringify({ base, adequate, text: text.trim() }, null, 2));
   } else {

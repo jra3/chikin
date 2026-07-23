@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { interpretProbe } from "../probe.js";
+import { interpretProbe, isAdequatelySandboxed } from "../probe.js";
 
 const goodRaw = {
   userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -69,6 +69,27 @@ test("WebGL row is informational, never fails", () => {
   const row = rows.find((r) => r.id === "webgl");
   assert.equal(row.required, false);
   assert.equal(row.status, "info");
+});
+
+// H1 renderer-sandbox adequacy predicate. Chrome's chrome://sandbox page says
+// EITHER "You are adequately sandboxed." OR "You are NOT adequately sandboxed.".
+// The check must distinguish them — a naive /adequately sandboxed/ matches both.
+test("isAdequatelySandboxed: true for the positive chrome://sandbox verdict", () => {
+  const page =
+    "Sandbox Status\nLayer 1 Sandbox\tNamespace\nSeccomp-BPF sandbox\tYes\n\nYou are adequately sandboxed.";
+  assert.equal(isAdequatelySandboxed(page), true);
+});
+
+test("isAdequatelySandboxed: FALSE for the negative 'You are NOT adequately sandboxed' verdict", () => {
+  const page =
+    "Sandbox Status\nLayer 1 Sandbox\tNone\nSeccomp-BPF sandbox\tNo\n\nYou are NOT adequately sandboxed.";
+  assert.equal(isAdequatelySandboxed(page), false);
+});
+
+test("isAdequatelySandboxed: false for empty/missing text", () => {
+  assert.equal(isAdequatelySandboxed(""), false);
+  assert.equal(isAdequatelySandboxed(null), false);
+  assert.equal(isAdequatelySandboxed(undefined), false);
 });
 
 test("all rows have the expected shape", () => {
