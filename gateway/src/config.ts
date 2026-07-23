@@ -23,6 +23,15 @@ function str(name: string, def: string): string {
   return raw === undefined || raw === "" ? def : raw;
 }
 
+export type SandboxMode = "auto" | "on" | "off";
+
+function sandboxMode(name: string, def: SandboxMode): SandboxMode {
+  const raw = (process.env[name] ?? "").trim().toLowerCase();
+  if (raw === "") return def;
+  if (raw === "auto" || raw === "on" || raw === "off") return raw;
+  throw new Error(`env ${name}=${process.env[name]} must be one of auto|on|off`);
+}
+
 export const config = {
   // HTTP listener. Bound to loopback by default — CDP/MCP have a bearer, but
   // the dashboard and /vnc proxy are loopback-trusted.
@@ -41,6 +50,21 @@ export const config = {
   // Docker access via the scoped tecnativa/docker-socket-proxy (HTTP, no TLS).
   dockerHost: str("DOCKER_PROXY_HOST", "docker-socket-proxy"),
   dockerPort: int("DOCKER_PROXY_PORT", 2375),
+
+  // Chrome renderer-sandbox policy (H1 hardening). Chrome's user-namespace
+  // sandbox now runs in the hardened container (CapDrop:[ALL], no-new-privileges)
+  // via a custom seccomp profile that allows only the 5 namespace/chroot
+  // syscalls it needs. But the sandbox requires the *host* to permit unprivileged
+  // user namespaces; where it doesn't, Chrome hard-fails to boot rather than
+  // silently downgrading.
+  //   auto (default): run sandboxed when the host supports it, else fall back to
+  //                   --no-sandbox so the browser still boots (loud WARN log).
+  //   on:             force sandboxed; fail loudly if the host can't support it.
+  //   off:            force --no-sandbox (pre-hardening behavior).
+  // The actual launch decision is made per-browser in the container entrypoint,
+  // which probes the host prerequisite; the gateway passes this mode down and
+  // attaches the seccomp profile for auto/on. See entrypoint.sh + provisioner.ts.
+  sandbox: sandboxMode("CHIKIN_SANDBOX", "auto"),
 
   // Fleet member image + network. The network name is forced (compose `name:`)
   // so the gateway and provisioned containers share one resolvable DNS domain.

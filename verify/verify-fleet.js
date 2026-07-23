@@ -15,7 +15,7 @@
 // · 2 couldn't connect to the gateway · 3 unexpected error.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { interpretProbe, PROBE_EXPRESSION } from "./probe.js";
+import { interpretProbe, isAdequatelySandboxed, PROBE_EXPRESSION } from "./probe.js";
 import { formatPretty, formatJson } from "./format.js";
 
 const SANNYSOFT_URL = "https://bot.sannysoft.com";
@@ -43,11 +43,18 @@ function parseArgs(argv) {
     url: "data:text/html,<title>chikin%20verify</title>",
     json: false,
     sannysoft: false,
+    // When set, REQUIRE chrome://sandbox to report "adequately sandboxed" — the
+    // H1 renderer-sandbox regression guard. CI sets this on a userns-capable
+    // host so a future change that silently drops back to --no-sandbox fails.
+    // Also settable via CHIKIN_EXPECT_SANDBOX=1. When unset the sandbox status is
+    // still reported, just informational (won't fail on a non-capable host).
+    expectSandbox: process.env.CHIKIN_EXPECT_SANDBOX === "1",
   };
   for (let i = 0; i < argv.length; i++) {
     const v = argv[i];
     if (v === "--json") a.json = true;
     else if (v === "--sannysoft") a.sannysoft = true;
+    else if (v === "--expect-sandbox") a.expectSandbox = true;
     else if (v === "--gateway") a.gateway = argv[++i];
     else if (v === "--name") a.name = argv[++i];
     else if (v === "--url") a.url = argv[++i];
@@ -129,6 +136,47 @@ async function main() {
     );
 
     const rows = interpretProbe(raw);
+
+    // H1 renderer-sandbox check. Read Chrome's OWN chrome://sandbox page — the
+    // authoritative signal. Do NOT trust /proc/<pid>/status Seccomp: (it shows 2
+    // even for the unsandboxed --no-sandbox baseline). A working sandbox reports
+    // "Layer 1 Sandbox: Namespace" and "You are adequately sandboxed.". Required
+    // only when expectSandbox (host is known userns-capable, e.g. CI); otherwise
+    // informational so it never fails on a host that legitimately fell back.
+    // Defensive: a hiccup reading chrome:// must not crash the whole run — it
+    // becomes a failed check only when we were REQUIRED to be sandboxed.
+    let sandboxText = "";
+    let sandboxErr = "";
+    try {
+      await client.callTool({
+        name: "navigate_page",
+        arguments: { type: "url", url: "chrome://sandbox" },
+      });
+      await new Promise((r) => setTimeout(r, 1000)); // let the status table render
+      const sandboxProbe = extractJson(
+        await client.callTool({
+          name: "evaluate_script",
+          arguments: {
+            function: "() => ({ sandbox: document.body ? document.body.innerText : '' })",
+          },
+        }),
+      );
+      sandboxText = String(sandboxProbe.sandbox || "");
+    } catch (e) {
+      sandboxErr = e instanceof Error ? e.message : String(e);
+    }
+    const adequate = isAdequatelySandboxed(sandboxText);
+    rows.push({
+      id: "sandbox",
+      label: "chrome://sandbox reports adequately sandboxed (H1 renderer sandbox)",
+      status: adequate ? "pass" : args.expectSandbox ? "fail" : "info",
+      required: args.expectSandbox,
+      value: adequate
+        ? "adequately sandboxed"
+        : sandboxErr
+          ? `could not read chrome://sandbox: ${sandboxErr}`.slice(0, 160)
+          : sandboxText.replace(/\s+/g, " ").trim().slice(0, 160) || "(empty)",
+    });
 
     let sannysoft = null;
     if (args.sannysoft) {
