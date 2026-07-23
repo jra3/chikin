@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# chikin-preflight [-f compose-file]... [--print-args]
+#
+# Check that the images a given compose file set selects can actually be run,
+# BEFORE `up` starts anything. Without this, bringing the stack up with the base
+# compose file alone in a dev checkout points the gateway's CHROME_IMAGE at
+# `ghcr.io/jra3/chikin:<tag>` — an image a local-only developer has never had —
+# and the gateway dies on its startup image check and crash-loops under
+# `restart: unless-stopped`, with the reason buried in `docker logs`.
+#
+# Note this cannot be fixed in .env: docker-compose.yml hardcodes
+# `CHROME_IMAGE: ghcr.io/jra3/chikin:${CHIKIN_VERSION:-...}` (only the TAG is
+# variable), so a CHROME_IMAGE entry in .env is inert. The dev override file is
+# what selects local images.
+#
+#   chikin-preflight                       # check the base (pinned/ghcr) file set
+#   chikin-preflight -f docker-compose.yml -f docker-compose.dev.yml
+#   chikin-preflight --print-args          # print the -f args this checkout should use
+#
+# Exit 0 = safe to bring up (images present, or absent but pullable from a
+# registry). Exit 1 = would fail; the message names the exact command to run.
+set -euo pipefail
+
+DOCKER="${DOCKER:-docker}"
+
+# Resolve the repo dir, following symlinks (portable: no `readlink -f` on macOS).
+src="$0"
+case "$src" in */*) ;; *) src="$(command -v "$src")" ;; esac
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" >/dev/null && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+REPO="$(dirname "$(cd -P "$(dirname "$src")" >/dev/null && pwd)")"
+cd "$REPO"
+
+DEV_ARGS=(-f docker-compose.yml -f docker-compose.dev.yml)
+DEV_CMD="docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d   (or: make dev-up)"
+PULL_CMD="docker compose --profile build pull && docker compose up -d   (or: make pull up)"
+
+files=()
+print_args=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--file) files+=(-f "$2"); shift 2 ;;
+    --print-args) print_args=1; shift ;;
+    -h|--help) sed -n '2,20p' "$src"; exit 0 ;;
+    *) echo "chikin-preflight: unknown argument '$1'" >&2; exit 2 ;;
+  esac
+done
+
+have_image() { "$DOCKER" image inspect "$1" >/dev/null 2>&1; }
+# An image reference with a registry host can be fetched on demand; a bare local
+# tag like `chikin:local` can only come from a local build.
+pullable() { case "$1" in */*) return 0 ;; *) return 1 ;; esac; }
+
+# The two first-party images a file set selects: the gateway service's own image
+# and the CHROME_IMAGE the gateway will provision browsers from (the one that
+# actually crash-looped — compose never runs it as a service, so compose's own
+# image handling never touches it).
+gateway_image() {
+  "$DOCKER" compose "$@" config --images 2>/dev/null | grep -E 'chikin-gateway' | head -1
+}
+chrome_image() {
+  "$DOCKER" compose "$@" config 2>/dev/null |
+    sed -n 's/^[[:space:]]*CHROME_IMAGE:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -1
+}
+
+# --print-args: the compose file set this checkout should be brought up with.
+# Locally-built images and no pinned chrome image present => a dev checkout.
+if [ "$print_args" = 1 ]; then
+  base_chrome="$(chrome_image)"
+  if have_image chikin:local && [ -n "$base_chrome" ] && ! have_image "$base_chrome"; then
+    printf '%s ' "${DEV_ARGS[@]}"
+  fi
+  echo
+  exit 0
+fi
+
+CHROME="$(chrome_image "${files[@]}")"
+GATEWAY="$(gateway_image "${files[@]}")"
+if [ -z "$CHROME" ]; then
+  echo "chikin-preflight: could not resolve CHROME_IMAGE from the compose config" >&2
+  exit 1
+fi
+
+rc=0
+for img in "$CHROME" "$GATEWAY"; do
+  [ -n "$img" ] || continue
+  if have_image "$img"; then
+    continue
+  fi
+  if have_image chikin:local || have_image chikin-gateway:local; then
+    # Local builds exist but this file set selects an image we don't have: the
+    # dev-override mistake. Say so even if the image is theoretically pullable —
+    # running the pinned ghcr build is not what a dev checkout means to do.
+    echo "chikin-preflight: '$img' is not present locally, but locally-built chikin images are." >&2
+    echo "  This looks like a dev checkout brought up with the base compose file alone;" >&2
+    echo "  the gateway would run against an image it cannot use and crash-loop." >&2
+    echo "  Use the dev override:  $DEV_CMD" >&2
+    echo "  Or run the pinned images deliberately:  $PULL_CMD" >&2
+    rc=1
+  elif pullable "$img"; then
+    echo "chikin-preflight: '$img' not present locally; it will be pulled on demand." >&2
+  else
+    echo "chikin-preflight: '$img' is not present and is a local-only tag (nothing to pull)." >&2
+    echo "  Build it:  make dev-build" >&2
+    rc=1
+  fi
+done
+
+exit "$rc"

@@ -34,7 +34,15 @@ cd "$REPO"
 # socket-activates a disabled daemon on Arch.
 for _ in $(seq 1 60); do
   if "$DOCKER" info >/dev/null 2>&1; then
-    exec "$DOCKER" compose up -d
+    # Pick the compose file set for THIS checkout. A dev checkout (locally-built
+    # images, pinned ghcr ones absent) needs the dev override — the base file
+    # alone points CHROME_IMAGE at an image it doesn't have and the gateway
+    # crash-loops on its startup image check. bin/chikin-preflight decides.
+    read -r -a COMPOSE_ARGS <<<"$(DOCKER="$DOCKER" bin/chikin-preflight --print-args)"
+    if [ "${#COMPOSE_ARGS[@]}" -gt 0 ]; then
+      echo "chikin-up: local images detected — using the dev override (${COMPOSE_ARGS[*]})"
+    fi
+    exec "$DOCKER" compose "${COMPOSE_ARGS[@]}" up -d
   fi
   sleep 2
 done

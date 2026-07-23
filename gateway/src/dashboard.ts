@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { runtimeConfig, configWarnings } from "./runtime.js";
 import type { Registry } from "./registry.js";
 import type { Provisioner, FleetMember, SandboxStatus } from "./provisioner.js";
 
@@ -21,6 +22,45 @@ function sandboxCell(status: SandboxStatus): string {
   const cls =
     status === "sandboxed" ? "sb-on" : status === "unknown" ? "sb-unknown" : "sb-off";
   return `<span class="sandbox ${cls}">${esc(label[status])}</span>`;
+}
+
+/**
+ * The effective runtime config of THIS gateway process (runtime.ts), rendered
+ * so "is seeding on?" is answerable at a glance. Container env is frozen at
+ * create time, so the .env on disk can disagree with what is running — this
+ * panel is the running truth. Seeding leads because it is the knob that failed
+ * silently for ~7 weeks.
+ */
+function configPanel(): string {
+  const rc = runtimeConfig();
+  const seeding = rc.seedingOn
+    ? `<span class="seed on">ON</span> <code>SEED_VOLUME=${esc(rc.seedVolume)}</code> — new browsers are cloned from this profile`
+    : `<span class="seed off">OFF</span> <code>SEED_VOLUME</code> is unset — new browsers get <strong>blank profiles</strong> and start logged out`;
+  const knobs: [string, string][] = [
+    ["CHROME_IMAGE", rc.chromeImage],
+    ["CHIKIN_SANDBOX", rc.sandbox],
+    ["MAX_FLEET", String(rc.maxFleet)],
+    ["IDLE_TTL_SEC", String(rc.idleTtlSec)],
+    ["WINDOW_SIZE", rc.windowSize],
+    ["SHARED_DIR", rc.sharedDir],
+    ["CHIKIN_NETWORK", rc.network],
+    ["CHIKIN_EGRESS_NETWORK", rc.egressNetwork],
+    ["LOG_LEVEL", rc.logLevel],
+    ["GATEWAY_TOKEN", rc.authEnabled ? "set (bearer auth on)" : "empty (bearer auth OFF)"],
+    ["GATEWAY_EXTRA_ORIGINS", rc.extraOrigins || "—"],
+    ["CDM_EXTRA_ARGS", rc.cdmExtraArgs.join(" ") || "—"],
+  ];
+  const warn = configWarnings()
+    .map((w) => `<p class="warnbox">⚠ ${esc(w)}</p>`)
+    .join("\n");
+  return `<h2>runtime config <span class="hint">(what this gateway process actually has — not <code>.env</code> on disk)</span></h2>
+  <p class="seedline">seeding: ${seeding}</p>
+  ${warn}
+  <table class="cfg">
+    <tbody>
+${knobs.map(([k, v]) => `      <tr><td><code>${esc(k)}</code></td><td>${esc(v)}</td></tr>`).join("\n")}
+    </tbody>
+  </table>`;
 }
 
 function row(
@@ -104,6 +144,16 @@ export async function renderDashboard(
   .empty { color: #888; text-align: center; padding: 1.2rem; }
   .err { color: #a50e0e; }
   .meta { color: #777; font-size: .85rem; margin-top: 1.5rem; }
+  h2 { font-size: 1rem; margin-top: 2rem; }
+  h2 .hint { font-weight: 400; color: #777; font-size: .85rem; }
+  .seedline { margin: .4rem 0; }
+  .seed { font-weight: 700; padding: 0 .35rem; border-radius: 3px; color: #fff; }
+  .seed.on { background: #137333; }
+  .seed.off { background: #a50e0e; }
+  .warnbox { background: #fff4e5; border-left: 4px solid #b06000; color: #6b3b00;
+             padding: .6rem .8rem; margin: .6rem 0; max-width: 60rem; }
+  table.cfg { max-width: 40rem; }
+  table.cfg td:first-child { width: 14rem; }
 </style>
 </head>
 <body>
@@ -117,6 +167,7 @@ export async function renderDashboard(
 ${rows}
     </tbody>
   </table>
+  ${configPanel()}
   <p class="meta">MAX_FLEET=${config.maxFleet} · idle reap after ${Math.round(
     config.idleTtlMs / 1000,
   )}s with no attached client · sandbox policy <code>CHIKIN_SANDBOX=${esc(

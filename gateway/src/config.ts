@@ -128,6 +128,10 @@ export const config = {
   // changes the tool schemas the client sees.
   cdmExtraArgs: str("CDM_EXTRA_ARGS", "").split(/\s+/).filter(Boolean),
 
+  // Log verbosity (debug|info|warn|error). Read here too so the effective value
+  // shows up alongside every other knob on /healthz and the dashboard.
+  logLevel: str("LOG_LEVEL", "info"),
+
   containerPrefix: "chikin-chrome-",
   volumePrefix: "chikin-profile-",
 } as const;

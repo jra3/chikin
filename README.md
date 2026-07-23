@@ -55,9 +55,12 @@ docker compose --profile build pull
 docker compose up -d
 
 # 3. Sanity check.
-curl -s http://localhost:8080/healthz        # {"status":"ok"}
+curl -s http://localhost:8080/healthz        # {"status":"ok","config":{…},"warnings":[…]}
 open http://localhost:8080/                   # fleet dashboard
 ```
+
+`/healthz` carries the **effective runtime config of the running gateway** — see
+[Checking the effective config](#checking-the-effective-config).
 
 The gateway listens on `127.0.0.1:8080` only. Browsers are **not** compose services — they appear on demand when a client connects.
 
@@ -150,8 +153,13 @@ Outputs are named `<name>-<timestamp>.mp4` / `.gif`. If neither `--mp4` nor `--g
 Each browser starts with a fresh profile, so you'd normally have to log into sites every time. Instead, seed every new browser from a **golden** profile you log into once:
 
 ```bash
-# 1. enable seeding (gateway env) and restart
-echo 'SEED_VOLUME=chikin-seed' >> .env && docker compose up -d gateway
+# 1. enable seeding (gateway env) and RECREATE the gateway. Run compose from the
+#    repo dir so it reads this .env — container env is fixed at create time, so
+#    `docker restart` can never pick up an .env change.
+echo 'SEED_VOLUME=chikin-seed' >> .env && docker compose up -d --force-recreate gateway
+
+#    then confirm the RUNNING gateway actually got it:
+curl -s localhost:8080/healthz | grep -o '"seedVolume":"[^"]*"'   # -> "seedVolume":"chikin-seed"
 
 # 2. log into your sites by hand, once
 chikin-claude golden                       # launch the golden browser
@@ -190,6 +198,31 @@ Set in `.env` (see `.env.example`) or the environment.
 | `CDM_EXTRA_ARGS` | *(empty)* | Extra flags for every `chrome-devtools-mcp` child, whitespace-separated. E.g. `--experimentalPageIdRouting` routes page-scoped tools by explicit `pageId` instead of the sticky selected-page binding (sidesteps the stale-target wedge, but changes tool schemas). |
 | `NAV_VERIFY_DELAY_MS` | `2500` | How long after a "successful" navigation the wedge watchdog waits before checking the browser's real CDP page list. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+
+### Checking the effective config
+
+`.env` on disk is **not** what the gateway is running. Container env is frozen at
+`docker create` time, so a gateway created from a directory where compose never
+read your `.env` runs with entirely different values — and no `docker restart`
+fixes it, only a recreate. (This is exactly how profile seeding stayed silently
+**off** for ~7 weeks while every check of the config on disk said "configured".)
+
+So the gateway reports what *it* has, in three places — no `docker exec` needed:
+
+```bash
+curl -s localhost:8080/healthz | python3 -m json.tool   # config + warnings
+open http://localhost:8080/                             # "runtime config" panel
+docker logs chikin-gateway | grep '^\[warn\] config:'   # startup banner
+```
+
+Startup states seeding either way, e.g. `seeding: ON (volume=chikin-seed)` or a
+**WARN** `seeding: OFF (SEED_VOLUME unset — new browsers get blank profiles …)`.
+If a seed volume exists on the host while `SEED_VOLUME` is unset, that's flagged
+as an explicit warning on all three surfaces. `GATEWAY_TOKEN` is reported only as
+a boolean (`authEnabled`) — these surfaces are unauthenticated.
+
+To fix a drifted gateway, recreate it *from the repo dir* so compose reads `.env`:
+`docker compose up -d --force-recreate gateway`.
 
 ### Wedge self-healing (issue #15)
 
@@ -293,6 +326,22 @@ npm run build        # tsc -> dist/
 npm test             # unit tests (names, registry, reaper)
 ```
 
+**Local images need the dev override — always.** `docker-compose.yml` hardcodes
+`CHROME_IMAGE: ghcr.io/jra3/chikin:${CHIKIN_VERSION}` (only the *tag* is variable,
+so a `CHROME_IMAGE` entry in `.env` is inert). Bringing a dev checkout up with the
+base file alone therefore points the gateway at a ghcr image it may not have, and
+it crash-loops on its startup image check. Use the override — one command:
+
+```bash
+make dev-build && make dev-up      # = docker compose -f docker-compose.yml -f docker-compose.dev.yml …
+```
+
+`bin/chikin-preflight` runs before both `make up` and `make dev-up` and fails with
+the exact command to use if the selected images aren't runnable; `bin/chikin-up`
+(the autostart entry point) picks the file set for the checkout automatically.
+Independently, the gateway now *pulls* a missing registry image at startup rather
+than dying, so the plain `docker compose up -d` path self-heals where it can.
+
 The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTransport` facing clients, `StdioClientTransport` to each `chrome-devtools-mcp` child) with `dockerode` for provisioning and `http-proxy` for the noVNC reverse proxy. See `gateway/src/` — `server.ts` (routing/auth), `provisioner.ts` (Docker lifecycle), `bridge.ts` (MCP↔stdio pump), `reaper.ts` (idle reclaim).
 
 ## Troubleshooting
@@ -304,6 +353,16 @@ The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTranspor
 **"browser '<name>' already has an active session" (409).** That name is in use by another client. Pick a different name, or have the other client disconnect (MCP `DELETE`/terminate frees the name immediately).
 
 **"fleet is full" (429).** Raise `MAX_FLEET` or let an idle browser get reaped.
+
+**New browsers are logged out / the golden profile isn't applied.** Seeding is off
+in the *running* gateway. Check `curl -s localhost:8080/healthz | grep seed` or the
+dashboard's **runtime config** panel — not `.env`. Fix with
+`docker compose up -d --force-recreate gateway` from the repo dir (see
+[Checking the effective config](#checking-the-effective-config)).
+
+**Gateway restarts in a loop right after `docker compose up -d`.** It couldn't get
+its `CHROME_IMAGE` (`docker logs chikin-gateway` names the fix). In a dev checkout
+use `make dev-up`; on the pinned path `make pull up`.
 
 **`make verify` says UA contains `HeadlessChrome`.** A `--headless` flag snuck into `entrypoint.sh`.
 
