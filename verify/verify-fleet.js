@@ -143,20 +143,28 @@ async function main() {
     // "Layer 1 Sandbox: Namespace" and "You are adequately sandboxed.". Required
     // only when expectSandbox (host is known userns-capable, e.g. CI); otherwise
     // informational so it never fails on a host that legitimately fell back.
-    await client.callTool({
-      name: "navigate_page",
-      arguments: { type: "url", url: "chrome://sandbox" },
-    });
-    await new Promise((r) => setTimeout(r, 1000)); // let the status table render
-    const sandboxProbe = extractJson(
+    // Defensive: a hiccup reading chrome:// must not crash the whole run — it
+    // becomes a failed check only when we were REQUIRED to be sandboxed.
+    let sandboxText = "";
+    let sandboxErr = "";
+    try {
       await client.callTool({
-        name: "evaluate_script",
-        arguments: {
-          function: "() => ({ sandbox: document.body ? document.body.innerText : '' })",
-        },
-      }),
-    );
-    const sandboxText = String(sandboxProbe.sandbox || "");
+        name: "navigate_page",
+        arguments: { type: "url", url: "chrome://sandbox" },
+      });
+      await new Promise((r) => setTimeout(r, 1000)); // let the status table render
+      const sandboxProbe = extractJson(
+        await client.callTool({
+          name: "evaluate_script",
+          arguments: {
+            function: "() => ({ sandbox: document.body ? document.body.innerText : '' })",
+          },
+        }),
+      );
+      sandboxText = String(sandboxProbe.sandbox || "");
+    } catch (e) {
+      sandboxErr = e instanceof Error ? e.message : String(e);
+    }
     const adequate = /adequately sandboxed/i.test(sandboxText);
     rows.push({
       id: "sandbox",
@@ -165,7 +173,9 @@ async function main() {
       required: args.expectSandbox,
       value: adequate
         ? "adequately sandboxed"
-        : sandboxText.replace(/\s+/g, " ").trim().slice(0, 160) || "(empty)",
+        : sandboxErr
+          ? `could not read chrome://sandbox: ${sandboxErr}`.slice(0, 160)
+          : sandboxText.replace(/\s+/g, " ").trim().slice(0, 160) || "(empty)",
     });
 
     let sannysoft = null;
