@@ -1,5 +1,12 @@
 import Docker from "dockerode";
-import { config, containerName, volumeName } from "./config.js";
+import {
+  config,
+  containerName,
+  isInstanceName,
+  isInstanceVolume,
+  volumeLabels,
+  volumeName,
+} from "./config.js";
 import { seccompProfile } from "./seccomp.js";
 // buildCreateOptions is exported above and used both here and by tests.
 import { log } from "./log.js";
@@ -147,6 +154,16 @@ export interface FleetMember {
   status: string;
 }
 
+/** Outcome of one orphan-instance-volume sweep (issue #58). */
+export interface OrphanSweepResult {
+  /** Volumes actually deleted. */
+  removed: string[];
+  /** Instance volumes skipped because a container still mounts them. */
+  inUse: string[];
+  /** Instance volumes Docker refused to delete. */
+  failed: string[];
+}
+
 /** What the entrypoint decided for a browser's renderer sandbox (from its logs). */
 export type SandboxStatus = "sandboxed" | "fell-back" | "disabled" | "failed" | "unknown";
 
@@ -291,10 +308,11 @@ export class Provisioner {
       // fall through to create
     }
     log.info(`provisioner: creating profile volume ${vol}`);
-    await this.docker.createVolume({
-      Name: vol,
-      Labels: { "chikin.fleet": "1", "chikin.name": name },
-    });
+    // chikin.role splits disposables (inst-*) from profiles worth keeping, so a
+    // label-scoped prune can be aimed at the garbage only (issue #59). Labels
+    // are immutable after create, so this only ever applies to NEW volumes —
+    // the gateway's own safety checks go by name, never by this label.
+    await this.docker.createVolume({ Name: vol, Labels: volumeLabels(name) });
     // Ownership is fixed by the container's entrypoint self-chown (it starts as
     // root, chowns /data to the chrome UID, then drops privileges).
 
@@ -507,10 +525,113 @@ export class Provisioner {
   }
 
   /**
+   * Remove a DISPOSABLE per-instance profile volume (issue #58). Returns true
+   * only if a volume was actually removed.
+   *
+   * Safety, in order:
+   *  1. The volume must be `chikin-profile-inst-*`. This name test — not the
+   *     `chikin.role=instance` label — is authoritative, because Docker volume
+   *     labels are immutable after creation: every volume that predates this
+   *     change is unlabelled, including `chikin-profile-golden`. `golden`,
+   *     `hermes` and every named client profile fail the test and are left
+   *     alone, whatever their labels say (issue #59).
+   *  2. Removal runs inside `createGate`, the same mutex that wraps
+   *     ensureVolume → createContainer → start. A provision therefore cannot be
+   *     interleaved: we can never delete a volume between the moment it is
+   *     seeded and the moment its container mounts it (CHK-015 / issue #32).
+   *  3. `guard` is re-evaluated INSIDE the gate — the reaper passes
+   *     `() => !registry.isPending(name)` so a provision that began after the
+   *     sweep's own pending check still calls the reap off.
+   * Docker itself is the final backstop: it refuses to remove a volume a live
+   * container still mounts.
+   */
+  async removeInstanceVolume(name: string, guard?: () => boolean): Promise<boolean> {
+    const vol = volumeName(name);
+    if (!isInstanceName(name)) {
+      log.debug(`provisioner: keeping profile volume ${vol} (not a disposable instance)`);
+      return false;
+    }
+    return this.serializeCreate(async () => {
+      if (guard && !guard()) {
+        log.info(`provisioner: not removing ${vol} — a provision for ${name} is in flight`);
+        return false;
+      }
+      try {
+        await this.docker.getVolume(vol).remove();
+        log.info(`provisioner: removed instance profile volume ${vol}`);
+        return true;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        // 404 = already gone; treat as success-shaped (nothing removed by us).
+        if (!/no such volume|404/i.test(msg)) {
+          log.warn(`provisioner: remove volume ${vol} failed`, msg);
+        }
+        return false;
+      }
+    });
+  }
+
+  /**
+   * One-shot sweep for instance profile volumes orphaned before the reaper
+   * learned to remove them (issue #58 measured 222 orphans / ~47 GB on one
+   * host). Selection is doubly conservative:
+   *
+   *  - by NAME: only `chikin-profile-inst-<something>`. `chikin-profile-golden`,
+   *    `chikin-profile-hermes`, every named client profile and the seed volume
+   *    are not candidates and are never inspected further (issue #59).
+   *  - by OWNERSHIP: only volumes that NO container on the host mounts. That set
+   *    is computed here from `listContainers({all:true})` rather than trusting
+   *    the daemon's `dangling` flag, and considers non-fleet containers too.
+   *
+   * Fails closed: if the container list can't be read we throw before removing
+   * anything, so an unknown ownership state never becomes a deletion.
+   */
+  async sweepOrphanInstanceVolumes(): Promise<OrphanSweepResult> {
+    const out: OrphanSweepResult = { removed: [], inUse: [], failed: [] };
+    const res = (await this.docker.listVolumes()) as { Volumes?: { Name?: string }[] | null };
+    const candidates = (res.Volumes ?? [])
+      .map((v) => v?.Name ?? "")
+      .filter((n) => isInstanceVolume(n) && n !== config.seedVolume)
+      .sort();
+    if (!candidates.length) return out;
+
+    const mounted = new Set<string>();
+    for (const c of await this.docker.listContainers({ all: true })) {
+      for (const m of c.Mounts ?? []) {
+        if (m?.Name) mounted.add(m.Name);
+      }
+    }
+
+    for (const vol of candidates) {
+      if (mounted.has(vol)) {
+        out.inUse.push(vol);
+        continue;
+      }
+      try {
+        await this.docker.getVolume(vol).remove();
+        out.removed.push(vol);
+      } catch (e) {
+        log.warn(`provisioner: sweep could not remove ${vol}`, String(e));
+        out.failed.push(vol);
+      }
+    }
+    return out;
+  }
+
+  /**
    * Tear down a (possibly wedged) browser container so the next `ensureContainer`
-   * rebuilds it from scratch. The named profile volume is preserved, so the
-   * fresh container reseeds from the saved cookies/state. Used by the bridge's
+   * rebuilds it from scratch. The profile volume is preserved — including for
+   * inst-* browsers, whose session must survive a Chrome respawn — so the fresh
+   * container reseeds from the saved cookies/state. Used by the bridge's
    * child-respawn path when Chrome itself has stopped answering CDP.
+   *
+   * This is why instance profiles are named volumes we remove explicitly rather
+   * than anonymous volumes with AutoRemove (issue #58's second direction):
+   * AutoRemove would destroy the profile on this path, it is rejected outright
+   * by Docker alongside our `RestartPolicy: unless-stopped`, and the seed clone
+   * writes into the volume BEFORE the container exists, so an anonymous volume
+   * would have to move seeding into container startup and change the seeding
+   * contract.
    */
   async recreateContainer(name: string): Promise<void> {
     await this.stopContainer(name);

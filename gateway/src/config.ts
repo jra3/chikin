@@ -23,6 +23,14 @@ function str(name: string, def: string): string {
   return raw === undefined || raw === "" ? def : raw;
 }
 
+function bool(name: string, def: boolean): boolean {
+  const raw = (process.env[name] ?? "").trim().toLowerCase();
+  if (raw === "") return def;
+  if (["1", "true", "yes", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+  throw new Error(`env ${name}=${process.env[name]} must be a boolean (1/0, true/false, on/off)`);
+}
+
 export type SandboxMode = "auto" | "on" | "off";
 
 function sandboxMode(name: string, def: SandboxMode): SandboxMode {
@@ -132,8 +140,20 @@ export const config = {
   // shows up alongside every other knob on /healthz and the dashboard.
   logLevel: str("LOG_LEVEL", "info"),
 
+  // Reclaim `chikin-profile-inst-*` volumes orphaned before the reaper learned
+  // to remove them (issue #58). Runs once at startup, name-scoped, and only for
+  // volumes no container mounts — see Provisioner.sweepOrphanInstanceVolumes.
+  // Set CHIKIN_VOLUME_GC=0 to leave every existing volume alone.
+  volumeGc: bool("CHIKIN_VOLUME_GC", true),
+
   containerPrefix: "chikin-chrome-",
   volumePrefix: "chikin-profile-",
+  // `bin/chikin-mcp` names each Claude Code instance `inst-<pid>`, so this
+  // prefix is what makes a browser (and its profile volume) DISPOSABLE. Names
+  // starting with it are reserved for throwaway-per-run browsers: their volumes
+  // are removed with the container. Every other name — `golden`, `hermes`, any
+  // named client profile — is sticky and never collected. See isInstanceName.
+  instancePrefix: "inst-",
 } as const;
 
 export function containerName(name: string): string {
@@ -142,6 +162,45 @@ export function containerName(name: string): string {
 
 export function volumeName(name: string): string {
   return config.volumePrefix + name;
+}
+
+/**
+ * Is this browser name a disposable per-run instance (`inst-<pid>`)?
+ *
+ * This is the AUTHORITATIVE safety rule for every destructive volume path in
+ * the gateway (issues #58/#59). It is deliberately name-based rather than
+ * label-based: Docker volume labels are immutable after creation, so the
+ * `chikin.role=instance` label this build started writing is absent on every
+ * volume that predates it — including the operator's `chikin-profile-golden`
+ * full of hand-authenticated logins. A name test is correct against volumes of
+ * any vintage; a label test is not.
+ */
+export function isInstanceName(name: string): boolean {
+  return name.startsWith(config.instancePrefix) && name.length > config.instancePrefix.length;
+}
+
+/** The same rule applied to a Docker volume name (`chikin-profile-inst-<pid>`). */
+export function isInstanceVolume(volume: string): boolean {
+  const prefix = config.volumePrefix + config.instancePrefix;
+  return volume.startsWith(prefix) && volume.length > prefix.length;
+}
+
+/**
+ * Labels for a profile volume. `chikin.fleet=1` stays on everything so the
+ * whole fleet remains one inventory, but `chikin.role` splits disposables from
+ * profiles worth keeping, so `--filter label=chikin.role=instance` is a prune
+ * scope that cannot reach the golden profile (issue #59, direction 1).
+ *
+ * Forward-looking only — labels can't be added to an existing volume, so this
+ * protects nothing that already exists on an operator's host. The README
+ * warning and the name-based rule above are what protect those.
+ */
+export function volumeLabels(name: string): Record<string, string> {
+  return {
+    "chikin.fleet": "1",
+    "chikin.name": name,
+    "chikin.role": isInstanceName(name) ? "instance" : "profile",
+  };
 }
 
 export function vncUrl(name: string): string {

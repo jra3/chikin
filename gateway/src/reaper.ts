@@ -6,10 +6,14 @@ import type { Provisioner } from "./provisioner.js";
 /**
  * Periodically reclaims idle browsers (issue #7). A browser is reaped only when
  * it has NO attached client stream AND has been idle past IDLE_TTL. Reaping
- * tears down any session, then stops AND removes the container, but preserves
- * the named profile volume so a reconnect restores cookies/state. Removing (not
+ * tears down any session, then stops AND removes the container. Removing (not
  * just stopping) is essential: stopped containers still count against MAX_FLEET,
  * so leaving them around leaks fleet slots until provisioning locks up.
+ *
+ * The profile volume follows the same rule the name implies: a disposable
+ * `inst-<pid>` browser's volume is removed with its container (issue #58),
+ * while a named profile (golden, hermes, any sticky client name) is preserved
+ * so a reconnect restores cookies/state.
  *
  * Reaping is driven by the per-name activity map, not by live sessions, so a
  * container that outlives its session (warm for fast reconnect) is still
@@ -66,6 +70,15 @@ export class Reaper {
         if (session) await session.close("reaped: idle");
         await this.provisioner.stopContainer(name);
         await this.provisioner.removeContainer(name);
+        // ...and, for a disposable `inst-<pid>` browser, its profile volume too
+        // (issue #58: the container half of this leak was fixed in 98a1e2f, the
+        // volume half was not — ~200 MB per browser ever provisioned). Named
+        // profiles (golden, hermes, sticky client names) are kept: the call is a
+        // no-op for them, decided by NAME so it holds for volumes created before
+        // chikin.role labels existed. The guard is re-checked inside the
+        // provisioner's create gate so a provision that started during this
+        // sweep cannot lose its freshly-seeded volume (CHK-015).
+        await this.provisioner.removeInstanceVolume(name, () => !this.registry.isPending(name));
         this.registry.dropActivity(name);
       } catch (e) {
         log.warn(`reaper: failed to reclaim ${name}`, String(e));

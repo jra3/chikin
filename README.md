@@ -169,11 +169,65 @@ chikin-claude golden                       # launch the golden browser
 chikin-snapshot                            # clones golden's profile -> chikin-seed
 ```
 
+`chikin-profile-golden` is now the most expensive thing on the host to lose — read [Profile volumes and cleaning them up](#profile-volumes-and-cleaning-them-up) before you run any `docker volume prune`.
+
 From then on **every new browser is cloned from the seed and starts logged in** — and the MCP automation sees those cookies (it shares the persistent profile context). Re-run `chikin-snapshot` whenever sessions expire. It works because every container uses Chrome's keyring-less `basic` cookie store, so the encryption key travels in the copied `Local State` and decrypts in the clones. Caveat: all seeded browsers share one identity, so sites that forbid concurrent sessions may re-challenge.
 
 ### Scratch files (per-browser)
 
 Each browser `<name>` gets its own host directory `/tmp/chikin-shared/<name>`, mounted **only** into that browser as `~/Downloads` (and at the same `/tmp/chikin-shared/<name>` path, which is what `upload_file` expects). Drop upload files under the per-name dir; downloads triggered in that browser land back there. Scratch files are **not** shared across clients — each browser sees only its own subdir (M2 / CHK-007); cookies/profile are per-name isolated too.
+
+### Profile volumes and cleaning them up
+
+> [!CAUTION]
+> **No label-scoped `docker volume prune --all` is safe against chikin volumes.**
+> `chikin-profile-golden` — your hand-authenticated logins — carries `chikin.fleet=1`
+> just like the throwaway per-instance profiles, and it sits *dangling* whenever no
+> container has it mounted, which is almost always. So this apparently careful,
+> chikin-scoped command **destroys every saved login**, and the only recovery is
+> signing back into each site by hand through noVNC:
+>
+> ```bash
+> docker volume prune --all --filter label=chikin.fleet=1   # ☠️  eats golden + hermes + every named profile
+> ```
+>
+> The trap is armed by `--all`: the plain prune skips named volumes and reports
+> `Total reclaimed space: 0B`, which reads as "nothing to clean here" and pushes you
+> straight to `--all`. Delete instance profiles **by name** instead:
+>
+> ```bash
+> docker volume ls -q --filter name=chikin-profile-inst-   # look first
+> docker volume ls -q --filter name=chikin-profile-inst- | xargs -r docker volume rm
+> ```
+>
+> (`docker volume rm` refuses volumes a container still mounts, so this is safe to
+> run against a live fleet.) Snapshot golden first — `bin/chikin-snapshot` copies it
+> into `chikin-seed`, giving you a second copy.
+
+Two kinds of profile volume, told apart by **name**:
+
+| Volume | Lifetime |
+|---|---|
+| `chikin-profile-inst-<pid>` | **Disposable.** One per Claude Code instance (the default `inst-<pid>` name). The gateway removes it when it reaps the browser. |
+| `chikin-profile-<name>` (`golden`, `hermes`, any name you pick) | **Sticky.** Survives reaping, restart, and `--force-recreate`. Never removed by the gateway. |
+
+Volumes created from this version on also carry `chikin.role=instance` vs
+`chikin.role=profile`, so `--filter label=chikin.role=instance` is a prune scope
+that cannot reach golden:
+
+```bash
+docker volume prune --all --filter label=chikin.role=instance
+```
+
+**But Docker volume labels are immutable after creation**, so any volume that
+predates this change — including the `chikin-profile-golden` already on your host —
+has no `chikin.role` label at all and is *not* protected by it. On an existing host,
+use the name-based commands above. The gateway's own safety checks always go by
+name, never by label, for exactly this reason.
+
+The gateway also sweeps orphaned `chikin-profile-inst-*` volumes (instance profiles
+whose container no longer exists) once at startup — that reclaims leftovers from
+before it removed them with the container. Set `CHIKIN_VOLUME_GC=0` to disable.
 
 ---
 
@@ -193,6 +247,7 @@ Set in `.env` (see `.env.example`) or the environment.
 | `SEED_VOLUME` | *(empty)* | Docker volume cloned into every new profile so browsers start logged in. Empty = off. Populate with `bin/chikin-snapshot` (see [Pre-authenticated browsers](#pre-authenticated-browsers-golden-profile)). |
 | `IDLE_TTL_SEC` | `900` | Idle seconds (no attached client stream) before a browser is reaped. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
+| `CHIKIN_VOLUME_GC` | `1` | Sweep orphaned `chikin-profile-inst-*` volumes (disposable profiles whose container is gone) once at startup. Scoped by name — `golden`, `hermes` and named client profiles are never candidates. `0` disables. See [Profile volumes](#profile-volumes-and-cleaning-them-up). |
 | `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up before failing the connect. |
 | `WINDOW_SIZE` | `1920,1080` | Chrome window / Xvfb screen size for provisioned browsers. |
 | `CDM_EXTRA_ARGS` | *(empty)* | Extra flags for every `chrome-devtools-mcp` child, whitespace-separated. E.g. `--experimentalPageIdRouting` routes page-scoped tools by explicit `pageId` instead of the sticky selected-page binding (sidesteps the stale-target wedge, but changes tool schemas). |
