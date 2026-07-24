@@ -86,12 +86,22 @@ services:
       # falls back to --no-sandbox (loud WARN) where it doesn't. See README.
       CHIKIN_SANDBOX: "${CHIKIN_SANDBOX:-auto}"
       MAX_FLEET: "${MAX_FLEET:-8}"
+      # Per-browser resource caps (M3). MAX_FLEET bounds how MANY browsers run;
+      # these bound what any ONE may consume. 0 disables an individual cap.
+      BROWSER_MEMORY_MB: "${BROWSER_MEMORY_MB:-3072}"
+      BROWSER_PIDS_LIMIT: "${BROWSER_PIDS_LIMIT:-512}"
+      BROWSER_CPUS: "${BROWSER_CPUS:-2.0}"
+      BROWSER_NOFILE: "${BROWSER_NOFILE:-8192}"
       IDLE_TTL_SEC: "${IDLE_TTL_SEC:-900}"
       # Second idle tier (issue #57): an attached client no longer makes a
       # browser unreapable, it buys this much grace with no real browser tool
       # call. 0 restores the old never-reap-attached behaviour. See README.
       ATTACHED_IDLE_TTL_SEC: "${ATTACHED_IDLE_TTL_SEC:-14400}"
       REAP_INTERVAL_SEC: "${REAP_INTERVAL_SEC:-30}"
+      # Startup sweep of orphaned chikin-profile-inst-* volumes (issue #58).
+      # The default is ON, so this line is what makes CHIKIN_VOLUME_GC=0 an
+      # actual brake instead of an inert line in .env. See README.
+      CHIKIN_VOLUME_GC: "${CHIKIN_VOLUME_GC:-1}"
       PROVISION_TIMEOUT_SEC: "${PROVISION_TIMEOUT_SEC:-90}"
       WINDOW_SIZE: "${WINDOW_SIZE:-1920,1080}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
