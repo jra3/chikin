@@ -91,6 +91,17 @@ export const config = {
   // Per-browser limits and lifecycle.
   maxFleet: int("MAX_FLEET", 8),
   idleTtlMs: int("IDLE_TTL_SEC", 900) * 1000,
+  // The second, much longer tier of the idle policy (issue #57). IDLE_TTL_SEC
+  // applies to a DETACHED browser and is measured against MCP traffic; this one
+  // applies while a client stream is still attached and is measured against
+  // Activity.lastBrowserActivity — real forwarded tool calls, not the client
+  // bridge's 120s keepalive ping. An attached session that has done no browser
+  // work for this long is holding a fleet slot for nothing and is reclaimed;
+  // the client bridge reconnects transparently.
+  //   0 = never reap an attached browser (the pre-#57 behaviour).
+  // Keep it well above IDLE_TTL_SEC: below it, a detached browser would outlive
+  // an attached one.
+  attachedIdleTtlMs: int("ATTACHED_IDLE_TTL_SEC", 14400) * 1000,
   reapIntervalMs: int("REAP_INTERVAL_SEC", 30) * 1000,
   provisionTimeoutMs: int("PROVISION_TIMEOUT_SEC", 90) * 1000,
 

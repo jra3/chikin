@@ -87,6 +87,10 @@ services:
       CHIKIN_SANDBOX: "${CHIKIN_SANDBOX:-auto}"
       MAX_FLEET: "${MAX_FLEET:-8}"
       IDLE_TTL_SEC: "${IDLE_TTL_SEC:-900}"
+      # Second idle tier (issue #57): an attached client no longer makes a
+      # browser unreapable, it buys this much grace with no real browser tool
+      # call. 0 restores the old never-reap-attached behaviour. See README.
+      ATTACHED_IDLE_TTL_SEC: "${ATTACHED_IDLE_TTL_SEC:-14400}"
       REAP_INTERVAL_SEC: "${REAP_INTERVAL_SEC:-30}"
       PROVISION_TIMEOUT_SEC: "${PROVISION_TIMEOUT_SEC:-90}"
       WINDOW_SIZE: "${WINDOW_SIZE:-1920,1080}"

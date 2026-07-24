@@ -13,4 +13,7 @@ GATEWAY_TOKEN=<your token> node run.mjs         # checks: auth, provisioning,
 
 `reaper-helper.mjs` drives the live reaper test (mark / read / hold a browser);
 see the commands in the repo's test notes. Run the gateway with a short
-`IDLE_TTL_SEC` / `REAP_INTERVAL_SEC` to watch idle reclaim quickly.
+`IDLE_TTL_SEC` / `REAP_INTERVAL_SEC` to watch idle reclaim quickly. Add a short
+`ATTACHED_IDLE_TTL_SEC` to watch the second tier — an *attached* session with no
+browser tool call being evicted, and the client bridge reconnecting through it
+(issue #57).

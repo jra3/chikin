@@ -28,6 +28,8 @@ test("runtimeConfig reports the env this process actually has, without secrets",
   assert.equal(rc.seedingOn, false);
   assert.equal(rc.chromeImage, "chikin:local");
   assert.equal(rc.authEnabled, false);
+  assert.equal(rc.idleTtlSec, 900, "detached idle tier");
+  assert.equal(rc.attachedIdleTtlSec, 14400, "attached idle tier (issue #57), 4h by default");
   // /healthz and the dashboard are unauthenticated: never leak the token value.
   assert.ok(!JSON.stringify(rc).includes("GATEWAY_TOKEN"));
   assert.ok(!("token" in rc));
@@ -42,6 +44,13 @@ test("seeding state is stated unambiguously in both directions", () => {
   const on = seedingLine({ ...runtimeConfig(), seedVolume: "chikin-seed", seedingOn: true });
   assert.match(on, /seeding: ON/);
   assert.match(on, /chikin-seed/, "names the volume when on");
+});
+
+test("ATTACHED_IDLE_TTL_SEC=0 is reported as-is (never-reap-attached escape hatch)", () => {
+  const { cfg } = runtimeWithEnv({ ATTACHED_IDLE_TTL_SEC: "0" }) as {
+    cfg: Record<string, unknown>;
+  };
+  assert.equal(cfg.attachedIdleTtlSec, 0, "0 must be visible, not defaulted away");
 });
 
 test("a set SEED_VOLUME flips the reported state (env is read at load)", () => {

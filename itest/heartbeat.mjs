@@ -1,6 +1,12 @@
 // Drives the bridge subprocess over raw stdio MCP to prove the heartbeat keeps
 // a browser alive past the idle reaper, and that a tool call after a long idle
 // does NOT hang. Run with the gateway on a short IDLE_TTL_SEC.
+//
+// Since issue #57 the heartbeat only holds a browser for ATTACHED_IDLE_TTL_SEC
+// (default 4h), which this run is far inside. Set ATTACHED_IDLE_TTL_SEC low on
+// the gateway to exercise the opposite case: the session IS evicted mid-idle and
+// the bridge must reconnect transparently, so the tool call below still passes
+// (with a fresh profile for a disposable inst-* name).
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";

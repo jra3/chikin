@@ -52,6 +52,9 @@ test("/healthz reports the effective runtime config, secret-free", async () => {
     assert.equal(body.config.seedVolume, "", "SEED_VOLUME readable without docker exec");
     assert.equal(body.config.seedingOn, false);
     assert.ok(body.config.chromeImage, "CHROME_IMAGE readable");
+    // The lifecycle knobs an operator retunes when the fleet saturates (#57).
+    assert.equal(body.config.idleTtlSec, 900);
+    assert.equal(body.config.attachedIdleTtlSec, 14400, "the attached tier is readable too");
     assert.equal(typeof body.config.authEnabled, "boolean", "token as a boolean, never its value");
     assert.ok(Array.isArray(body.warnings));
   } finally {

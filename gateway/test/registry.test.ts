@@ -70,6 +70,19 @@ test("claimHandle enforces uniqueness across live sessions; frees on remove", ()
   assert.equal(r.getByHandle("other-work"), undefined, "handle freed when session removed");
 });
 
+test("every activity record has a browser-activity clock from the moment it exists", () => {
+  const r = new Registry();
+  // Both ways a record can be born: a frame/adoption stamp, and a reservation.
+  r.touch("adopted", 4242);
+  assert.equal(r.getActivity("adopted")?.lastBrowserActivity, 4242, "seeded at creation");
+  r.reserve("provisioning", 99);
+  assert.equal(r.getActivity("provisioning")?.lastBrowserActivity, 99);
+  // A browser that has never run a tool call therefore ages from when it
+  // appeared, rather than looking infinitely busy or infinitely stale.
+  r.streamOpened("fresh", 7);
+  assert.equal(r.getActivity("fresh")?.lastBrowserActivity, 7);
+});
+
 test("stream open/close tracking", () => {
   const r = new Registry();
   r.touch("x", 0);
