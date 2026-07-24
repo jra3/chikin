@@ -4,14 +4,19 @@
 COMPOSE = docker compose
 DEV     = docker compose -f docker-compose.yml -f docker-compose.dev.yml
 
-.PHONY: pull up down update verify dev-build dev-up uninstall purge
+.PHONY: pull up down update verify preflight dev-build dev-up uninstall purge
 
 # Fetch the pinned gateway + fleet browser images from ghcr (builds nothing).
 pull:
 	$(COMPOSE) --profile build pull
 
+# Check the images this file set selects are actually runnable, so `up` can't
+# leave the gateway crash-looping on a missing CHROME_IMAGE. See bin/chikin-preflight.
+preflight:
+	@bin/chikin-preflight
+
 # Start / stop the control plane (down keeps profile volumes).
-up:
+up: preflight
 	$(COMPOSE) up -d
 down:
 	$(COMPOSE) down
@@ -29,6 +34,7 @@ verify:
 dev-build:
 	$(DEV) --profile build build
 dev-up:
+	@bin/chikin-preflight -f docker-compose.yml -f docker-compose.dev.yml
 	$(DEV) up -d
 
 # Teardown. uninstall preserves logged-in profile volumes; purge wipes them.

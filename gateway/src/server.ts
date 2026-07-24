@@ -9,6 +9,7 @@ import { Registry } from "./registry.js";
 import { Provisioner, FleetFullError, ProvisionError } from "./provisioner.js";
 import { createSession } from "./bridge.js";
 import { renderDashboard } from "./dashboard.js";
+import { runtimeConfig, configWarnings } from "./runtime.js";
 import { makeVncHttpHandler, vncUpgradeHandler, hostOk } from "./vnc.js";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
@@ -83,9 +84,13 @@ export function createApp(deps: ServerDeps): express.Express {
   const app = express();
   app.disable("x-powered-by");
 
-  // Health (no auth) — for compose healthcheck.
+  // Health (no auth) — for the compose healthcheck, which only reads the HTTP
+  // status. The effective runtime config rides along so an operator can answer
+  // "is seeding actually on?" with `curl -s localhost:8080/healthz` instead of a
+  // `docker exec` into the container's env (see runtime.ts). Secret-free by
+  // construction: GATEWAY_TOKEN appears only as `authEnabled`.
   app.get("/healthz", (_req, res) => {
-    res.json({ status: "ok" });
+    res.json({ status: "ok", config: runtimeConfig(), warnings: configWarnings() });
   });
 
   // Fleet dashboard and the noVNC proxy below are intentionally NOT bearer-

@@ -204,16 +204,68 @@ export class Provisioner {
     return run;
   }
 
-  /** Fail fast at startup if the fleet image is missing (issue #5). */
+  /**
+   * Fail fast at startup if the fleet image is unusable (issue #5).
+   *
+   * "Present OR pullable": bringing the stack up with the BASE compose file
+   * alone points CHROME_IMAGE at `ghcr.io/jra3/chikin:<tag>`, which a developer
+   * who only ever built locally does not have — the gateway then died here and
+   * crash-looped under `restart: unless-stopped`. So try a pull first (the
+   * socket-proxy already allows IMAGES + POST), which makes the plain
+   * `docker compose up -d` path just work, and only fail if that can't help —
+   * with a message naming the exact fix. `chikin:local` is never pullable, so
+   * that case falls through to the message quickly.
+   */
   async checkImage(): Promise<void> {
     try {
       await this.docker.getImage(config.image).inspect();
+      return;
     } catch {
+      // fall through to the pull attempt
+    }
+    log.warn(`fleet image '${config.image}' not present locally; attempting pull`);
+    try {
+      await this.pullImage(config.image);
+      await this.docker.getImage(config.image).inspect();
+      log.info(`fleet image '${config.image}' pulled`);
+      return;
+    } catch (e) {
       throw new ProvisionError(
-        `fleet image '${config.image}' not found via docker-socket-proxy. ` +
-          `Build it (docker build -t ${config.image} .) before starting the gateway.`,
+        `fleet image '${config.image}' is not present and could not be pulled ` +
+          `(${e instanceof Error ? e.message : String(e)}). Fix one of:\n` +
+          `  • local/dev images: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d   (or: make dev-up)\n` +
+          `  • pinned ghcr images: docker compose --profile build pull && docker compose up -d   (or: make pull up)\n` +
+          `Note: CHROME_IMAGE is hardcoded in docker-compose.yml (only the tag comes from CHIKIN_VERSION), ` +
+          `so setting CHROME_IMAGE in .env has NO effect — the dev override file is what selects local images.`,
       );
     }
+  }
+
+  /** Pull an image through the socket-proxy, bounded so startup can't hang. */
+  private async pullImage(image: string, timeoutMs = 180_000): Promise<void> {
+    const stream = (await this.docker.pull(image)) as NodeJS.ReadableStream;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`pull timed out after ${timeoutMs}ms`)), timeoutMs);
+      timer.unref?.();
+      this.docker.modem.followProgress(stream, (err: Error | null) => {
+        clearTimeout(timer);
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  }
+
+  /**
+   * Volumes on the host that look like a golden profile seed, used only to spot
+   * the "seed exists but SEED_VOLUME is unset" misconfiguration at startup.
+   * Per-name profile volumes (chikin-profile-*) are excluded — they are not seeds.
+   */
+  async findSeedVolumes(): Promise<string[]> {
+    const res = (await this.docker.listVolumes()) as { Volumes?: { Name?: string }[] | null };
+    return (res.Volumes ?? [])
+      .map((v) => v?.Name ?? "")
+      .filter((n) => n && /seed/i.test(n) && !n.startsWith(config.volumePrefix))
+      .sort();
   }
 
   /** Containers we manage, by the `chikin.fleet=1` label. */

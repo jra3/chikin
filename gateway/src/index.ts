@@ -4,6 +4,7 @@ import { log } from "./log.js";
 import { Registry } from "./registry.js";
 import { Provisioner } from "./provisioner.js";
 import { Reaper } from "./reaper.js";
+import { reportRuntimeConfig } from "./runtime.js";
 import { createApp, makeUpgradeHandler } from "./server.js";
 
 async function main(): Promise<void> {
@@ -34,6 +35,10 @@ async function main(): Promise<void> {
     log.error("startup check failed", e instanceof Error ? e.message : String(e));
     process.exit(1);
   }
+
+  // Say out loud what this PROCESS is configured with (not what .env on disk
+  // says) — above all, whether new browsers get seeded profiles. See runtime.ts.
+  await reportRuntimeConfig(provisioner);
 
   // Clear leftover exited fleet containers from a previous run / reboot / crash
   // before they count against MAX_FLEET and block new browsers. Volumes are kept.

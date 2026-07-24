@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { resourceLimits, buildCreateOptions, securityOpt } from "../src/provisioner.js";
+import { resourceLimits, buildCreateOptions, securityOpt, Provisioner } from "../src/provisioner.js";
 import { config, volumeName } from "../src/config.js";
 
 test("resourceLimits maps the default env config onto HostConfig caps (M3)", () => {
@@ -166,4 +166,28 @@ test("buildCreateOptions scopes the shared scratch to a per-name subdir (M2)", (
     binds.includes(`${volumeName("alice")}:/data`),
     "profile volume bind unchanged",
   );
+});
+
+// --- Seed-volume misconfiguration detection --------------------------------
+// Startup asks Docker whether a seed volume exists so "seed on disk but
+// SEED_VOLUME unset" (the ~7-week silent outage) can be warned about.
+test("findSeedVolumes picks seed-looking volumes and ignores per-name profiles", async () => {
+  const fake = {
+    listVolumes: async () => ({
+      Volumes: [
+        { Name: "chikin-profile-alice" },
+        { Name: "chikin-profile-seedy" }, // a browser literally named "seedy" is not a seed
+        { Name: "chikin-seed" },
+        { Name: "my-seed-backup" },
+        { Name: "unrelated" },
+      ],
+    }),
+  };
+  const p = new Provisioner(fake as never);
+  assert.deepEqual(await p.findSeedVolumes(), ["chikin-seed", "my-seed-backup"]);
+});
+
+test("findSeedVolumes tolerates a null volume list", async () => {
+  const p = new Provisioner({ listVolumes: async () => ({ Volumes: null }) } as never);
+  assert.deepEqual(await p.findSeedVolumes(), []);
 });
