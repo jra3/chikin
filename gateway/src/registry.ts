@@ -6,6 +6,26 @@ export interface Activity {
   last: number;
   /** open server->client SSE streams right now. >0 means a client is attached. */
   streams: number;
+  /**
+   * epoch ms of the last frame that actually drove the BROWSER — a `tools/call`
+   * the gate forwarded to chrome-devtools-mcp (bridge.ts).
+   *
+   * Deliberately separate from `last`, which measures MCP protocol traffic and
+   * is therefore useless as an activity signal for an attached client: the
+   * client bridge fires a JSON-RPC `ping` every `CHIKIN_HEARTBEAT_MS` (120s)
+   * for the stated purpose of keeping `last` fresh (client/bridge.mjs), so on
+   * an attached session `last` never ages past ~2 minutes no matter how long
+   * the browser has sat on about:blank (issue #57). Heartbeat pings,
+   * `chikin_identify`, `chikin_reset` and identity-blocked calls all leave this
+   * clock alone; only real browser work moves it.
+   *
+   * Seeded to the record's creation time so a browser that has never done any
+   * work still has a well-defined age. Attaching or re-attaching an SSE stream
+   * does NOT refresh it — clients routinely close and reopen that stream while
+   * idle between tool calls (see server.ts), which would recreate exactly the
+   * heartbeat problem this field exists to escape.
+   */
+  lastBrowserActivity: number;
 }
 
 /**
@@ -117,11 +137,27 @@ export class Registry {
   touch(name: string, now: number = Date.now()): void {
     const a = this.activity.get(name);
     if (a) a.last = now;
-    else this.activity.set(name, { last: now, streams: 0 });
+    else this.activity.set(name, { last: now, streams: 0, lastBrowserActivity: now });
+  }
+
+  /**
+   * Stamp REAL browser work (a forwarded `tools/call`). Also refreshes `last`,
+   * since a tool call is protocol traffic too. Called from exactly one place —
+   * the bridge's client pump, on `classifyClientFrame(...) === "forward"` — so
+   * that pings and gateway-owned tools can never move this clock (issue #57).
+   */
+  touchBrowserActivity(name: string, now: number = Date.now()): void {
+    const a = this.activity.get(name);
+    if (a) {
+      a.last = now;
+      a.lastBrowserActivity = now;
+    } else {
+      this.activity.set(name, { last: now, streams: 0, lastBrowserActivity: now });
+    }
   }
 
   streamOpened(name: string, now: number = Date.now()): void {
-    const a = this.activity.get(name) ?? { last: now, streams: 0 };
+    const a = this.activity.get(name) ?? { last: now, streams: 0, lastBrowserActivity: now };
     a.streams += 1;
     a.last = now;
     this.activity.set(name, a);

@@ -24,6 +24,13 @@ export interface RuntimeConfig {
   sandbox: string;
   maxFleet: number;
   idleTtlSec: number;
+  /**
+   * Grace period for a browser whose client is still attached but which has run
+   * no browser tool call. 0 means attached browsers are never reaped (the
+   * pre-#57 behaviour). This is the knob an operator retunes when the fleet
+   * saturates with idle sessions, so it has to be readable from the process.
+   */
+  attachedIdleTtlSec: number;
   /** Whether the startup sweep reclaims orphaned chikin-profile-inst-* volumes. */
   volumeGc: boolean;
   network: string;
@@ -45,6 +52,7 @@ export function runtimeConfig(): RuntimeConfig {
     sandbox: config.sandbox,
     maxFleet: config.maxFleet,
     idleTtlSec: Math.round(config.idleTtlMs / 1000),
+    attachedIdleTtlSec: Math.round(config.attachedIdleTtlMs / 1000),
     volumeGc: config.volumeGc,
     network: config.network,
     egressNetwork: config.egressNetwork,

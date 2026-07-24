@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { Registry } from "../src/registry.js";
 import { Reaper } from "../src/reaper.js";
 import { config } from "../src/config.js";
@@ -78,6 +80,147 @@ test("a mid-provision (pending) browser is not reaped even when idle past the TT
   reg.release("provisioning"); // simulate provision resolving to no live session
   await reaper.sweep(config.idleTtlMs * 2 + 5000);
   assert.deepEqual(stopped, ["provisioning"], "reaped once no longer pending and idle");
+});
+
+// --- Two-tier idle TTL (issue #57) ------------------------------------------
+// An attached client used to make a browser unreapable outright, so a fleet
+// saturated at MAX_FLEET with every browser parked on about:blank had no
+// reclaimable slot. Attachment now buys ATTACHED_IDLE_TTL_SEC (default 4h) of
+// grace, measured against REAL browser work — never against `last`, which the
+// client bridge's 120s keepalive ping keeps permanently fresh.
+
+const HOUR = 3600_000;
+
+test("an attached session past the attached TTL with no browser work is reclaimed", async () => {
+  const reg = new Registry();
+  const now = 8 * HOUR;
+  reg.streamOpened("inst-3244808", 0); // client attached since t=0, never left
+  reg.touch("inst-3244808", now - 30_000); // ...and its heartbeat ping just landed
+
+  const { provisioner, stopped, removed } = fakeProvisioner();
+  await new Reaper(reg, provisioner as never).sweep(now);
+
+  assert.deepEqual(stopped, ["inst-3244808"], "8h attached with zero tool calls -> reclaimed");
+  assert.deepEqual(removed, ["inst-3244808"], "container removed, so the slot is really freed");
+  assert.equal(reg.getActivity("inst-3244808"), undefined);
+});
+
+test("the client heartbeat cannot keep an attached browser alive (the #57 mechanism)", async () => {
+  const reg = new Registry();
+  const now = 6 * HOUR;
+  reg.streamOpened("inst-1", 0);
+  // Simulate the measured 120s sawtooth right up to the sweep: `last` is never
+  // more than a ping old, so the OLD single-tier clock could never fire.
+  for (let t = 0; t <= now; t += 120_000) reg.touch("inst-1", t);
+  assert.ok(now - reg.getActivity("inst-1")!.last < 120_000, "idle clock is fresh, as measured live");
+
+  const { provisioner, stopped } = fakeProvisioner();
+  await new Reaper(reg, provisioner as never).sweep(now);
+  assert.deepEqual(stopped, ["inst-1"], "reaped on browser activity, not protocol traffic");
+});
+
+test("an attached session merely between tool calls is spared", async () => {
+  const reg = new Registry();
+  const now = 8 * HOUR;
+  reg.streamOpened("inst-2", 0);
+  // Last real browser work an hour ago: well past IDLE_TTL_SEC (900s) but
+  // comfortably inside the 4h attached tier. A working session must not be
+  // evicted just because it paused to think.
+  reg.touchBrowserActivity("inst-2", now - HOUR);
+
+  const { provisioner, stopped } = fakeProvisioner();
+  await new Reaper(reg, provisioner as never).sweep(now);
+  assert.deepEqual(stopped, [], "recent browser work protects an attached session");
+});
+
+test("a DETACHED session still reaps on the short TTL, against the plain idle clock", async () => {
+  const reg = new Registry();
+  // Recent browser work, but the client is gone: the detached tier is unchanged
+  // and must not be widened to the attached grace period.
+  reg.touch("inst-3", 0);
+  reg.touchBrowserActivity("inst-3", 0);
+
+  const { provisioner, stopped } = fakeProvisioner();
+  await new Reaper(reg, provisioner as never).sweep(config.idleTtlMs + 1000);
+  assert.deepEqual(stopped, ["inst-3"], "detached TTL unchanged");
+});
+
+test("evicting an attached disposable browser discards its profile volume", async () => {
+  const reg = new Registry();
+  const now = 8 * HOUR;
+  reg.streamOpened("inst-77", 0);
+  reg.touch("inst-77", now - 1000);
+
+  const { provisioner, volumesRemoved, order } = fakeProvisioner();
+  await new Reaper(reg, provisioner as never).sweep(now);
+
+  // The captain accepted this consequence knowingly: since #58 an evicted
+  // instance loses its profile, so the transparent reconnect starts from a
+  // fresh seed clone. The reaper logs it explicitly for exactly that reason.
+  assert.deepEqual(volumesRemoved, ["inst-77"]);
+  assert.deepEqual(order, ["stop:inst-77", "rm-container:inst-77", "rm-volume:inst-77"]);
+});
+
+test("an attached name that is mid-provision is still spared (CHK-015)", async () => {
+  const reg = new Registry();
+  const now = 8 * HOUR;
+  reg.reserve("inst-88", 0);
+  reg.streamOpened("inst-88", 0);
+
+  const { provisioner, stopped, volumesRemoved } = fakeProvisioner();
+  const reaper = new Reaper(reg, provisioner as never);
+  await reaper.sweep(now);
+  assert.deepEqual(stopped, [], "the attached tier does not bypass the pending guard");
+  assert.deepEqual(volumesRemoved, [], "and no volume is pulled out from under it");
+
+  reg.release("inst-88");
+  await reaper.sweep(now);
+  assert.deepEqual(stopped, ["inst-88"], "reclaimed once the provision settled");
+});
+
+// config is read once at module load, so the knob is exercised in a fresh
+// process (same pattern as provisioner.test.ts / runtime.test.ts). The scenario
+// is the one above: attached for 8h, heartbeat fresh, zero browser work.
+function sweepAttachedWithEnv(env: Record<string, string>): string[] {
+  const reg = fileURLToPath(new URL("../src/registry.js", import.meta.url));
+  const reap = fileURLToPath(new URL("../src/reaper.js", import.meta.url));
+  const out = execFileSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `Promise.all([import(${JSON.stringify(reg)}), import(${JSON.stringify(reap)})]).then(([r, k]) => {
+         const registry = new r.Registry();
+         const now = 8 * 3600000;
+         registry.streamOpened("inst-x", 0);
+         registry.touch("inst-x", now - 30000);
+         const stopped = [];
+         const provisioner = {
+           listFleet: async () => [],
+           stopContainer: async (n) => { stopped.push(n); },
+           removeContainer: async () => {},
+           removeInstanceVolume: async () => false,
+         };
+         return new k.Reaper(registry, provisioner).sweep(now)
+           .then(() => process.stdout.write("RESULT:" + JSON.stringify(stopped)));
+       });`,
+    ],
+    // The reaper logs to stdout, so the result rides a marker line.
+    { env: { ...process.env, ...env }, encoding: "utf8" },
+  );
+  return JSON.parse(out.slice(out.lastIndexOf("RESULT:") + "RESULT:".length)) as string[];
+}
+
+test("ATTACHED_IDLE_TTL_SEC=0 restores the old never-reap-attached behaviour", () => {
+  assert.deepEqual(
+    sweepAttachedWithEnv({ ATTACHED_IDLE_TTL_SEC: "0" }),
+    [],
+    "0 is the documented escape hatch",
+  );
+  // And a tuned-down value takes effect, so the knob is genuinely runtime-tunable.
+  assert.deepEqual(sweepAttachedWithEnv({ ATTACHED_IDLE_TTL_SEC: "60" }), ["inst-x"]);
+  // Default (4h) also evicts this 8h-idle session.
+  assert.deepEqual(sweepAttachedWithEnv({}), ["inst-x"]);
 });
 
 // --- Instance profile volumes (issue #58) -----------------------------------

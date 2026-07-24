@@ -87,7 +87,9 @@ chikin-claude carey --continue # another instance, isolated "carey"
 
 Env (read by `chikin-mcp`): `CHIKIN_GATEWAY` (default `http://localhost:8080`), `CHIKIN_NAME` (explicit browser name), `CHIKIN_TOKEN` (bearer, only if `GATEWAY_TOKEN` is set).
 
-The first tool call provisions and starts the browser (a few seconds). A named browser (`giard`) always gets the same profile. Disconnect and the browser stays warm for a fast reconnect; leave it idle past `IDLE_TTL_SEC` with no client attached and it's stopped (the profile volume is preserved, so reconnecting restores everything).
+The first tool call provisions and starts the browser (a few seconds). A named browser (`giard`) always gets the same profile. Disconnect and the browser stays warm for a fast reconnect; leave it idle past `IDLE_TTL_SEC` with no client attached and it's **removed** — for a named browser the profile volume is preserved, so reconnecting restores everything, while a disposable `inst-<pid>` browser's profile goes with it (see [Profile volumes](#profile-volumes-and-cleaning-them-up)).
+
+Staying connected is no longer enough on its own: a session that holds the link open but runs no browser tool for `ATTACHED_IDLE_TTL_SEC` (4h) is reclaimed too, so a fleet of connected-but-idle windows can't sit on every slot. The client bridge reconnects transparently on the next tool call.
 
 #### Direct HTTP transport (pin a browser, or non–Claude-Code clients)
 
@@ -259,7 +261,8 @@ Set in `.env` (see `.env.example`) or the environment.
 | `BROWSER_CPUS` | `2.0` | CPU cap per browser in cores (fractions allowed, e.g. `1.5`); mapped to Docker `NanoCpus`. `0` disables. |
 | `BROWSER_NOFILE` | `8192` | Open-file-descriptor ceiling per browser (soft=hard). Kept generous because Chrome is fd-hungry. `0` disables. |
 | `SEED_VOLUME` | *(empty)* | Docker volume cloned into every new profile so browsers start logged in. Empty = off. Populate with `bin/chikin-snapshot` (see [Pre-authenticated browsers](#pre-authenticated-browsers-golden-profile)). |
-| `IDLE_TTL_SEC` | `900` | Idle seconds (no attached client stream) before a browser is reaped. |
+| `IDLE_TTL_SEC` | `900` | Idle seconds before a **detached** browser (no attached client stream) is reaped. Measured against any MCP traffic. |
+| `ATTACHED_IDLE_TTL_SEC` | `14400` | Seconds an **attached** browser may go with no real browser tool call before it is reclaimed anyway. Measured against actual forwarded `tools/call`s — *not* the client bridge's keepalive ping, which by design keeps the plain idle clock fresh — and shown as the dashboard's `browser idle` column. Without this, one connected-but-idle window holds a fleet slot for its whole lifetime and the fleet saturates with browsers parked on `about:blank`. Eviction is survivable: the bridge reconnects transparently, though a disposable `inst-*` browser's profile is discarded with it (logged explicitly). `0` = never reap an attached browser (pre-#57 behaviour). Keep it well above `IDLE_TTL_SEC`. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
 | `CHIKIN_VOLUME_GC` | `1` | Sweep orphaned `chikin-profile-inst-*` volumes (disposable profiles whose container is gone) once at startup. Scoped by name — `golden`, `hermes` and named client profiles are never candidates. `0` disables. See [Profile volumes](#profile-volumes-and-cleaning-them-up). |
 | `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up before failing the connect. |

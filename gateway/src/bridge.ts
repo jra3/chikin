@@ -141,6 +141,26 @@ export function classifyClientFrame(
   return "forward";
 }
 
+/**
+ * Does this client frame actually drive the BROWSER? True only for a
+ * `tools/call` the gate forwards to chrome-devtools-mcp — so the client
+ * bridge's keepalive `ping`, `initialize`, `tools/list`, notifications, the
+ * gateway-owned `chikin_identify`/`chikin_reset`, and calls blocked by the
+ * identify gate are all excluded.
+ *
+ * This is the single definition of "real browser activity" behind
+ * `Activity.lastBrowserActivity` and therefore behind the attached-tier reap
+ * TTL (issue #57): the plain idle clock cannot be used, because the client
+ * heartbeat exists precisely to keep it fresh.
+ */
+export function isBrowserWork(
+  f: { method?: string; params?: { name?: string } } | null | undefined,
+  identified: boolean,
+): boolean {
+  if (!f || f.method !== "tools/call") return false;
+  return classifyClientFrame(f, identified) === "forward";
+}
+
 // Layer 3 of the self-directing design: the actionable error a blocked browser
 // tool returns, naming chikin_identify, the handle format, and a worked example
 // so a caller that just starts browsing self-corrects on its first call.
@@ -241,6 +261,12 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     for (const id of [...inflight.keys()]) failRequest(id, message);
   };
 
+  // Rotate a browser still running an older image onto the current one, but
+  // ONLY on a cold attach — with no client stream open, nobody is disturbed by
+  // the recreate (issue #57). During a mid-session child respawn a stream is
+  // attached, so the wedged browser is rebuilt from the image it already has.
+  const canRotateImage = () => (deps.registry.getActivity(name)?.streams ?? 0) === 0;
+
   // Provision the browser, recreating the container if its Chrome is wedged
   // (ensureContainer's health probe throws ProvisionError). The profile volume
   // survives a recreate, so cookies/login persist. Anything else — fleet cap,
@@ -249,12 +275,12 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // boot) would be worse than the failure itself.
   async function provision(): Promise<string> {
     try {
-      return await deps.provisioner.ensureContainer(name);
+      return await deps.provisioner.ensureContainer(name, { canRotateImage });
     } catch (e) {
       if (!(e instanceof ProvisionError)) throw e;
       log.warn(`session[${name}]: container unhealthy, recreating`, String(e));
       await deps.provisioner.recreateContainer(name);
-      return await deps.provisioner.ensureContainer(name);
+      return await deps.provisioner.ensureContainer(name, { canRotateImage });
     }
   }
 
@@ -535,6 +561,12 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         return;
       }
     }
+    // Real browser work — the ONLY thing that moves the browser-activity clock
+    // the attached-tier reap TTL runs on (issue #57). Everything the gate
+    // handles itself above (identify/reset/block) and every non-tools/call frame
+    // (ping, initialize, tools/list, notifications) is excluded by construction,
+    // which is exactly what makes that clock meaningful.
+    if (isBrowserWork(f, session.handle !== undefined)) deps.registry.touchBrowserActivity(name);
     const tracked = f && f.method !== undefined && f.id !== undefined;
     if (tracked) {
       inflight.set(f.id as string | number, true);

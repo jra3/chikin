@@ -40,7 +40,13 @@ function configPanel(): string {
     ["CHROME_IMAGE", rc.chromeImage],
     ["CHIKIN_SANDBOX", rc.sandbox],
     ["MAX_FLEET", String(rc.maxFleet)],
-    ["IDLE_TTL_SEC", String(rc.idleTtlSec)],
+    ["IDLE_TTL_SEC", `${rc.idleTtlSec} (detached browsers)`],
+    [
+      "ATTACHED_IDLE_TTL_SEC",
+      rc.attachedIdleTtlSec > 0
+        ? `${rc.attachedIdleTtlSec} (attached but no browser tool call — see the "browser idle" column)`
+        : "0 (attached browsers are never reaped)",
+    ],
     ["CHIKIN_VOLUME_GC", rc.volumeGc ? "on (orphaned inst-* volumes swept at startup)" : "off"],
     ["WINDOW_SIZE", rc.windowSize],
     ["SHARED_DIR", rc.sharedDir],
@@ -74,6 +80,17 @@ function row(
   const act = registry.getActivity(m.name);
   const idle = act ? `${Math.round((now - act.last) / 1000)}s` : "—";
   const attached = act ? (act.streams > 0 ? "yes" : "no") : "—";
+  // Seconds since this browser last did REAL work (a forwarded tools/call), as
+  // opposed to `idle` above, which the client's 120s keepalive ping keeps near
+  // zero on every attached session. This is the number the attached-tier reap
+  // TTL is measured against, so "is this session actually working?" is readable
+  // rather than inferred (issue #57). Flagged once it is past that TTL.
+  const workIdleMs = act ? now - act.lastBrowserActivity : 0;
+  const overAttachedTtl =
+    !!act && act.streams > 0 && config.attachedIdleTtlMs > 0 && workIdleMs > config.attachedIdleTtlMs;
+  const browserIdle = act
+    ? `<span class="${overAttachedTtl ? "work-stale" : ""}">${Math.round(workIdleMs / 1000)}s</span>`
+    : "—";
   const name = esc(m.name);
   const vncHref = `/vnc/${name}/vnc.html?autoconnect=true&resize=remote&reconnect=true&path=${encodeURIComponent(
     `vnc/${m.name}/websockify`,
@@ -93,6 +110,7 @@ function row(
     <td>${session ? "live" : "—"}</td>
     <td>${attached}</td>
     <td>${idle}</td>
+    <td>${browserIdle}</td>
     <td>${running ? `<a href="${vncHref}">open noVNC ↗</a>` : "—"}</td>
   </tr>`;
 }
@@ -122,7 +140,7 @@ export async function renderDashboard(
 
   const rows = members.length
     ? members.map((m) => row(m, registry, now, sandbox.get(m.name) ?? "unknown")).join("\n")
-    : `<tr><td colspan="9" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> to spin one up.</td></tr>`;
+    : `<tr><td colspan="10" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> to spin one up.</td></tr>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -142,6 +160,7 @@ export async function renderDashboard(
   .sandbox.sb-on { color: #137333; font-weight: 600; }
   .sandbox.sb-off { color: #a50e0e; font-weight: 600; }
   .sandbox.sb-unknown { color: #888; }
+  .work-stale { color: #a50e0e; font-weight: 600; }
   .empty { color: #888; text-align: center; padding: 1.2rem; }
   .err { color: #a50e0e; }
   .meta { color: #777; font-size: .85rem; margin-top: 1.5rem; }
@@ -162,7 +181,7 @@ export async function renderDashboard(
   ${err ? `<p class="err">Could not list fleet: ${esc(err)}</p>` : ""}
   <table>
     <thead>
-      <tr><th>name</th><th>handle</th><th>state</th><th>status</th><th>sandbox</th><th>session</th><th>attached</th><th>idle</th><th>view</th></tr>
+      <tr><th>name</th><th>handle</th><th>state</th><th>status</th><th>sandbox</th><th>session</th><th>attached</th><th title="since any MCP frame — a client heartbeat ping keeps this near zero">idle</th><th title="since a real browser tool call — what the attached reap TTL measures">browser idle</th><th>view</th></tr>
     </thead>
     <tbody>
 ${rows}
@@ -171,9 +190,13 @@ ${rows}
   ${configPanel()}
   <p class="meta">MAX_FLEET=${config.maxFleet} · idle reap after ${Math.round(
     config.idleTtlMs / 1000,
-  )}s with no attached client · sandbox policy <code>CHIKIN_SANDBOX=${esc(
-    config.sandbox,
-  )}</code></p>
+  )}s with no attached client${
+    config.attachedIdleTtlMs > 0
+      ? `, or after ${Math.round(
+          config.attachedIdleTtlMs / 1000,
+        )}s with a client attached but no browser tool call`
+      : " (attached browsers are never reaped)"
+  } · sandbox policy <code>CHIKIN_SANDBOX=${esc(config.sandbox)}</code></p>
 </body>
 </html>`;
 }

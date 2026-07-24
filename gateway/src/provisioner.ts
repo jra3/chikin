@@ -369,14 +369,71 @@ export class Provisioner {
   }
 
   /**
+   * Is this container running an image other than the one we would create it
+   * from today? Compares resolved image IDs, not tags: the common case is a
+   * rebuilt `chikin:local` (or a moved `:latest`), where the tag is identical
+   * and only the ID differs — which is exactly the 30-hour browser still
+   * running pre-sandbox-hardening code in issue #57.
+   *
+   * Fails safe: any doubt (image gone, proxy hiccup, missing field) returns
+   * false, so a Docker glitch can never cascade into recreating containers.
+   */
+  private async isImageStale(info: Docker.ContainerInspectInfo): Promise<boolean> {
+    const running = info.Image;
+    if (!running) return false;
+    try {
+      const current = await this.docker.getImage(config.image).inspect();
+      return !!current?.Id && current.Id !== running;
+    } catch (e) {
+      log.debug(`provisioner: could not resolve ${config.image} for a staleness check: ${String(e)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Create + start a fleet container for `name` (volume, egress network, start).
+   * MUST be called inside `serializeCreate` — its callers do the cap check (new
+   * browsers) or the remove-then-recreate (image rotation) in the same critical
+   * section, so a freed slot can never be claimed by a concurrent provision
+   * between the two halves (CHK-010 / issue #27).
+   */
+  private async createAndStart(name: string): Promise<void> {
+    const cname = containerName(name);
+    await this.ensureVolume(name);
+    log.info(`provisioner: creating container ${cname}`);
+    const created = await this.createContainer(buildCreateOptions(name));
+    // Attach the egress network so the browser can reach the internet; the
+    // primary chikin-net is internal-only (CDP isolated from the host).
+    try {
+      await this.docker.getNetwork(config.egressNetwork).connect({ Container: created.id });
+    } catch (e) {
+      log.warn(`provisioner: could not attach ${cname} to ${config.egressNetwork}`, String(e));
+    }
+    await created.start();
+  }
+
+  /**
    * Ensure `chikin-chrome-<name>` exists and is running, then block until its
    * CDP endpoint answers. Creates the container (and volume) on first use,
    * starts it if stopped, reuses it if already running. Enforces MAX_FLEET for
    * genuinely new browsers. Returns the container's IP on the control network —
    * we connect to CDP by IP because Chrome's DevTools HTTP endpoint rejects a
    * Host header that is a DNS name (DNS-rebinding protection).
+   *
+   * `opts.canRotateImage` opts this name into IMAGE ROTATION (issue #57): if the
+   * existing container runs an image other than the current one, it is recreated
+   * instead of reused, so a long-lived browser stops silently outliving image
+   * upgrades — and with them the hardening they carry (the reporter's 30-hour
+   * browser whose `sandbox` column read `—` while every other row read
+   * `sandboxed`). The bridge passes `() => no client stream is attached`, so
+   * rotation only ever happens on a COLD attach: nobody's live session is torn
+   * down to fix an image problem, and there is no blunt max-age cap that would
+   * do exactly that. The profile volume is preserved across the rotation.
    */
-  async ensureContainer(name: string): Promise<string> {
+  async ensureContainer(
+    name: string,
+    opts?: { canRotateImage?: () => boolean },
+  ): Promise<string> {
     const cname = containerName(name);
     const container = this.docker.getContainer(cname);
     let info: Docker.ContainerInspectInfo | null = null;
@@ -386,7 +443,34 @@ export class Provisioner {
       info = null;
     }
 
-    if (info) {
+    let rotated = false;
+    if (info && opts?.canRotateImage?.() && (await this.isImageStale(info))) {
+      // Remove-then-recreate under ONE createGate hold: the removal frees a
+      // fleet slot, and re-claiming it outside the gate is precisely the
+      // MAX_FLEET TOCTOU that CHK-010 closed. No cap check is needed inside —
+      // the slot being reused is the one we just freed, so the count is flat.
+      await this.serializeCreate(async () => {
+        // Re-check inside the gate: everything above is awaited, so a client
+        // stream may have attached while we were inspecting.
+        if (!opts.canRotateImage?.()) {
+          log.info(`provisioner: skipping image rotation for ${cname} — a client attached`);
+          return;
+        }
+        log.info(
+          `provisioner: recreating ${cname} on the current ${config.image} ` +
+            `(it was started from an older image; profile volume preserved)`,
+        );
+        await this.stopContainer(name);
+        await this.removeContainer(name);
+        await this.createAndStart(name);
+        rotated = true;
+      });
+    }
+
+    if (rotated) {
+      // Created and started inside the gate above; nothing left to do but wait
+      // for its CDP to answer.
+    } else if (info) {
       if (!info.State.Running) {
         log.info(`provisioner: starting existing container ${cname}`);
         await container.start();
@@ -405,17 +489,7 @@ export class Provisioner {
         if (existing >= config.maxFleet) {
           throw new FleetFullError(config.maxFleet);
         }
-        await this.ensureVolume(name);
-        log.info(`provisioner: creating container ${cname}`);
-        const created = await this.createContainer(buildCreateOptions(name));
-        // Attach the egress network so the browser can reach the internet; the
-        // primary chikin-net is internal-only (CDP isolated from the host).
-        try {
-          await this.docker.getNetwork(config.egressNetwork).connect({ Container: created.id });
-        } catch (e) {
-          log.warn(`provisioner: could not attach ${cname} to ${config.egressNetwork}`, String(e));
-        }
-        await created.start();
+        await this.createAndStart(name);
       });
     }
 
