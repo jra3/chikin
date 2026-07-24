@@ -169,7 +169,7 @@ chikin-claude golden                       # launch the golden browser
 chikin-snapshot                            # clones golden's profile -> chikin-seed
 ```
 
-`chikin-profile-golden` is now the most expensive thing on the host to lose — read [Profile volumes and cleaning them up](#profile-volumes-and-cleaning-them-up) before you run any `docker volume prune`.
+`chikin-profile-golden` and `chikin-seed` are now the most expensive things on the host to lose, and a single `docker volume prune --all` takes both — read [Profile volumes and cleaning them up](#profile-volumes-and-cleaning-them-up) before you run any prune.
 
 From then on **every new browser is cloned from the seed and starts logged in** — and the MCP automation sees those cookies (it shares the persistent profile context). Re-run `chikin-snapshot` whenever sessions expire. It works because every container uses Chrome's keyring-less `basic` cookie store, so the encryption key travels in the copied `Local State` and decrypts in the clones. Caveat: all seeded browsers share one identity, so sites that forbid concurrent sessions may re-challenge.
 
@@ -180,16 +180,27 @@ Each browser `<name>` gets its own host directory `/tmp/chikin-shared/<name>`, m
 ### Profile volumes and cleaning them up
 
 > [!CAUTION]
-> **No label-scoped `docker volume prune --all` is safe against chikin volumes.**
-> `chikin-profile-golden` — your hand-authenticated logins — carries `chikin.fleet=1`
-> just like the throwaway per-instance profiles, and it sits *dangling* whenever no
-> container has it mounted, which is almost always. So this apparently careful,
-> chikin-scoped command **destroys every saved login**, and the only recovery is
-> signing back into each site by hand through noVNC:
+> **No `docker volume prune --all` is safe against chikin volumes — filtered or not.**
+> Both forms destroy hand-authenticated login state, and the only recovery is signing
+> back into every site by hand through noVNC. They differ only in what they take:
 >
 > ```bash
-> docker volume prune --all --filter label=chikin.fleet=1   # ☠️  eats golden + hermes + every named profile
+> docker volume prune --all --filter label=chikin.fleet=1   # ☠️  golden + hermes + every sticky profile
+> docker volume prune --all                                 # ☠️☠️ the above, AND chikin-seed
 > ```
+>
+> - The **label-scoped** form looks chikin-aware and careful, and is the more likely
+>   mistake. `chikin-profile-golden` carries `chikin.fleet=1` exactly like the
+>   throwaway per-instance profiles, and it sits *dangling* whenever no container has
+>   it mounted — which is almost always. So do every sticky client profile.
+> - The **unfiltered** form is worse. `bin/chikin-snapshot` creates the seed with a
+>   plain `docker volume create`, so `chikin-seed` carries **no labels at all**: no
+>   label filter can reach it, but a bare `--all` takes it along with everything else.
+>   That is the volume new browsers are actually cloned from when `SEED_VOLUME` is
+>   set, and in practice it is golden's only second copy of the login state. Losing
+>   both is terminal in a way losing either alone is not: `chikin-snapshot` refuses to
+>   run without `chikin-profile-golden`, so once golden is gone the seed can never be
+>   refreshed again without re-authenticating every site by hand.
 >
 > The trap is armed by `--all`: the plain prune skips named volumes and reports
 > `Total reclaimed space: 0B`, which reads as "nothing to clean here" and pushes you
@@ -201,19 +212,21 @@ Each browser `<name>` gets its own host directory `/tmp/chikin-shared/<name>`, m
 > ```
 >
 > (`docker volume rm` refuses volumes a container still mounts, so this is safe to
-> run against a live fleet.) Snapshot golden first — `bin/chikin-snapshot` copies it
-> into `chikin-seed`, giving you a second copy.
+> run against a live fleet.) Keep golden and the seed as genuinely separate copies:
+> `bin/chikin-snapshot` refreshes `chikin-seed` from golden, and a tarball of either,
+> outside Docker's volume store, is what survives a prune of both.
 
 Two kinds of profile volume, told apart by **name**:
 
 | Volume | Lifetime |
 |---|---|
 | `chikin-profile-inst-<pid>` | **Disposable.** One per Claude Code instance (the default `inst-<pid>` name). The gateway removes it when it reaps the browser. |
-| `chikin-profile-<name>` (`golden`, `hermes`, any name you pick) | **Sticky.** Survives reaping, restart, and `--force-recreate`. Never removed by the gateway. |
+| `chikin-profile-<name>` — **every** name that is not `inst-*` | **Sticky.** Survives reaping, restart, and `--force-recreate`. Never removed by the gateway. `golden` and `hermes` are just the well-known ones; any name you or a client picks (`alice`, `mulm`, …) is in this class, and yours is not safe merely because it is not listed here. |
+| `chikin-seed` | **Sticky, and unlabelled.** The snapshot new browsers are cloned from (`SEED_VOLUME`). Not a `chikin-profile-*` volume, so the by-name commands above never touch it — but a bare `docker volume prune --all` does. |
 
 Volumes created from this version on also carry `chikin.role=instance` vs
 `chikin.role=profile`, so `--filter label=chikin.role=instance` is a prune scope
-that cannot reach golden:
+that cannot reach golden, any other sticky profile, or the seed:
 
 ```bash
 docker volume prune --all --filter label=chikin.role=instance
@@ -223,7 +236,8 @@ docker volume prune --all --filter label=chikin.role=instance
 predates this change — including the `chikin-profile-golden` already on your host —
 has no `chikin.role` label at all and is *not* protected by it. On an existing host,
 use the name-based commands above. The gateway's own safety checks always go by
-name, never by label, for exactly this reason.
+name, never by label, for exactly this reason. And no label filter of any kind
+saves you from an **unfiltered** `docker volume prune --all`.
 
 The gateway also sweeps orphaned `chikin-profile-inst-*` volumes (instance profiles
 whose container no longer exists) once at startup — that reclaims leftovers from
