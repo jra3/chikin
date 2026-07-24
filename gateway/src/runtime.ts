@@ -24,6 +24,8 @@ export interface RuntimeConfig {
   sandbox: string;
   maxFleet: number;
   idleTtlSec: number;
+  /** Whether the startup sweep reclaims orphaned chikin-profile-inst-* volumes. */
+  volumeGc: boolean;
   network: string;
   egressNetwork: string;
   sharedDir: string;
@@ -43,6 +45,7 @@ export function runtimeConfig(): RuntimeConfig {
     sandbox: config.sandbox,
     maxFleet: config.maxFleet,
     idleTtlSec: Math.round(config.idleTtlMs / 1000),
+    volumeGc: config.volumeGc,
     network: config.network,
     egressNetwork: config.egressNetwork,
     sharedDir: config.sharedDir,

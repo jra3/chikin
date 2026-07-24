@@ -41,12 +41,41 @@ async function main(): Promise<void> {
   await reportRuntimeConfig(provisioner);
 
   // Clear leftover exited fleet containers from a previous run / reboot / crash
-  // before they count against MAX_FLEET and block new browsers. Volumes are kept.
+  // before they count against MAX_FLEET and block new browsers. Named profile
+  // volumes are kept.
   try {
     const n = await provisioner.gcExited();
     if (n) log.info(`startup: removed ${n} leftover exited fleet container(s)`);
   } catch (e) {
     log.warn("startup: gc of exited containers failed", e instanceof Error ? e.message : String(e));
+  }
+
+  // Belt and braces for issue #58: reclaim chikin-profile-inst-* volumes whose
+  // container is long gone (they leaked at ~200 MB apiece before the reaper
+  // removed them). Deliberately after gcExited, so containers it just removed
+  // release their volumes in time for this pass. Scoped by NAME to inst-* with
+  // no owning container — golden, hermes and named client profiles are never
+  // candidates. CHIKIN_VOLUME_GC=0 disables it.
+  if (config.volumeGc) {
+    try {
+      const sweep = await provisioner.sweepOrphanInstanceVolumes();
+      if (sweep.removed.length) {
+        log.info(
+          `startup: reclaimed ${sweep.removed.length} orphaned instance profile volume(s)`,
+          sweep.removed.join(" "),
+        );
+      }
+      if (sweep.failed.length) {
+        log.warn(`startup: ${sweep.failed.length} instance volume(s) could not be removed`);
+      }
+    } catch (e) {
+      log.warn(
+        "startup: orphan instance-volume sweep failed (nothing removed)",
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  } else {
+    log.info("startup: orphan instance-volume sweep disabled (CHIKIN_VOLUME_GC=0)");
   }
 
   const reaper = new Reaper(registry, provisioner);

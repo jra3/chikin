@@ -41,6 +41,7 @@ function configPanel(): string {
     ["CHIKIN_SANDBOX", rc.sandbox],
     ["MAX_FLEET", String(rc.maxFleet)],
     ["IDLE_TTL_SEC", String(rc.idleTtlSec)],
+    ["CHIKIN_VOLUME_GC", rc.volumeGc ? "on (orphaned inst-* volumes swept at startup)" : "off"],
     ["WINDOW_SIZE", rc.windowSize],
     ["SHARED_DIR", rc.sharedDir],
     ["CHIKIN_NETWORK", rc.network],
