@@ -68,6 +68,18 @@ async function identify(client, handle, description) {
   });
 }
 
+const textOf = (r) => (r.content ?? []).map((c) => c.text ?? "").join("");
+
+// How many fleet slots are actually held right now, read off the dashboard.
+// Since issue #63 this is NOT the number of connected sessions: a session that
+// has not made a browser tool call owns no container and holds no slot.
+async function slotsInUse() {
+  const html = await (await fetch(`${BASE}/`)).text();
+  const m = html.match(/slots in use: <strong>(\d+)\//);
+  if (!m) throw new Error("dashboard did not report fleet slots in use");
+  return Number(m[1]);
+}
+
 // evaluate a function in the page and return the raw text payload
 async function evalText(client, fn) {
   const r = await client.callTool({ name: "evaluate_script", arguments: { function: fn } });
@@ -91,7 +103,8 @@ try {
       .status === 400,
   );
 
-  console.log("== Provision alice + tools + egress ==");
+  console.log("== Connect alice + tools + egress ==");
+  const baseSlots = await slotsInUse();
   const alice = await connect("alice");
   sessions.push(alice);
   check("alice initialize", alice.client.getServerVersion()?.name === "chrome_devtools");
@@ -105,13 +118,29 @@ try {
   const blocked = await alice.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
   check(
     "browser tool before identify -> instructive error",
-    blocked.isError === true && /chikin_identify/.test((blocked.content ?? []).map((c) => c.text ?? "").join("")),
+    blocked.isError === true && /chikin_identify/.test(textOf(blocked)),
     JSON.stringify(blocked).slice(0, 120),
   );
   const ident = await identify(alice.client, "alice-itest", "itest driver");
   check("chikin_identify succeeds", ident.isError !== true, JSON.stringify(ident).slice(0, 120));
 
+  // Lazy provisioning (issue #63): nothing above touched a browser, so no fleet
+  // slot has been claimed. Eight connected-but-idle clients used to saturate
+  // MAX_FLEET and lock out the one session that actually needed a browser.
+  const idleSlots = await slotsInUse();
+  check(
+    "connect + tools/list + gated call + identify claim NO fleet slot",
+    idleSlots === baseSlots,
+    `slots ${baseSlots} -> ${idleSlots}`,
+  );
+
   await alice.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
+  const usedSlots = await slotsInUse();
+  check(
+    "the first real browser tool call is what provisions the browser",
+    usedSlots === baseSlots + 1,
+    `slots ${idleSlots} -> ${usedSlots}`,
+  );
   const aliceTitle = await evalText(alice.client, "() => document.title");
   check("alice browsed example.com (egress works, post-identify)", /Example Domain/.test(aliceTitle), aliceTitle.slice(0, 80));
 
@@ -144,12 +173,35 @@ try {
   );
 
   console.log("== Fleet cap (MAX_FLEET) ==");
-  // alice + bob are live. Provision carol (=3 if cap is 3), then dave must fail.
-  const carol = await connect("carol");
-  sessions.push(carol);
-  check("carol provisioned (within cap)", carol.client.getServerVersion()?.name === "chrome_devtools");
-  const dave = await rawPost("/b/dave/", { token: TOKEN });
-  check("provision past MAX_FLEET -> 429", dave.status === 429, `got ${dave.status}`);
+  // alice + bob hold browsers. Fill whatever the running gateway's cap leaves,
+  // so this works at any MAX_FLEET rather than assuming the itest's 3.
+  const cap = (await (await fetch(`${BASE}/healthz`)).json()).config.maxFleet;
+  for (let i = await slotsInUse(); i < cap; i++) {
+    const filler = await connect(`filler${i}`);
+    sessions.push(filler);
+    await identify(filler.client, `filler${i}-itest`);
+    await filler.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
+  }
+  check("fleet filled to the cap", (await slotsInUse()) === cap, `slots=${await slotsInUse()} cap=${cap}`);
+
+  // Past the cap the SESSION still opens and keeps every tool registered — only
+  // the browser call fails, retryably (issue #63). It used to be a 429 on the
+  // handshake, which cost the caller its browser lane for the whole session:
+  // an MCP client fixes its tool registry at session start, so freeing a slot
+  // afterwards could not give the tools back.
+  const dave = await connect("dave");
+  sessions.push(dave);
+  check("connect past MAX_FLEET still opens a session", dave.client.getServerVersion()?.name === "chrome_devtools");
+  const daveTools = await dave.client.listTools();
+  check("...with every browser tool still registered", daveTools.tools.length > 20, `got ${daveTools.tools.length}`);
+  await identify(dave.client, "dave-itest");
+  const capped = await dave.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
+  check(
+    "browser tool past MAX_FLEET -> retryable tool error naming the cap",
+    capped.isError === true && /fleet is full/.test(textOf(capped)),
+    JSON.stringify(capped).slice(0, 160),
+  );
+  check("...and the fleet was not overshot", (await slotsInUse()) === cap, `slots=${await slotsInUse()}`);
 
   console.log("== Dashboard ==");
   const dash = await fetch(`${BASE}/`);

@@ -45,6 +45,32 @@ test("a session between tool calls is not flagged as stale", async () => {
   assert.ok(!html.includes('class="work-stale"'), "recent browser work is not flagged");
 });
 
+// Lazy provisioning (issue #63) makes a connected session that has never made a
+// browser tool call hold no container — so it would fall off a table built from
+// the fleet listing alone. The old failure was these sessions eating every slot
+// invisibly; the new risk is the opposite, that they cannot be seen at all.
+test("connected sessions holding no fleet slot are listed, and the count is explicit", async () => {
+  const reg = new Registry();
+  const now = Date.now();
+  reg.streamOpened("inst-working", now - 60_000);
+  reg.touchBrowserActivity("inst-working", now - 60_000);
+  // Connected, never browsed: no container exists for this name.
+  reg.add({ name: "inst-justconnected", handle: undefined } as never);
+  reg.streamOpened("inst-justconnected", now - 3600_000);
+  reg.touch("inst-justconnected", now - 30_000);
+
+  const html = await renderDashboard(fakeProvisioner(["inst-working"]) as never, reg);
+
+  assert.match(html, /inst-justconnected/, "the browser-less session has a row");
+  assert.match(html, /no browser/, "and is marked as holding no browser");
+  assert.match(html, /holds no fleet slot/, "with what that means spelled out");
+  assert.match(
+    html,
+    new RegExp(`slots in use: <strong>1/${config.maxFleet}</strong>`),
+    "real fleet usage is a number, not an inference from row count",
+  );
+});
+
 test("the runtime-config panel surfaces the attached TTL knob", async () => {
   const html = await renderDashboard(fakeProvisioner([]) as never, new Registry());
   assert.match(html, /ATTACHED_IDLE_TTL_SEC/, "the knob an operator retunes is readable");

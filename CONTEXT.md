@@ -16,7 +16,7 @@ _Avoid_: node, remote host, server
 The one container clients connect to; it provisions/reaps Browsers and multiplexes each client onto its own. Speaks MCP over HTTP on `127.0.0.1` only.
 
 **Browser**:
-One provisioned Chrome container with its own sticky, isolated profile, addressed by a **Name**. Provisioned on first connect, reaped when idle; the profile persists.
+One provisioned Chrome container with its own sticky, isolated profile, addressed by a **Name**. Provisioned on a session's first browser tool call (not on connect), reaped when idle; the profile persists.
 _Avoid_: tab, session, page (those are things *inside* a Browser)
 
 **Name**:

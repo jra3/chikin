@@ -115,6 +115,34 @@ function row(
   </tr>`;
 }
 
+/**
+ * A live session that holds NO container — connected, tools registered, but it
+ * has not yet made a browser tool call, so lazy provisioning (issue #63) has
+ * not claimed it a fleet slot. Before that change these sessions were the ones
+ * silently eating the fleet; now they are free, and the risk is the opposite —
+ * that they are invisible. So they get a row, marked as costing nothing.
+ */
+function browserlessRow(name: string, registry: Registry, now: number): string {
+  const session = registry.getByName(name);
+  const act = registry.getActivity(name);
+  const idle = act ? `${Math.round((now - act.last) / 1000)}s` : "—";
+  const handle = session?.handle
+    ? `<code title="${esc(session.handleDescription ?? "")}">${esc(session.handle)}</code>`
+    : "—";
+  return `<tr class="noslot">
+    <td><code>${esc(name)}</code></td>
+    <td>${handle}</td>
+    <td><span class="state none">no browser</span></td>
+    <td>connected — holds no fleet slot</td>
+    <td>—</td>
+    <td>live</td>
+    <td>${act && act.streams > 0 ? "yes" : "no"}</td>
+    <td>${idle}</td>
+    <td>—</td>
+    <td>—</td>
+  </tr>`;
+}
+
 /** Render the fleet dashboard listing every managed browser (issue #9). */
 export async function renderDashboard(
   provisioner: Provisioner,
@@ -138,9 +166,22 @@ export async function renderDashboard(
     }),
   );
 
-  const rows = members.length
-    ? members.map((m) => row(m, registry, now, sandbox.get(m.name) ?? "unknown")).join("\n")
-    : `<tr><td colspan="10" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> to spin one up.</td></tr>`;
+  // Live sessions with no container of their own (issue #63) listed after the
+  // real browsers, so "8 clients connected, 2 slots used" reads off the page.
+  const held = new Set(members.map((m) => m.name));
+  const browserless = registry
+    .all()
+    .map((s) => s.name)
+    .filter((n) => !held.has(n))
+    .sort();
+
+  const rows =
+    members.length || browserless.length
+      ? [
+          ...members.map((m) => row(m, registry, now, sandbox.get(m.name) ?? "unknown")),
+          ...browserless.map((n) => browserlessRow(n, registry, now)),
+        ].join("\n")
+      : `<tr><td colspan="10" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> and make a browser tool call to spin one up.</td></tr>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -157,6 +198,8 @@ export async function renderDashboard(
   code { background: #f4f4f4; padding: 0 .25rem; border-radius: 3px; }
   .state.up { color: #137333; font-weight: 600; }
   .state.down { color: #a50e0e; }
+  .state.none { color: #777; }
+  tr.noslot td { color: #777; }
   .sandbox.sb-on { color: #137333; font-weight: 600; }
   .sandbox.sb-off { color: #a50e0e; font-weight: 600; }
   .sandbox.sb-unknown { color: #888; }
@@ -188,6 +231,11 @@ ${rows}
     </tbody>
   </table>
   ${configPanel()}
+  <p class="meta">fleet slots in use: <strong>${members.length}/${config.maxFleet}</strong>${
+    browserless.length
+      ? ` · ${browserless.length} connected session${browserless.length === 1 ? "" : "s"} holding no slot (no browser tool call yet — issue #63)`
+      : ""
+  }</p>
   <p class="meta">MAX_FLEET=${config.maxFleet} · idle reap after ${Math.round(
     config.idleTtlMs / 1000,
   )}s with no attached client${

@@ -66,6 +66,20 @@ jobs:
           npm ci
           npm test
 
+      # The gateway's own suite, which CI never ran. Every fleet-lifecycle
+      # invariant lives there and nowhere else: lazy provisioning (a connected
+      # client must claim no fleet slot — issue #63), the two-tier idle reap
+      # (#57), and the name-based profile-volume safety rules (#58/#59). The
+      # smoke test below drives one browser; it cannot see any of those.
+      - name: Unit tests (gateway)
+        working-directory: gateway
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "1"
+        run: |
+          npm ci
+          npm run build
+          npm test
+
       # Stand up the whole fleet from the locally-built images and prove a
       # provisioned browser is non-headless THROUGH the gateway (the fleet never
       # exposes CDP). CHIKIN_VERSION=ci points compose at the :ci images loaded

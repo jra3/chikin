@@ -1,7 +1,7 @@
 import { config } from "./config.js";
 import { log } from "./log.js";
 import type { Registry } from "./registry.js";
-import type { Provisioner } from "./provisioner.js";
+import type { FleetMember, Provisioner } from "./provisioner.js";
 
 /**
  * Periodically reclaims idle browsers (issue #7). Reaping tears down any
@@ -37,6 +37,11 @@ import type { Provisioner } from "./provisioner.js";
  * reclaimed once idle. Running containers with no activity record — e.g.
  * orphans from a previous gateway run — are adopted with a one-time grace
  * stamp so they too get reaped after the TTL instead of leaking forever.
+ *
+ * Since issue #63 the map also holds names with NO container: a session
+ * provisions its browser lazily, on its first browser tool call. Those hold no
+ * fleet slot, so there is nothing for this to reclaim and it skips them — the
+ * whole point of lazy provisioning is that they cost nothing to leave alone.
  */
 export class Reaper {
   private timer: NodeJS.Timeout | undefined;
@@ -67,23 +72,43 @@ export class Reaper {
 
   /** One pass. Exposed for tests. */
   async sweep(now: number = Date.now()): Promise<void> {
-    // Adopt running fleet containers we aren't yet tracking (gateway restart,
-    // manual start) so they're subject to the same idle policy.
+    // Which names actually hold a container right now. Deliberately read from
+    // Docker every sweep rather than tracked as a gateway-side flag: a flag that
+    // drifted to "no container" would leak that container's slot forever, which
+    // is precisely the class of bug this reaper exists to prevent.
+    let fleet: FleetMember[] | null = null;
     try {
-      for (const m of await this.provisioner.listFleet()) {
-        if (m.state === "running" && !this.registry.getActivity(m.name)) {
-          log.info(`reaper: adopting untracked running container ${m.name}`);
-          this.registry.touch(m.name, now);
-        }
-      }
+      fleet = await this.provisioner.listFleet();
     } catch (e) {
+      // Unknown fleet state: fall back to reaping on the activity record alone,
+      // rather than silently suspending reaping until Docker answers again.
       log.warn("reaper: could not list fleet", String(e));
     }
+    // Adopt running fleet containers we aren't yet tracking (gateway restart,
+    // manual start) so they're subject to the same idle policy.
+    for (const m of fleet ?? []) {
+      if (m.state === "running" && !this.registry.getActivity(m.name)) {
+        log.info(`reaper: adopting untracked running container ${m.name}`);
+        this.registry.touch(m.name, now);
+      }
+    }
+    const containers = fleet && new Set(fleet.map((m) => m.name));
 
     for (const name of this.registry.activityNames()) {
       const a = this.registry.getActivity(name);
       if (!a) continue;
       if (this.registry.isPending(name)) continue; // mid-provision -> not idle (CHK-015)
+
+      // Since issue #63 an activity record no longer implies a fleet slot: a
+      // session provisions its browser lazily, on its first browser tool call,
+      // so a connected-but-never-used session is tracked here while owning no
+      // container. There is nothing to reclaim from it — evicting it would cost
+      // the client a reconnect and free nothing — so leave it alone, and drop
+      // the bookkeeping once nothing is using it either.
+      if (containers && !containers.has(name)) {
+        if (!this.registry.getByName(name) && a.streams === 0) this.registry.dropActivity(name);
+        continue;
+      }
 
       // Two-tier TTL (issue #57). An attached client no longer makes a browser
       // unreapable — it only buys the much longer ATTACHED_IDLE_TTL_SEC, and

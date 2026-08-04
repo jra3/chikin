@@ -6,14 +6,30 @@ import { Registry } from "../src/registry.js";
 import { Reaper } from "../src/reaper.js";
 import { config } from "../src/config.js";
 
-function fakeProvisioner(fleet: { name: string; state: string }[] = []) {
+// `fleet` names the containers that actually exist. Since issue #63 that is not
+// a formality: a name can have an activity record with no container (a session
+// that connected but never made a browser tool call), and the reaper must leave
+// those alone — so every test that expects a reap has to say the container is
+// really there. A bare string means "running".
+function fakeProvisioner(
+  fleet: (string | { name: string; state: string })[] = [],
+  opts: { listFails?: boolean } = {},
+) {
+  const members = fleet.map((m) => (typeof m === "string" ? { name: m, state: "running" } : m));
   const stopped: string[] = [];
   const removed: string[] = [];
   const volumesRemoved: string[] = [];
   const order: string[] = [];
   const provisioner = {
-    listFleet: async () =>
-      fleet.map((m) => ({ name: m.name, containerId: m.name, state: m.state, status: m.state })),
+    listFleet: async () => {
+      if (opts.listFails) throw new Error("docker socket unavailable");
+      return members.map((m) => ({
+        name: m.name,
+        containerId: m.name,
+        state: m.state,
+        status: m.state,
+      }));
+    },
     stopContainer: async (n: string) => {
       stopped.push(n);
       order.push(`stop:${n}`);
@@ -42,7 +58,7 @@ test("reaper reclaims idle browsers but spares attached ones", async () => {
   // attached: an SSE stream is open -> never reap
   reg.streamOpened("attached", 0);
 
-  const { provisioner, stopped, removed } = fakeProvisioner();
+  const { provisioner, stopped, removed } = fakeProvisioner(["idle", "attached"]);
   const reaper = new Reaper(reg, provisioner as never);
   await reaper.sweep(config.idleTtlMs + 1000);
 
@@ -55,7 +71,7 @@ test("reaper reclaims idle browsers but spares attached ones", async () => {
 test("a browser idle within the TTL is not reaped", async () => {
   const reg = new Registry();
   reg.touch("fresh", 1000);
-  const { provisioner, stopped } = fakeProvisioner();
+  const { provisioner, stopped } = fakeProvisioner(["fresh"]);
   const reaper = new Reaper(reg, provisioner as never);
   await reaper.sweep(1000 + config.idleTtlMs - 1);
   assert.deepEqual(stopped, [], "within TTL -> not reaped");
@@ -67,7 +83,7 @@ test("a mid-provision (pending) browser is not reaped even when idle past the TT
   // the name stays pending until provisioning finishes — a slow cold start must
   // not be torn down mid-flight (CHK-015).
   reg.reserve("provisioning", 0);
-  const { provisioner, stopped, removed } = fakeProvisioner();
+  const { provisioner, stopped, removed } = fakeProvisioner(["provisioning"]);
   const reaper = new Reaper(reg, provisioner as never);
 
   await reaper.sweep(config.idleTtlMs + 5000);
@@ -97,7 +113,7 @@ test("an attached session past the attached TTL with no browser work is reclaime
   reg.streamOpened("inst-3244808", 0); // client attached since t=0, never left
   reg.touch("inst-3244808", now - 30_000); // ...and its heartbeat ping just landed
 
-  const { provisioner, stopped, removed } = fakeProvisioner();
+  const { provisioner, stopped, removed } = fakeProvisioner(["inst-3244808"]);
   await new Reaper(reg, provisioner as never).sweep(now);
 
   assert.deepEqual(stopped, ["inst-3244808"], "8h attached with zero tool calls -> reclaimed");
@@ -114,7 +130,7 @@ test("the client heartbeat cannot keep an attached browser alive (the #57 mechan
   for (let t = 0; t <= now; t += 120_000) reg.touch("inst-1", t);
   assert.ok(now - reg.getActivity("inst-1")!.last < 120_000, "idle clock is fresh, as measured live");
 
-  const { provisioner, stopped } = fakeProvisioner();
+  const { provisioner, stopped } = fakeProvisioner(["inst-1"]);
   await new Reaper(reg, provisioner as never).sweep(now);
   assert.deepEqual(stopped, ["inst-1"], "reaped on browser activity, not protocol traffic");
 });
@@ -128,7 +144,7 @@ test("an attached session merely between tool calls is spared", async () => {
   // evicted just because it paused to think.
   reg.touchBrowserActivity("inst-2", now - HOUR);
 
-  const { provisioner, stopped } = fakeProvisioner();
+  const { provisioner, stopped } = fakeProvisioner(["inst-2"]);
   await new Reaper(reg, provisioner as never).sweep(now);
   assert.deepEqual(stopped, [], "recent browser work protects an attached session");
 });
@@ -140,7 +156,7 @@ test("a DETACHED session still reaps on the short TTL, against the plain idle cl
   reg.touch("inst-3", 0);
   reg.touchBrowserActivity("inst-3", 0);
 
-  const { provisioner, stopped } = fakeProvisioner();
+  const { provisioner, stopped } = fakeProvisioner(["inst-3"]);
   await new Reaper(reg, provisioner as never).sweep(config.idleTtlMs + 1000);
   assert.deepEqual(stopped, ["inst-3"], "detached TTL unchanged");
 });
@@ -151,7 +167,7 @@ test("evicting an attached disposable browser discards its profile volume", asyn
   reg.streamOpened("inst-77", 0);
   reg.touch("inst-77", now - 1000);
 
-  const { provisioner, volumesRemoved, order } = fakeProvisioner();
+  const { provisioner, volumesRemoved, order } = fakeProvisioner(["inst-77"]);
   await new Reaper(reg, provisioner as never).sweep(now);
 
   // The captain accepted this consequence knowingly: since #58 an evicted
@@ -167,7 +183,7 @@ test("an attached name that is mid-provision is still spared (CHK-015)", async (
   reg.reserve("inst-88", 0);
   reg.streamOpened("inst-88", 0);
 
-  const { provisioner, stopped, volumesRemoved } = fakeProvisioner();
+  const { provisioner, stopped, volumesRemoved } = fakeProvisioner(["inst-88"]);
   const reaper = new Reaper(reg, provisioner as never);
   await reaper.sweep(now);
   assert.deepEqual(stopped, [], "the attached tier does not bypass the pending guard");
@@ -196,7 +212,7 @@ function sweepAttachedWithEnv(env: Record<string, string>): string[] {
          registry.touch("inst-x", now - 30000);
          const stopped = [];
          const provisioner = {
-           listFleet: async () => [],
+           listFleet: async () => [{ name: "inst-x", containerId: "inst-x", state: "running", status: "up" }],
            stopContainer: async (n) => { stopped.push(n); },
            removeContainer: async () => {},
            removeInstanceVolume: async () => false,
@@ -231,7 +247,7 @@ test("reaping a disposable browser removes its instance volume with the containe
   const reg = new Registry();
   reg.touch("inst-18051", 0);
 
-  const { provisioner, removed, volumesRemoved, order } = fakeProvisioner();
+  const { provisioner, removed, volumesRemoved, order } = fakeProvisioner(["inst-18051"]);
   const reaper = new Reaper(reg, provisioner as never);
   await reaper.sweep(config.idleTtlMs + 1000);
 
@@ -250,7 +266,7 @@ test("reaping a named browser preserves its profile volume (golden/hermes/sticky
   const reg = new Registry();
   for (const name of ["golden", "hermes", "alice"]) reg.touch(name, 0);
 
-  const { provisioner, removed, volumesRemoved } = fakeProvisioner();
+  const { provisioner, removed, volumesRemoved } = fakeProvisioner(["golden", "hermes", "alice"]);
   const reaper = new Reaper(reg, provisioner as never);
   await reaper.sweep(config.idleTtlMs + 1000);
 
@@ -265,7 +281,7 @@ test("a mid-provision browser keeps its freshly-seeded volume (CHK-015)", async 
   // inside the create gate.
   reg.reserve("inst-99", 0);
 
-  const { provisioner, volumesRemoved } = fakeProvisioner();
+  const { provisioner, volumesRemoved } = fakeProvisioner(["inst-99"]);
   const reaper = new Reaper(reg, provisioner as never);
   await reaper.sweep(config.idleTtlMs + 5000);
   assert.deepEqual(volumesRemoved, [], "no volume removed while provisioning");
@@ -273,6 +289,46 @@ test("a mid-provision browser keeps its freshly-seeded volume (CHK-015)", async 
   reg.release("inst-99");
   await reaper.sweep(config.idleTtlMs * 2 + 5000);
   assert.deepEqual(volumesRemoved, ["inst-99"], "removed once the provision settled");
+});
+
+// --- Names with no container (issue #63) ------------------------------------
+// Lazy provisioning means an activity record no longer implies a fleet slot.
+// The reaper's job is to reclaim SLOTS, so a name holding none is not its
+// business — evicting one would cost a client its session and free nothing.
+
+test("a connected session that never browsed holds no slot and is not evicted", async () => {
+  const reg = new Registry();
+  const now = 8 * HOUR;
+  // Exactly the reported row: a Claude Code window attached for hours, its
+  // heartbeat fresh, zero browser work — but since #63, no container either.
+  reg.streamOpened("inst-idle-window", 0);
+  reg.touch("inst-idle-window", now - 30_000);
+
+  const { provisioner, stopped, removed, volumesRemoved } = fakeProvisioner([]);
+  await new Reaper(reg, provisioner as never).sweep(now);
+
+  assert.deepEqual(stopped, [], "nothing to reclaim — it owns no container");
+  assert.deepEqual(removed, []);
+  assert.deepEqual(volumesRemoved, [], "and no profile to discard");
+  assert.ok(reg.getActivity("inst-idle-window"), "its stream bookkeeping survives");
+});
+
+test("bookkeeping for a name with neither container nor session is dropped", async () => {
+  const reg = new Registry();
+  reg.touch("inst-gone", 0); // client disconnected without ever provisioning
+  const { provisioner } = fakeProvisioner([]);
+  await new Reaper(reg, provisioner as never).sweep(1000);
+  assert.equal(reg.getActivity("inst-gone"), undefined, "the activity map cannot grow forever");
+});
+
+test("an unreadable fleet falls back to reaping on the activity record alone", async () => {
+  const reg = new Registry();
+  reg.touch("inst-4", 0);
+  // A Docker hiccup must not silently suspend reaping — that is how fleets
+  // saturate. With the container list unknown, the TTL still applies.
+  const { provisioner, stopped } = fakeProvisioner([], { listFails: true });
+  await new Reaper(reg, provisioner as never).sweep(config.idleTtlMs + 1000);
+  assert.deepEqual(stopped, ["inst-4"], "reaping continues when Docker can't be listed");
 });
 
 test("orphan running containers are adopted, then reaped after the TTL", async () => {

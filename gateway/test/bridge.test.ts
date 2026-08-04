@@ -5,6 +5,7 @@ import {
   identifyRequiredMessage,
   augmentInstructions,
   isBrowserWork,
+  browserUnavailableMessage,
 } from "../src/bridge.js";
 import { Registry } from "../src/registry.js";
 
@@ -100,6 +101,23 @@ test("gating error names chikin_identify, the format, and an example", () => {
   assert.match(msg, /navigate_page/, "names the blocked tool");
   assert.match(msg, /1-32 chars/, "states the handle format");
   assert.match(msg, /"handle"/, "shows a worked example");
+});
+
+// --- lazy provisioning: the fleet-full error is now a TOOL error (issue #63) --
+// It used to be an HTTP 429 on the MCP handshake, which took the whole session
+// with it — and an MCP client fixes its tool registry at session start, so the
+// caller could not get the browser lane back even after a slot freed. Now one
+// call fails and the session is intact, so the message has to say so.
+
+test("the fleet-full tool error names the cause, the tool, and that the session survived", () => {
+  const msg = browserUnavailableMessage(
+    "navigate_page",
+    "FleetFullError: fleet is full (MAX_FLEET=8); reclaim an idle browser or raise the cap",
+  );
+  assert.match(msg, /navigate_page/, "names the tool that failed");
+  assert.match(msg, /fleet is full/, "and the real reason");
+  assert.match(msg, /still registered/, "tells the caller nothing was lost");
+  assert.match(msg, /[Rr]etry/, "and that retrying is the fix");
 });
 
 // --- layer 1: initialize instructions are augmented, upstream preserved ----

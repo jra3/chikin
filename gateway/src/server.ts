@@ -133,7 +133,10 @@ export function createApp(deps: ServerDeps): express.Express {
       return;
     }
 
-    // No session id: only a fresh initialize may start a browser.
+    // No session id: only a fresh initialize may open a session. Note that it
+    // opens a SESSION, not a browser — since issue #63 the container is
+    // provisioned lazily by the bridge, on the first frame that actually drives
+    // the browser. A client that connects and never browses holds no fleet slot.
     if (!isInitializeRequest(req.body)) {
       res
         .status(400)
@@ -164,6 +167,11 @@ export function createApp(deps: ServerDeps): express.Express {
       session = await createSession(name, deps);
     } catch (e) {
       deps.registry.release(name);
+      // Both branches are now near-unreachable: creating a session spawns a
+      // browser-less child and touches Docker not at all, so fleet-full and
+      // provisioning failures surface on the first browser tool call instead,
+      // as a retryable TOOL error that leaves the session intact (issue #63).
+      // Kept as the honest mapping if a future change ever provisions here.
       if (e instanceof FleetFullError) {
         res.status(429).json(rpcError(RPC.FLEET_FULL, e.message));
       } else {
