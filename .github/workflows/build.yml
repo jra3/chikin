@@ -56,9 +56,13 @@ jobs:
           cache-from: type=gha,scope=gateway-${{ matrix.short }}
           cache-to: type=gha,mode=max,scope=gateway-${{ matrix.short }}
 
+      # 22 to match the gateway runtime image (node:22-bookworm-slim), and
+      # because the gateway suite is run with `node --test "dist/test/*.test.js"`:
+      # glob expansion for --test only arrived in Node 21, so on 20 the pattern
+      # is taken literally and the step fails before running a single test.
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Unit tests (verify)
         working-directory: verify

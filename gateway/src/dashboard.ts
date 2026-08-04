@@ -168,20 +168,38 @@ export async function renderDashboard(
 
   // Live sessions with no container of their own (issue #63) listed after the
   // real browsers, so "8 clients connected, 2 slots used" reads off the page.
+  // Only derivable when the fleet listing SUCCEEDED: if Docker could not be
+  // reached, `members` is empty for a reason that has nothing to do with what
+  // the fleet holds, and every live session would be presented — precisely, and
+  // wrongly — as holding no slot. Unknown must read as unknown.
   const held = new Set(members.map((m) => m.name));
-  const browserless = registry
-    .all()
-    .map((s) => s.name)
-    .filter((n) => !held.has(n))
-    .sort();
+  const browserless = err
+    ? []
+    : registry
+        .all()
+        .map((s) => s.name)
+        .filter((n) => !held.has(n))
+        .sort();
 
+  const emptyRow = err
+    ? `<tr><td colspan="10" class="empty">Fleet state unknown — the fleet could not be listed (see the error above). Nothing here is a statement about what is running.</td></tr>`
+    : `<tr><td colspan="10" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> and make a browser tool call to spin one up.</td></tr>`;
   const rows =
     members.length || browserless.length
       ? [
           ...members.map((m) => row(m, registry, now, sandbox.get(m.name) ?? "unknown")),
           ...browserless.map((n) => browserlessRow(n, registry, now)),
         ].join("\n")
-      : `<tr><td colspan="10" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> and make a browser tool call to spin one up.</td></tr>`;
+      : emptyRow;
+
+  // Slot accounting is only honest on a fleet we could actually read.
+  const slotLine = err
+    ? `<p class="meta">fleet slots in use: <strong>unknown</strong> — the fleet could not be listed, so neither the count nor which sessions hold a slot can be reported</p>`
+    : `<p class="meta">fleet slots in use: <strong>${members.length}/${config.maxFleet}</strong>${
+        browserless.length
+          ? ` · ${browserless.length} connected session${browserless.length === 1 ? "" : "s"} holding no slot (no browser tool call yet — issue #63)`
+          : ""
+      }</p>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -231,11 +249,7 @@ ${rows}
     </tbody>
   </table>
   ${configPanel()}
-  <p class="meta">fleet slots in use: <strong>${members.length}/${config.maxFleet}</strong>${
-    browserless.length
-      ? ` · ${browserless.length} connected session${browserless.length === 1 ? "" : "s"} holding no slot (no browser tool call yet — issue #63)`
-      : ""
-  }</p>
+  ${slotLine}
   <p class="meta">MAX_FLEET=${config.maxFleet} · idle reap after ${Math.round(
     config.idleTtlMs / 1000,
   )}s with no attached client${

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type Server } from "node:http";
@@ -27,8 +27,11 @@ import type { AddressInfo } from "node:net";
 // A stand-in for chrome-devtools-mcp: newline-delimited JSON-RPC over stdio,
 // dependency-free so it runs from a temp dir. It ECHOES the --browserUrl it was
 // launched with, which is what lets the assertions below tell a BROWSER-LESS
-// child apart from one bound to a real container.
+// child apart from one bound to a real container. It also records its pid, so a
+// child the gateway forgot to close is detectable as a still-live process.
 const FAKE_CDM = `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+appendFileSync("__PIDFILE__", process.pid + "\\n");
 const i = process.argv.indexOf("--browserUrl");
 const browserUrl = i >= 0 ? process.argv[i + 1] : "(none)";
 let buf = "";
@@ -69,8 +72,36 @@ const port = await new Promise<number>((resolve) => {
   });
 });
 
-const fakeCdm = join(mkdtempSync(join(tmpdir(), "chikin-lazy-")), "fake-cdm.mjs");
-writeFileSync(fakeCdm, FAKE_CDM, { mode: 0o755 });
+const tmp = mkdtempSync(join(tmpdir(), "chikin-lazy-"));
+const fakeCdm = join(tmp, "fake-cdm.mjs");
+// The pidfile path is baked into the script rather than passed as an env var:
+// StdioClientTransport spawns children with a curated default environment, so
+// nothing the test sets in `process.env` would reach them.
+const pidFile = join(tmp, "children.pids");
+writeFileSync(fakeCdm, FAKE_CDM.replace("__PIDFILE__", pidFile), { mode: 0o755 });
+
+const spawnedPids = (): number[] =>
+  existsSync(pidFile)
+    ? readFileSync(pidFile, "utf8").split("\n").filter(Boolean).map(Number)
+    : [];
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+/** Poll until every pid is gone; returns whatever is still alive at the deadline. */
+async function stillAlive(pids: number[], ms = 5000): Promise<number[]> {
+  const deadline = Date.now() + ms;
+  let alive = pids.filter(isAlive);
+  while (alive.length && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+    alive = alive.filter(isAlive);
+  }
+  return alive;
+}
 
 process.env.PORT = String(port);
 process.env.CDM_COMMAND = fakeCdm;
@@ -88,9 +119,18 @@ const BROWSER_IP = "10.99.0.7";
 
 /** Docker, stubbed. `ensured` counts every container the gateway asks for. */
 function stubProvisioner() {
-  const state = { ensured: [] as string[], fail: null as Error | null };
+  const state = {
+    ensured: [] as string[],
+    fail: null as Error | null,
+    // Hold a provision open, the way a cold container does for tens of seconds,
+    // and announce that one has started. Lets a test act inside that window.
+    hold: null as Promise<void> | null,
+    onEnter: () => {},
+  };
   const provisioner = {
     ensureContainer: async (name: string) => {
+      state.onEnter();
+      if (state.hold) await state.hold;
       if (state.fail) throw state.fail;
       state.ensured.push(name);
       return BROWSER_IP;
@@ -219,6 +259,51 @@ test("a full fleet fails one tool call, not the whole session (issue #63 impact)
   } finally {
     state.fail = null;
     await close();
+  }
+});
+
+// The attach path spawns a child AFTER an await that can run for tens of
+// seconds, which is long enough for the client to vanish. `Session.close` runs
+// its teardown against whatever child is current at that moment — the
+// browser-less one — so a child spawned afterwards is owned by nobody and
+// survives, holding a CDP connection, until the gateway restarts.
+test("a client that disconnects mid-provision leaves no orphaned child process", { timeout: 30_000 }, async () => {
+  state.ensured.length = 0;
+  const before = spawnedPids().length;
+  let release!: () => void;
+  state.hold = new Promise<void>((r) => (release = r));
+  const provisionStarted = new Promise<void>((r) => (state.onEnter = r));
+
+  try {
+    const { client, close } = await connect("inst-vanish");
+    await client.callTool({ name: "chikin_identify", arguments: { handle: "vanish-test" } });
+    // Fire the browser call and DON'T wait for it: the client goes away while
+    // the provision it triggered is still in flight.
+    void client.callTool({ name: "list_pages", arguments: {} }).catch(() => {});
+    await provisionStarted;
+    await close();
+    // `remove` runs from Session.close, which sets isClosed first — so this is
+    // the barrier proving the session really was closed before the provision
+    // returns, rather than a sleep hoping it was.
+    while (registry.getByName("inst-vanish")) await new Promise((r) => setTimeout(r, 20));
+    release();
+    // Let the resumed attach do whatever it is going to do.
+    await new Promise((r) => setTimeout(r, 300));
+
+    const leaked = await stillAlive(spawnedPids().slice(before));
+    // Reap before asserting: a leaked child holds this test process's event loop
+    // open, so a regression would hang the run instead of failing it.
+    for (const pid of leaked) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* raced us to it */
+      }
+    }
+    assert.deepEqual(leaked, [], "every child spawned for this session must be closed with it");
+  } finally {
+    state.hold = null;
+    state.onEnter = () => {};
   }
 });
 

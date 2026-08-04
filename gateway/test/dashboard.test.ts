@@ -71,6 +71,30 @@ test("connected sessions holding no fleet slot are listed, and the count is expl
   );
 });
 
+// Slot accounting is derived from the fleet listing, so a Docker outage used to
+// turn "we cannot see the fleet" into a confident `0/8` with every live session
+// rendered as holding no slot — the most wrong the page can be, stated in the
+// most precise-looking way, exactly when an operator is debugging a saturated
+// fleet.
+test("a fleet listing failure reads as unknown, not as an empty fleet", async () => {
+  const reg = new Registry();
+  reg.add({ name: "inst-working", handle: undefined } as never);
+  reg.streamOpened("inst-working");
+  const broken = {
+    listFleet: async () => {
+      throw new Error("connect ENOENT /var/run/docker.sock");
+    },
+    sandboxStatus: async () => "unknown" as const,
+  };
+
+  const html = await renderDashboard(broken as never, reg);
+
+  assert.match(html, /Could not list fleet/, "the error banner is still shown");
+  assert.match(html, /slots in use: <strong>unknown/, "the slot count is not a confident 0/N");
+  assert.ok(!/holds no fleet slot/.test(html), "no session is claimed to hold no slot");
+  assert.ok(!/No browsers provisioned yet/.test(html), "and the empty state is not asserted either");
+});
+
 test("the runtime-config panel surfaces the attached TTL knob", async () => {
   const html = await renderDashboard(fakeProvisioner([]) as never, new Registry());
   assert.match(html, /ATTACHED_IDLE_TTL_SEC/, "the knob an operator retunes is readable");

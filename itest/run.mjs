@@ -173,35 +173,52 @@ try {
   );
 
   console.log("== Fleet cap (MAX_FLEET) ==");
-  // alice + bob hold browsers. Fill whatever the running gateway's cap leaves,
-  // so this works at any MAX_FLEET rather than assuming the itest's 3.
+  // alice + bob hold browsers; fill the cap from there. Bounded to MAX_FILL
+  // deliberately: every filler is a REAL Chrome container (BROWSER_MEMORY_MB
+  // each) and they outlive this run until the idle reaper sweeps, so filling a
+  // default MAX_FLEET=8 asks the host for ~24 GB. Run the gateway with a small
+  // MAX_FLEET to exercise this section — see itest/README.md.
+  const MAX_FILL = 3;
   const cap = (await (await fetch(`${BASE}/healthz`)).json()).config.maxFleet;
-  for (let i = await slotsInUse(); i < cap; i++) {
+  const fillTo = Math.min(cap, MAX_FILL);
+  for (let i = await slotsInUse(); i < fillTo; i++) {
     const filler = await connect(`filler${i}`);
     sessions.push(filler);
     await identify(filler.client, `filler${i}-itest`);
     await filler.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
   }
-  check("fleet filled to the cap", (await slotsInUse()) === cap, `slots=${await slotsInUse()} cap=${cap}`);
 
-  // Past the cap the SESSION still opens and keeps every tool registered — only
-  // the browser call fails, retryably (issue #63). It used to be a 429 on the
-  // handshake, which cost the caller its browser lane for the whole session:
-  // an MCP client fixes its tool registry at session start, so freeing a slot
-  // afterwards could not give the tools back.
-  const dave = await connect("dave");
-  sessions.push(dave);
-  check("connect past MAX_FLEET still opens a session", dave.client.getServerVersion()?.name === "chrome_devtools");
-  const daveTools = await dave.client.listTools();
-  check("...with every browser tool still registered", daveTools.tools.length > 20, `got ${daveTools.tools.length}`);
-  await identify(dave.client, "dave-itest");
-  const capped = await dave.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
-  check(
-    "browser tool past MAX_FLEET -> retryable tool error naming the cap",
-    capped.isError === true && /fleet is full/.test(textOf(capped)),
-    JSON.stringify(capped).slice(0, 160),
-  );
-  check("...and the fleet was not overshot", (await slotsInUse()) === cap, `slots=${await slotsInUse()}`);
+  if (cap > fillTo) {
+    // The fleet is NOT full, so every assertion below would pass or fail for a
+    // reason that has nothing to do with the cap. Skipping loudly beats a silent
+    // green tick on a check that never checked anything.
+    console.log(
+      `  SKIP  fleet cap: MAX_FLEET=${cap} but this test provisions at most ${fillTo} browsers, ` +
+        `so the fleet is not full and the past-the-cap behaviour cannot be exercised. ` +
+        `Re-run the gateway with MAX_FLEET=${fillTo} (or lower) to cover it.`,
+    );
+  } else {
+    check("fleet filled to the cap", (await slotsInUse()) === cap, `slots=${await slotsInUse()} cap=${cap}`);
+
+    // Past the cap the SESSION still opens and keeps every tool registered — only
+    // the browser call fails, retryably (issue #63). It used to be a 429 on the
+    // handshake, which cost the caller its browser lane for the whole session:
+    // an MCP client fixes its tool registry at session start, so freeing a slot
+    // afterwards could not give the tools back.
+    const dave = await connect("dave");
+    sessions.push(dave);
+    check("connect past MAX_FLEET still opens a session", dave.client.getServerVersion()?.name === "chrome_devtools");
+    const daveTools = await dave.client.listTools();
+    check("...with every browser tool still registered", daveTools.tools.length > 20, `got ${daveTools.tools.length}`);
+    await identify(dave.client, "dave-itest");
+    const capped = await dave.client.callTool({ name: "new_page", arguments: { url: "https://example.com/" } });
+    check(
+      "browser tool past MAX_FLEET -> retryable tool error naming the cap",
+      capped.isError === true && /fleet is full/.test(textOf(capped)),
+      JSON.stringify(capped).slice(0, 160),
+    );
+    check("...and the fleet was not overshot", (await slotsInUse()) === cap, `slots=${await slotsInUse()}`);
+  }
 
   console.log("== Dashboard ==");
   const dash = await fetch(`${BASE}/`);

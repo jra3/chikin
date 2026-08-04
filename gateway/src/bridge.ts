@@ -324,13 +324,24 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // container over a transient proxy error (or recreate-looping a slow cold
   // boot) would be worse than the failure itself.
   async function provision(): Promise<string> {
+    // Declare the provision so the reaper can see it (CHK-015). `registry.reserve`
+    // no longer implies this: since issue #63 the container is created on the
+    // first browser tool call, long after the name stopped being pending, so
+    // without this mark a sweep landing mid-provision could remove the profile
+    // volume between the moment it is seeded and the moment the container mounts
+    // it — silently handing out a blank profile instead of a golden clone.
+    deps.registry.markProvisioning(name);
     try {
-      return await deps.provisioner.ensureContainer(name, { canRotateImage });
-    } catch (e) {
-      if (!(e instanceof ProvisionError)) throw e;
-      log.warn(`session[${name}]: container unhealthy, recreating`, String(e));
-      await deps.provisioner.recreateContainer(name);
-      return await deps.provisioner.ensureContainer(name, { canRotateImage });
+      try {
+        return await deps.provisioner.ensureContainer(name, { canRotateImage });
+      } catch (e) {
+        if (!(e instanceof ProvisionError)) throw e;
+        log.warn(`session[${name}]: container unhealthy, recreating`, String(e));
+        await deps.provisioner.recreateContainer(name);
+        return await deps.provisioner.ensureContainer(name, { canRotateImage });
+      }
+    } finally {
+      deps.registry.clearProvisioning(name);
     }
   }
 
@@ -522,21 +533,45 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   async function attachBrowser(): Promise<void> {
     const ip = await provision();
 
+    // A cold provision blocks for tens of seconds, and the session can end or
+    // another child swap can begin inside that window — so re-establish both
+    // preconditions before touching any child state, exactly as respawnChild
+    // and handleReset do at their own spawn sites:
+    //  - the client may have disconnected, in which case `Session.close` has
+    //    already closed the BROWSER-LESS child. A child spawned after that
+    //    belongs to nobody and would outlive the session holding a CDP
+    //    connection open until the gateway restarts.
+    //  - the browser-less child may have died and `respawnChild` may be part
+    //    way through installing its replacement. Two swaps interleaving their
+    //    `childGen` bumps orphan one of them: the pump then drops every reply
+    //    from the live child (client requests hang instead of failing) and the
+    //    loser's retry reinstalls a browser-less child over the browser we just
+    //    provisioned, stranding its container. Waiting the other swap out keeps
+    //    the invariant every other site assumes — at most one swap at a time.
+    if (session.isClosed) return;
+    while (respawning) await sleep(250);
+    if (session.isClosed) return;
+
     // Swap the child. `respawning` carries its established meaning here — "the
     // child is being replaced" — so the pump fails concurrent frames retryably
     // instead of sending them into a child that is going away.
     respawning = true;
     const old = child;
     const gen = ++childGen; // orphans `old`: its onmessage/onclose go quiet
+    // Non-null while nothing else owns the new child yet, so the `finally` below
+    // is what closes it if the swap fails or the session went away mid-swap.
+    let spawned: StdioClientTransport | null = null;
     try {
       failAllInflight("chikin browser attaching; retry the request");
       pendingNavs.clear();
       toolsListIds.clear();
       navStrikes = 0;
-      const c = await startChild(gen, ip);
-      await replayInitialize(c, gen);
-      child = c;
+      spawned = await startChild(gen, ip);
+      await replayInitialize(spawned, gen);
       respawning = false;
+      if (session.isClosed) return;
+      child = spawned;
+      spawned = null;
       log.info(`session[${name}]: browser attached at ${ip} (child gen ${gen})`);
     } catch (e) {
       // The container is up but the child swap failed. `currentIp` is set, so
@@ -547,10 +582,12 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       void respawnChild("browser attach failed");
       throw e;
     } finally {
-      try {
-        await old?.close();
-      } catch {
-        /* already gone */
+      for (const c of [old, spawned]) {
+        try {
+          await c?.close();
+        } catch {
+          /* already gone */
+        }
       }
     }
   }
