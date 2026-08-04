@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type Server } from "node:http";
@@ -29,11 +29,34 @@ import type { AddressInfo } from "node:net";
 // launched with, which is what lets the assertions below tell a BROWSER-LESS
 // child apart from one bound to a real container. It also records its pid, so a
 // child the gateway forgot to close is detectable as a still-live process.
+// It also stalls its `initialize` reply for as long as a hold file exists, which
+// is how a test freezes the gateway inside `replayInitialize` — the window where
+// a child has been spawned but nothing owns it yet.
 const FAKE_CDM = `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 appendFileSync("__PIDFILE__", process.pid + "\\n");
+const HOLD_FILE = "__HOLDFILE__";
 const i = process.argv.indexOf("--browserUrl");
 const browserUrl = i >= 0 ? process.argv[i + 1] : "(none)";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function handle(m) {
+  const reply = (result) =>
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");
+  if (m.method === "initialize") {
+    while (existsSync(HOLD_FILE)) await sleep(20);
+    reply({
+      protocolVersion: m.params.protocolVersion,
+      capabilities: { tools: {} },
+      serverInfo: { name: "chrome_devtools", version: "0.0.0" },
+      instructions: "UPSTREAM DOC",
+    });
+  } else if (m.method === "tools/list")
+    reply({ tools: [{ name: "list_pages", description: "fake", inputSchema: { type: "object" } }] });
+  else if (m.method === "tools/call")
+    reply({ content: [{ type: "text", text: "browserUrl=" + browserUrl }] });
+  else reply({});
+}
+let queue = Promise.resolve();
 let buf = "";
 process.stdin.on("data", (d) => {
   buf += d;
@@ -44,20 +67,7 @@ process.stdin.on("data", (d) => {
     if (!line) continue;
     const m = JSON.parse(line);
     if (m.id === undefined) continue; // notification
-    const reply = (result) =>
-      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");
-    if (m.method === "initialize")
-      reply({
-        protocolVersion: m.params.protocolVersion,
-        capabilities: { tools: {} },
-        serverInfo: { name: "chrome_devtools", version: "0.0.0" },
-        instructions: "UPSTREAM DOC",
-      });
-    else if (m.method === "tools/list")
-      reply({ tools: [{ name: "list_pages", description: "fake", inputSchema: { type: "object" } }] });
-    else if (m.method === "tools/call")
-      reply({ content: [{ type: "text", text: "browserUrl=" + browserUrl }] });
-    else reply({});
+    queue = queue.then(() => handle(m));
   }
 });
 `;
@@ -78,7 +88,12 @@ const fakeCdm = join(tmp, "fake-cdm.mjs");
 // StdioClientTransport spawns children with a curated default environment, so
 // nothing the test sets in `process.env` would reach them.
 const pidFile = join(tmp, "children.pids");
-writeFileSync(fakeCdm, FAKE_CDM.replace("__PIDFILE__", pidFile), { mode: 0o755 });
+const holdFile = join(tmp, "hold-initialize");
+writeFileSync(
+  fakeCdm,
+  FAKE_CDM.replace("__PIDFILE__", pidFile).replace("__HOLDFILE__", holdFile),
+  { mode: 0o755 },
+);
 
 const spawnedPids = (): number[] =>
   existsSync(pidFile)
@@ -304,6 +319,47 @@ test("a client that disconnects mid-provision leaves no orphaned child process",
   } finally {
     state.hold = null;
     state.onEnter = () => {};
+  }
+});
+
+// The narrower window: the provision SUCCEEDED and the browser-bound child is
+// already running when the client vanishes, so the child exists but nothing owns
+// it yet — `Session.close` ran against the browser-less one and the attach never
+// reaches the assignment that would hand it over. Freezing the child's replayed
+// `initialize` is what holds the gateway inside that window on demand.
+test("a client that disconnects after the browser child is up leaves no orphan", { timeout: 30_000 }, async () => {
+  state.ensured.length = 0;
+  const before = spawnedPids().length;
+  try {
+    const { client, close } = await connect("inst-vanish-late");
+    await client.callTool({ name: "chikin_identify", arguments: { handle: "vanish-late" } });
+    const handshakeChildren = spawnedPids().length;
+
+    writeFileSync(holdFile, "");
+    void client.callTool({ name: "list_pages", arguments: {} }).catch(() => {});
+    // The browser-bound child has started (and is now stuck on the hold file).
+    while (spawnedPids().length === handshakeChildren) await new Promise((r) => setTimeout(r, 20));
+    await close();
+    while (registry.getByName("inst-vanish-late")) await new Promise((r) => setTimeout(r, 20));
+    rmSync(holdFile, { force: true });
+    await new Promise((r) => setTimeout(r, 300));
+
+    const spawned = spawnedPids().slice(before);
+    assert.ok(
+      spawned.length >= 2,
+      `the browser-bound child must actually have been spawned (got ${spawned.length})`,
+    );
+    const leaked = await stillAlive(spawned);
+    for (const pid of leaked) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* raced us to it */
+      }
+    }
+    assert.deepEqual(leaked, [], "the browser-bound child must be closed with the session too");
+  } finally {
+    rmSync(holdFile, { force: true });
   }
 });
 

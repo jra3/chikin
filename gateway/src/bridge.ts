@@ -481,41 +481,50 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   async function respawnChild(why: string): Promise<void> {
     if (session?.isClosed || respawning) return;
     respawning = true;
-    log.warn(`session[${name}]: child gone (${why}); respawning`);
-    failAllInflight(`chikin browser restarted (${why}); retry the request`);
-    // Those requests got error replies; nothing left to verify or decorate.
-    pendingNavs.clear();
-    toolsListIds.clear();
-    navStrikes = 0;
     try {
-      await child?.close();
-    } catch {
-      /* already gone */
-    }
-    // Rebuild the child in whatever state this session is currently in: a
-    // browser-less session (issue #63) respawns browser-less and must NOT
-    // provision a container just because its child died.
-    const wantBrowser = currentIp !== null;
-    for (let attempt = 1; attempt <= MAX_RESPAWN_ATTEMPTS; attempt++) {
-      if (session?.isClosed) return;
-      const gen = ++childGen;
+      log.warn(`session[${name}]: child gone (${why}); respawning`);
+      failAllInflight(`chikin browser restarted (${why}); retry the request`);
+      // Those requests got error replies; nothing left to verify or decorate.
+      pendingNavs.clear();
+      toolsListIds.clear();
+      navStrikes = 0;
       try {
-        const c = await startChild(gen, wantBrowser ? await provision() : null);
-        await replayInitialize(c, gen);
-        child = c;
-        respawning = false;
-        log.info(`session[${name}]: child respawned (gen ${gen})`);
-        return;
-      } catch (e) {
-        log.warn(`session[${name}]: respawn attempt ${attempt} failed`, String(e));
-        await sleep(Math.min(500 * attempt, 5000));
+        await child?.close();
+      } catch {
+        /* already gone */
       }
+      // Rebuild the child in whatever state this session is currently in: a
+      // browser-less session (issue #63) respawns browser-less and must NOT
+      // provision a container just because its child died.
+      const wantBrowser = currentIp !== null;
+      for (let attempt = 1; attempt <= MAX_RESPAWN_ATTEMPTS; attempt++) {
+        if (session?.isClosed) return;
+        const gen = ++childGen;
+        let spawned: StdioClientTransport | null = null;
+        try {
+          spawned = await startChild(gen, wantBrowser ? await provision() : null);
+          await replayInitialize(spawned, gen);
+          child = spawned;
+          spawned = null;
+          log.info(`session[${name}]: child respawned (gen ${gen})`);
+          return;
+        } catch (e) {
+          log.warn(`session[${name}]: respawn attempt ${attempt} failed`, String(e));
+          try {
+            await spawned?.close();
+          } catch {
+            /* already gone */
+          }
+          await sleep(Math.min(500 * attempt, 5000));
+        }
+      }
+      // Exhausted: fall back to dropping the session. The self-healing client
+      // bridge will then reconnect from scratch.
+      log.error(`session[${name}]: child respawn exhausted; closing session`);
+      await session.close("child respawn exhausted");
+    } finally {
+      respawning = false;
     }
-    // Exhausted: fall back to dropping the session. The self-healing client
-    // bridge will then reconnect from scratch.
-    respawning = false;
-    log.error(`session[${name}]: child respawn exhausted; closing session`);
-    await session.close("child respawn exhausted");
   }
 
   /**
@@ -549,7 +558,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     //    provisioned, stranding its container. Waiting the other swap out keeps
     //    the invariant every other site assumes — at most one swap at a time.
     if (session.isClosed) return;
-    while (respawning) await sleep(250);
+    while (respawning && !session.isClosed) await sleep(250);
     if (session.isClosed) return;
 
     // Swap the child. `respawning` carries its established meaning here — "the
@@ -609,7 +618,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // child; never tracked in inflight (respawnChild would fail it mid-reset).
   async function handleReset(id: string | number | undefined): Promise<void> {
     log.warn(`session[${name}]: chikin_reset requested by client`);
-    while (respawning) await sleep(250); // let any in-progress respawn settle first
+    while (respawning && !session?.isClosed) await sleep(250); // let any in-progress respawn settle first
     if (session?.isClosed) return;
     // Nothing exists to reset before the first browser tool call (issue #63) —
     // and provisioning one here would hand a fleet slot to a session that has
