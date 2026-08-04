@@ -304,6 +304,8 @@ To fix a drifted gateway, recreate it *from the repo dir* so compose reads `.env
 2. **`chikin_reset` tool** — injected into every `tools/list` (alongside `chikin_identify`, see [Identify your session first](#identify-your-session-first-chikin_identify--required)), so the model itself can hard-reset a wedged browser (container recreated, profile/logins preserved) without human help.
 3. **Self-healing transports** — both the client bridge and the gateway replay the cached `initialize` over a rebuilt link, so none of the above ever drops the client's MCP session.
 
+**SSE keepalive.** Node's `fetch` (undici) kills a response body that has been idle for 300s, and the MCP event stream is silent whenever a client sits between tool calls — so every long-lived session used to be torn down and rebuilt on a ~301s cycle. That was invisible except for one symptom: a reconnect frees the session's `chikin_identify` handle, so sessions kept losing their identity (and, with it, access to every browser tool until they re-identified) every five minutes. The gateway now writes a `: keepalive` SSE comment into open streams every 30s. It is protocol-invisible, and it covers POST replies too, so a tool call slower than 300s no longer dies mid-flight.
+
 Gateway responses use JSON-RPC error envelopes with these HTTP statuses: `401` (bad/missing token), `400` (invalid name or non-initialize without a session), `409` (a name already has an active session), `503` (session setup failed). A full fleet is no longer an HTTP status: since provisioning is lazy it surfaces on the offending tool call, as a retryable tool error.
 
 ---

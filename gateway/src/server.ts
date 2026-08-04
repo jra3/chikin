@@ -67,6 +67,69 @@ function hostMiddleware(req: Request, res: Response, next: NextFunction): void {
 }
 
 /**
+ * How often to poke an open SSE stream so it never goes silent. Must stay well
+ * under the shortest idle timeout any client (or intervening proxy) applies to
+ * a response body — see startSseKeepalive for why 300s is the number that
+ * matters. Deliberately a constant rather than an env knob: a knob would also
+ * need a line in docker-compose.yml to be settable at all, and there is no
+ * operational reason to tune this.
+ */
+const SSE_KEEPALIVE_MS = 30_000;
+
+/**
+ * Keep an open SSE response from going silent.
+ *
+ * Node's `fetch` (undici) enforces a 300_000 ms `bodyTimeout` on a response
+ * body. The standalone MCP event stream carries NOTHING while a client sits
+ * idle between tool calls, so undici tore it down at almost exactly five
+ * minutes with `UND_ERR_BODY_TIMEOUT` — which surfaces client-side as
+ * `TypeError: terminated`. The client then reconnected and re-initialized, and
+ * the POST handler above reclaimed the now-streamless old session as stale,
+ * which FREES its chikin_identify handle (registry.remove). So every long-lived
+ * session silently lost its identity every five minutes and, since #54, its
+ * access to every browser tool until it happened to re-identify — which is why
+ * a fleet of hours-old browsers all showed `handle: —`. It was long read as
+ * flaky-network SSE drops; it was never flaky, it was this clock, ticking on a
+ * measured 301s period.
+ *
+ * A bare SSE comment resets that timer and is invisible to the protocol: the
+ * SDK parses with eventsource-parser, which drops `:`-prefixed lines. We only
+ * ever write BETWEEN the SDK's own writes (each emits a whole event), so a
+ * keepalive can never land inside one.
+ *
+ * SSE-ness is asserted by the CALLER, not sniffed. `res.getHeader()` CANNOT see
+ * a content type the MCP SDK passes straight to `res.writeHead(200, {...})` —
+ * it returns undefined, and `getHeaders()` returns `{}` — so an earlier version
+ * of this guard silently disabled the whole keepalive (verified live: 75s on a
+ * real stream, zero comments written). The content-type check below therefore
+ * fails OPEN on an unreadable header and only fails closed on one that is
+ * readable and definitively not an event stream.
+ *
+ * Both call sites are event streams by construction: the MCP GET stream always
+ * is, and POST replies are SSE unless the transport is built with
+ * `enableJsonResponse`, which this gateway never sets. As a second line of
+ * defence the timer only ever fires on a response still open `everyMs` later,
+ * which a plain JSON reply never is.
+ *
+ * Fixed here rather than in our own client so it protects EVERY MCP client that
+ * connects to this gateway, not just the bundled bridge.
+ */
+export function startSseKeepalive(res: Response, everyMs: number = SSE_KEEPALIVE_MS): () => void {
+  const timer = setInterval(() => {
+    if (!res.headersSent || res.writableEnded || !res.writable) return;
+    const ct = res.getHeader("content-type");
+    if (ct !== undefined && !String(ct).includes("text/event-stream")) return;
+    try {
+      res.write(": keepalive\n\n");
+    } catch (e) {
+      log.debug(`sse keepalive write failed: ${String(e)}`);
+    }
+  }, everyMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+/**
  * Wrap an async route handler so a rejected promise is forwarded to Express's
  * error middleware instead of surfacing as an unhandledRejection — which, under
  * Node's default policy, crashes the single shared gateway and disconnects every
@@ -129,6 +192,12 @@ export function createApp(deps: ServerDeps): express.Express {
         res.status(404).json(rpcError(RPC.NOT_FOUND, "unknown or mismatched session"));
         return;
       }
+      // A POST reply is an SSE stream too (the SDK only sends plain JSON with
+      // enableJsonResponse), and it stays silent until the tool returns — so a
+      // tool call slower than the client's 300s body timeout died the same way
+      // the idle event stream did. Same keepalive, same reasoning.
+      const stopKeepalive = startSseKeepalive(res);
+      res.on("close", stopKeepalive);
       await session.http.handleRequest(req, res, req.body);
       return;
     }
@@ -201,7 +270,13 @@ export function createApp(deps: ServerDeps): express.Express {
     // stale (streamless) session on the next initialize (see the POST handler),
     // and idle containers are still reaped on the activity TTL.
     deps.registry.streamOpened(session.name);
-    res.on("close", () => deps.registry.streamClosed(session.name));
+    // This is THE stream the 300s body timeout was killing: it is silent for as
+    // long as the client sits between tool calls. See startSseKeepalive.
+    const stopKeepalive = startSseKeepalive(res);
+    res.on("close", () => {
+      stopKeepalive();
+      deps.registry.streamClosed(session.name);
+    });
     await session.http.handleRequest(req, res);
   }));
 

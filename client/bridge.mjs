@@ -8,7 +8,7 @@
 //
 // RESILIENCE (issue: a transient SSE drop must not kill the MCP server). The
 // MCP *session* (the client's one-time `initialize` handshake) lives in the
-// client and is never repeated. So when the gateway link breaks — a flaky SSE
+// client and is never repeated. So when the gateway link breaks — a dropped SSE
 // stream (`TypeError: terminated`), or the gateway tearing the session down
 // because its browser/child died — we MUST NOT exit the process: Claude Code
 // does not restart a stdio MCP server mid-session, so exiting deregisters every
@@ -26,6 +26,16 @@
 // Claude Code sits idle between tool calls far longer than that, so we send a
 // periodic `ping` to refresh the gateway-side activity clock. A failed ping is
 // just another reconnect trigger. Ping replies are swallowed.
+//
+// NOTE: the ping is a separate POST — it does NOT put any bytes on the event
+// stream, so it never protected that stream from going silent. Node's fetch
+// (undici) kills a response body idle for 300s (`UND_ERR_BODY_TIMEOUT`, seen
+// here as `TypeError: terminated`), which used to reconnect every session on a
+// 301s period and, because a reconnect frees the session's chikin_identify
+// handle, silently cost it every browser tool until it re-identified. That is
+// fixed on the GATEWAY, which now writes an SSE keepalive comment into open
+// streams (startSseKeepalive in gateway/src/server.ts) — not here, so it
+// protects every MCP client rather than just this bridge.
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { readFileSync, unlinkSync, writeFileSync, mkdirSync, lstatSync } from "node:fs";
