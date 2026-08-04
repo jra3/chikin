@@ -40,8 +40,11 @@ import type { FleetMember, Provisioner } from "./provisioner.js";
  *
  * Since issue #63 the map also holds names with NO container: a session
  * provisions its browser lazily, on its first browser tool call. Those hold no
- * fleet slot, so there is nothing for this to reclaim and it skips them — the
- * whole point of lazy provisioning is that they cost nothing to leave alone.
+ * fleet slot, so they are never torn down here — the whole point of lazy
+ * provisioning is that they cost nothing to leave alone. Once such a name is
+ * finished with (no session, no stream, past the idle TTL) its disposable
+ * profile volume is still collected, so a container that disappeared
+ * out-of-band cannot leak one (issue #58).
  */
 export class Reaper {
   private timer: NodeJS.Timeout | undefined;
@@ -102,11 +105,37 @@ export class Reaper {
       // Since issue #63 an activity record no longer implies a fleet slot: a
       // session provisions its browser lazily, on its first browser tool call,
       // so a connected-but-never-used session is tracked here while owning no
-      // container. There is nothing to reclaim from it — evicting it would cost
-      // the client a reconnect and free nothing — so leave it alone, and drop
-      // the bookkeeping once nothing is using it either.
+      // container. There is no SLOT to reclaim from it — evicting it would cost
+      // the client a reconnect and free nothing — so it is never torn down here.
+      //
+      // Its disposable PROFILE VOLUME is another matter (issue #58): a name
+      // whose container vanished out-of-band leaves ~200 MB behind, and before
+      // lazy provisioning the reclaim path below collected it. So the record is
+      // kept until it satisfies every condition the reclaim path would have
+      // demanded — no live session, no open stream, and past the detached idle
+      // TTL — and only then is the volume dropped along with the bookkeeping. A
+      // live session is spared because it may be mid-attach and about to mount
+      // that very volume; the TTL is what stops a just-started session from
+      // being raced. `isPending` re-checks the same thing inside the create gate.
       if (containers && !containers.has(name)) {
-        if (!this.registry.getByName(name) && a.streams === 0) this.registry.dropActivity(name);
+        if (this.registry.getByName(name) || a.streams > 0) continue;
+        if (now - a.last <= config.idleTtlMs) continue;
+        try {
+          const discarded = await this.provisioner.removeInstanceVolume(
+            name,
+            () => !this.registry.isPending(name),
+          );
+          if (discarded) {
+            log.info(
+              `reaper: discarded orphaned profile volume for ${name} — it has no container and no ` +
+                `session, and has been idle ${Math.round((now - a.last) / 1000)}s`,
+            );
+          }
+          this.registry.dropActivity(name);
+        } catch (e) {
+          // Leave the record in place so the next sweep retries the reclaim.
+          log.warn(`reaper: failed to reclaim ${name}'s orphaned profile volume`, String(e));
+        }
         continue;
       }
 

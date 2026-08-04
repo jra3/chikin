@@ -136,6 +136,7 @@ const BROWSER_IP = "10.99.0.7";
 function stubProvisioner() {
   const state = {
     ensured: [] as string[],
+    recreated: [] as string[],
     fail: null as Error | null,
     // Hold a provision open, the way a cold container does for tens of seconds,
     // and announce that one has started. Lets a test act inside that window.
@@ -150,7 +151,9 @@ function stubProvisioner() {
       state.ensured.push(name);
       return BROWSER_IP;
     },
-    recreateContainer: async () => {},
+    recreateContainer: async (name: string) => {
+      state.recreated.push(name);
+    },
     listFleet: async () => [],
   };
   return { provisioner, state };
@@ -365,13 +368,88 @@ test("a client that disconnects after the browser child is up leaves no orphan",
 
 test("chikin_reset on a browser-less session is a no-op, not a provision", async () => {
   state.ensured.length = 0;
+  state.recreated.length = 0;
   const { client, close } = await connect("inst-reset");
   try {
     const r = await client.callTool({ name: "chikin_reset", arguments: {} });
     assert.notEqual(r.isError, true, textOf(r));
     assert.match(textOf(r), /nothing to reset/i);
     assert.deepEqual(state.ensured, [], "resetting a browser that doesn't exist must not create one");
+    assert.deepEqual(state.recreated, [], "and nothing to recreate either");
   } finally {
+    await close();
+  }
+});
+
+// The one state where "nothing to reset" is a lie: a cold provision runs for
+// tens of seconds, which is exactly when an impatient model reaches for the
+// reset tool. It used to be told everything was fine (isError false) while a
+// container was actively being built for it.
+test("chikin_reset mid-provision reports the attach instead of 'nothing to reset'", { timeout: 30_000 }, async () => {
+  state.ensured.length = 0;
+  state.recreated.length = 0;
+  let release!: () => void;
+  state.hold = new Promise<void>((r) => (release = r));
+  const provisionStarted = new Promise<void>((r) => (state.onEnter = r));
+  const { client, close } = await connect("inst-reset-race");
+  try {
+    await client.callTool({ name: "chikin_identify", arguments: { handle: "reset-race" } });
+    const first = client.callTool({ name: "list_pages", arguments: {} });
+    await provisionStarted;
+
+    const r = await client.callTool({ name: "chikin_reset", arguments: {} });
+    assert.equal(r.isError, true, "a reset that did not happen must not report success");
+    assert.doesNotMatch(textOf(r), /nothing to reset/i, "a browser is being built right now");
+    assert.match(textOf(r), /starting a browser/i, "so say that, and say to wait");
+    assert.deepEqual(state.recreated, [], "and it must not recreate a container mid-build");
+
+    release();
+    const ok = await first;
+    assert.notEqual(ok.isError, true, textOf(ok));
+    assert.deepEqual(state.ensured, ["inst-reset-race"], "the reset provisioned nothing of its own");
+  } finally {
+    release();
+    state.hold = null;
+    state.onEnter = () => {};
+    await close();
+  }
+});
+
+// The child-swap window. `provision()` has already returned and the
+// browser-bound child is starting, so the session's container IP is set while
+// no child is serving it yet. A browser call landing here used to skip the
+// attach path entirely (its gate read that IP) and fall into the respawn guard,
+// which hard-failed it with JSON-RPC -32001 — the exact class of failure lazy
+// provisioning exists to turn into "retry, nothing was lost".
+test("a browser call arriving during the child swap joins the attach", { timeout: 30_000 }, async () => {
+  state.ensured.length = 0;
+  const { client, close } = await connect("inst-swap");
+  try {
+    await client.callTool({ name: "chikin_identify", arguments: { handle: "swap-test" } });
+    const beforeSwap = spawnedPids().length;
+
+    // Freeze the gateway inside `replayInitialize`: the browser-bound child is
+    // up, the swap has not completed, and it stays that way until we say so.
+    writeFileSync(holdFile, "");
+    const first = client.callTool({ name: "list_pages", arguments: {} });
+    while (spawnedPids().length === beforeSwap) await new Promise((r) => setTimeout(r, 20));
+
+    const second = client.callTool({ name: "list_pages", arguments: {} });
+    await new Promise((r) => setTimeout(r, 200)); // the racer is now parked inside the gateway
+    rmSync(holdFile, { force: true });
+
+    // Neither may reject: a JSON-RPC error is what the racer used to get.
+    for (const r of await Promise.all([first, second])) {
+      assert.notEqual(r.isError, true, textOf(r));
+      assert.match(
+        textOf(r),
+        new RegExp(`browserUrl=http://${BROWSER_IP}:`),
+        "both ran against the REAL browser, in order, on the swapped-in child",
+      );
+    }
+    assert.deepEqual(state.ensured, ["inst-swap"], "one shared attach, not two provisions");
+  } finally {
+    rmSync(holdFile, { force: true });
     await close();
   }
 });

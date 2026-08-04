@@ -8,7 +8,7 @@ import { log } from "./log.js";
 import { isValidHandle, HANDLE_RULE } from "./names.js";
 import type { Registry } from "./registry.js";
 import type { Provisioner } from "./provisioner.js";
-import { ProvisionError } from "./provisioner.js";
+import { FleetFullError, ProvisionError } from "./provisioner.js";
 
 export interface BridgeDeps {
   provisioner: Provisioner;
@@ -177,22 +177,32 @@ export function isBrowserWork(
 
 /**
  * The tool error returned when a browser tool arrives but the browser cannot be
- * provisioned — almost always `FleetFullError` (issue #63).
+ * provisioned — usually `FleetFullError` (issue #63), but a Docker or
+ * socket-proxy failure lands here too and needs different advice: pointing the
+ * model at the dashboard's slot accounting explains nothing when no slot is the
+ * problem.
  *
  * Before lazy provisioning this was an HTTP 429 on the MCP handshake, which
  * killed the whole session: an MCP client fixes its tool registry at session
  * start, so the browser lane stayed unavailable for the rest of that session
  * even after a slot freed. Now the session is already up and every tool is
  * registered; only this one call failed, and the model can free a slot and
- * retry. So the message is written for the model: what happened, that the
- * session is intact, and what to do.
+ * retry. Both branches therefore say so — what happened, that the session is
+ * intact, and what to do.
  */
-export function browserUnavailableMessage(tool: string | undefined, reason: string): string {
+export function browserUnavailableMessage(tool: string | undefined, cause: unknown): string {
+  const guidance =
+    cause instanceof FleetFullError
+      ? "Retry the call once a slot frees; the chikin dashboard (the gateway's root URL) lists which browsers " +
+        "are holding them and how long each has been idle."
+      : "No fleet slot is missing — chikin failed to build the browser itself (Docker or the socket proxy). " +
+        "Retry the call; if it fails the same way again the gateway host needs attention, and its logs carry " +
+        "the underlying Docker error.";
   return (
-    `chikin could not start a browser for '${tool ?? "that tool"}': ${reason}. ` +
-    "This session is still connected and every browser tool is still registered — nothing has been lost. " +
-    "Retry the call once a slot frees; the chikin dashboard (the gateway's root URL) lists which browsers " +
-    "are holding them and how long each has been idle."
+    `chikin could not start a browser for '${tool ?? "that tool"}': ${String(cause)}. ` +
+    "This session is still connected and every browser tool is still registered — nothing has been lost, " +
+    "and the very same call works as soon as a browser can be started. " +
+    guidance
   );
 }
 
@@ -259,12 +269,17 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   const inflight = new Map<string | number, true>();
 
   // --- wedge-watchdog state ---
-  // Container IP of the live child's CDP, and the session's single source of
-  // truth for "is a browser attached?" (issue #63): null means the current child
-  // is browser-less and this session holds NO fleet slot.
+  // Container IP the CHILD is bound to (null = this child is browser-less, so
+  // the session holds no fleet slot — issue #63). It tracks the child, not the
+  // session's claim: `startChild` stamps it before the new child is spawned, so
+  // through the whole attach swap it names a browser no child is serving yet.
   let currentIp: string | null = null;
-  // In-flight `attachBrowser`, so concurrent first calls share one provision.
+  // In-flight `attachBrowser`, so concurrent first calls share one provision —
+  // and so a frame landing mid-swap joins that attach instead of racing it.
   let attaching: Promise<void> | null = null;
+  // "Can a browser frame go straight to the child?" — the question `currentIp`
+  // alone cannot answer, and the reason it must not be asked alone.
+  const browserReady = (): boolean => currentIp !== null && attaching === null;
   // nav request id -> what was asked for + the real page set before the nav
   const pendingNavs = new Map<string | number, { url?: string; before: string[] | null }>();
   let navStrikes = 0;
@@ -601,14 +616,19 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     }
   }
 
-  /** Attach the browser at most once, sharing one provision across racers. */
+  /**
+   * Attach the browser at most once, sharing one attach across racers. The
+   * in-flight attach is checked FIRST: from `startChild` onwards `currentIp` is
+   * set while the browser-bound child is still starting, and a racer that
+   * short-circuited on it there would be forwarded into a child that does not
+   * exist yet. Awaiting the shared promise also keeps racers in arrival order.
+   */
   function ensureBrowser(): Promise<void> {
+    if (attaching) return attaching;
     if (currentIp) return Promise.resolve();
-    if (!attaching) {
-      attaching = attachBrowser().finally(() => {
-        attaching = null;
-      });
-    }
+    attaching = attachBrowser().finally(() => {
+      attaching = null;
+    });
     return attaching;
   }
 
@@ -620,6 +640,22 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     log.warn(`session[${name}]: chikin_reset requested by client`);
     while (respawning && !session?.isClosed) await sleep(250); // let any in-progress respawn settle first
     if (session?.isClosed) return;
+    // A browser IS on its way — a cold provision blocks for tens of seconds,
+    // which is exactly when a model gets impatient and calls this. Saying
+    // "nothing to reset" here would be a lie about the one state where it
+    // matters, so answer with what is actually happening. Not awaited: the
+    // reset the caller asked for is a container recreate, and running one over
+    // a container that is still being built is worse than telling it to wait.
+    if (attaching) {
+      replyTool(
+        id,
+        "chikin is starting a browser for this session right now — your first browser tool call is still " +
+          "in flight. Nothing is wedged yet, so nothing was reset. Wait for that call to return, and use " +
+          "chikin_reset only if the browser it gives you is genuinely stuck.",
+        true,
+      );
+      return;
+    }
     // Nothing exists to reset before the first browser tool call (issue #63) —
     // and provisioning one here would hand a fleet slot to a session that has
     // not asked for a browser, which is the bug this laziness fixes.
@@ -756,7 +792,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     try {
       await ensureBrowser();
     } catch (e) {
-      replyTool(f.id, browserUnavailableMessage(f.params?.name, String(e)), true);
+      replyTool(f.id, browserUnavailableMessage(f.params?.name, e), true);
       return;
     }
     if (session.isClosed) return;
@@ -803,7 +839,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       // drives the browser — never on the handshake every MCP client sends at
       // startup. One definition of "browser work", used for both the clock and
       // the allocation, so the two can never disagree.
-      if (!currentIp) {
+      if (!browserReady()) {
         void attachThenForward(msg, f);
         return;
       }

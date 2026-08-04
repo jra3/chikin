@@ -317,8 +317,76 @@ test("bookkeeping for a name with neither container nor session is dropped", asy
   const reg = new Registry();
   reg.touch("inst-gone", 0); // client disconnected without ever provisioning
   const { provisioner } = fakeProvisioner([]);
-  await new Reaper(reg, provisioner as never).sweep(1000);
+  const reaper = new Reaper(reg, provisioner as never);
+
+  // Held while it is still fresh: the record is the only handle on a possible
+  // orphaned volume, so it cannot be thrown away before the TTL decides.
+  await reaper.sweep(1000);
+  assert.ok(reg.getActivity("inst-gone"), "not dropped while still within the TTL");
+
+  await reaper.sweep(config.idleTtlMs + 1000);
   assert.equal(reg.getActivity("inst-gone"), undefined, "the activity map cannot grow forever");
+});
+
+// A container that disappeared out-of-band (docker rm, host reboot, a failed
+// create) leaves its ~200 MB instance profile volume behind. That reclaim is
+// issue #58's fix and it still has to happen for a name holding no slot —
+// otherwise the volume leaks until the next gateway restart's startup sweep.
+
+test("an orphaned instance volume is still reclaimed when its container is gone", async () => {
+  const reg = new Registry();
+  reg.touch("inst-orphan", 0); // provisioned once; its container vanished
+
+  const { provisioner, stopped, removed, volumesRemoved } = fakeProvisioner([]);
+  await new Reaper(reg, provisioner as never).sweep(config.idleTtlMs + 1000);
+
+  assert.deepEqual(volumesRemoved, ["inst-orphan"], "the orphaned profile volume is collected");
+  assert.deepEqual(stopped, [], "there is no container to stop");
+  assert.deepEqual(removed, [], "and none to remove");
+  assert.equal(reg.getActivity("inst-orphan"), undefined, "bookkeeping goes with it");
+});
+
+test("a containerless name is spared while a session or stream still holds it", async () => {
+  const reg = new Registry();
+  const now = 8 * HOUR;
+  // Attached for hours with no browser work — the reported row. It may be
+  // mid-attach and about to mount that volume, so nothing is touched.
+  reg.streamOpened("inst-attached-lazy", 0);
+  reg.touch("inst-attached-lazy", 0);
+
+  const { provisioner, stopped, volumesRemoved } = fakeProvisioner([]);
+  await new Reaper(reg, provisioner as never).sweep(now);
+
+  assert.deepEqual(volumesRemoved, [], "a live client's profile is never pulled out from under it");
+  assert.deepEqual(stopped, [], "and it is not evicted — it holds no slot to reclaim");
+  assert.ok(reg.getActivity("inst-attached-lazy"), "its bookkeeping survives");
+});
+
+test("a containerless NAMED profile is never discarded (golden/hermes/sticky)", async () => {
+  const reg = new Registry();
+  for (const name of ["golden", "hermes", "alice"]) reg.touch(name, 0);
+
+  const { provisioner, volumesRemoved } = fakeProvisioner([]);
+  await new Reaper(reg, provisioner as never).sweep(config.idleTtlMs + 1000);
+
+  assert.deepEqual(volumesRemoved, [], "hand-authenticated logins are not disposable");
+});
+
+test("a containerless name mid-provision keeps its freshly-seeded volume (CHK-015)", async () => {
+  const reg = new Registry();
+  // The window lazy provisioning opened: the volume is seeded before the
+  // container exists, so a sweep landing here must not take it.
+  reg.reserve("inst-seeding", 0);
+
+  const { provisioner, volumesRemoved } = fakeProvisioner([]);
+  const reaper = new Reaper(reg, provisioner as never);
+  await reaper.sweep(config.idleTtlMs + 1000);
+  assert.deepEqual(volumesRemoved, [], "no volume removed while provisioning");
+  assert.ok(reg.getActivity("inst-seeding"), "and the record is kept for the retry");
+
+  reg.release("inst-seeding");
+  await reaper.sweep(config.idleTtlMs + 1000);
+  assert.deepEqual(volumesRemoved, ["inst-seeding"], "removed once the provision settled");
 });
 
 test("an unreadable fleet falls back to reaping on the activity record alone", async () => {
