@@ -5,14 +5,16 @@ name: chikin
 #   host Claude Code ──HTTP/MCP+bearer──► gateway (127.0.0.1:8080)
 #                                            │ scoped docker API (socket-proxy)
 #                                            └─ provisions chikin-chrome-<name>
-#                                               on demand (internal chikin-net)
+#                                               on that client's first browser
+#                                               tool call (internal chikin-net)
 #
 # Bring up the control plane (pulls pinned images from ghcr — builds nothing):
 #   docker compose --profile build pull   # fetch gateway + fleet browser images
 #   docker compose up -d
 # Developers build locally instead by layering docker-compose.dev.yml on top
 # (see that file, or `make dev-build`). Pin the image tag with CHIKIN_VERSION
-# in .env. Browsers are created on demand by the gateway; NOT compose services.
+# in .env. Browsers are created by the gateway on a client's first browser tool
+# call — not on connect, and NOT as compose services.
 
 services:
   # Pull anchor for the fleet browser image. Not a running service (the gateway
