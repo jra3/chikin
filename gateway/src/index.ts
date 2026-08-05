@@ -4,8 +4,9 @@ import { log } from "./log.js";
 import { Registry } from "./registry.js";
 import { Provisioner } from "./provisioner.js";
 import { Reaper } from "./reaper.js";
-import { reportRuntimeConfig } from "./runtime.js";
+import { addRuntimeWarning, reportRuntimeConfig } from "./runtime.js";
 import { createApp, makeUpgradeHandler } from "./server.js";
+import { planBind } from "./bind.js";
 
 async function main(): Promise<void> {
   // Backstop: a rejected promise outside any request handler (background reaper
@@ -82,19 +83,38 @@ async function main(): Promise<void> {
   reaper.start();
 
   const app = createApp({ registry, provisioner });
-  const server = http.createServer(app);
-  server.on("upgrade", makeUpgradeHandler());
 
-  server.listen(config.port, config.host, () => {
-    log.info(`gateway listening on http://${config.host}:${config.port}`);
-    log.info(`  MCP:       POST http://${config.host}:${config.port}/b/<name>/`);
-    log.info(`  dashboard: http://${config.host}:${config.port}/`);
+  // Never listen on the browser data plane (CHK-002 / issue #20). HOST=0.0.0.0
+  // would include chikin-net, putting this MCP endpoint — no bearer by default,
+  // and hostOk is only a rebinding guard — within reach of every browser we
+  // provision. See bind.ts. One listener per resolved address; an explicit HOST
+  // is honoured as-is.
+  const plan = planBind(config.host, await provisioner.selfEgressIp());
+  if (plan.warning) {
+    log.warn(plan.warning);
+    addRuntimeWarning(plan.warning);
+  }
+
+  const servers = plan.hosts.map((host) => {
+    const server = http.createServer(app);
+    server.on("upgrade", makeUpgradeHandler());
+    server.listen(config.port, host, () => {
+      log.info(`gateway listening on http://${host}:${config.port}`);
+    });
+    return server;
   });
+  log.info(`  MCP:       POST http://<listen-addr>:${config.port}/b/<name>/`);
+  log.info(`  dashboard: http://127.0.0.1:${config.port}/`);
 
   const shutdown = (sig: string) => {
     log.info(`received ${sig}, shutting down`);
     reaper.stop();
-    server.close(() => process.exit(0));
+    let left = servers.length;
+    for (const server of servers) {
+      server.close(() => {
+        if (--left === 0) process.exit(0);
+      });
+    }
     // Hard-exit backstop.
     setTimeout(() => process.exit(0), 5000).unref();
   };

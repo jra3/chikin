@@ -99,6 +99,15 @@ export function configWarnings(): string[] {
 }
 
 /**
+ * Append a warning discovered outside reportRuntimeConfig (the bind fallback in
+ * index.ts). Same surfaces: /healthz and the dashboard. Kept additive so it
+ * cannot clobber the seeding warning regardless of startup ordering.
+ */
+export function addRuntimeWarning(warning: string): void {
+  warnings = [...warnings, warning];
+}
+
+/**
  * Startup banner: dump the effective config and shout about seeding either way.
  * Also asks Docker whether a seed volume exists while SEED_VOLUME is unset —
  * the exact silent misconfiguration that wasted ~7 weeks — and records any
@@ -119,6 +128,10 @@ export async function reportRuntimeConfig(provisioner: Provisioner): Promise<voi
   } catch (e) {
     log.debug(`config: could not list volumes for the seed check: ${String(e)}`);
   }
-  warnings = configWarningsFor(rc, seedVolumes);
-  for (const w of warnings) log.warn(`config: ${w}`);
+  // Merge, don't replace: addRuntimeWarning may already have recorded one, and
+  // a warning that silently disappears because two startup steps got reordered
+  // is worse than no warning at all.
+  const found = configWarningsFor(rc, seedVolumes);
+  warnings = [...found, ...warnings];
+  for (const w of found) log.warn(`config: ${w}`);
 }

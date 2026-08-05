@@ -73,8 +73,13 @@ services:
       # loopback-trusted. Never change the host side to 0.0.0.0.
       - "127.0.0.1:8080:8080"
     environment:
-      # Bind all interfaces *inside* the container; the host-side mapping below
-      # (127.0.0.1:8080) is what restricts reachability to loopback.
+      # Listen broadly *inside* the container, EXCEPT on the browser data plane:
+      # the gateway resolves its own chikin-egress address at startup and binds
+      # loopback + that address only, never chikin-net (CHK-002 — a browser
+      # could otherwise reach this MCP endpoint and drive the whole fleet; see
+      # gateway/src/bind.ts and docs/adr/0003). Any other value here is honoured
+      # verbatim. The host-side mapping below (127.0.0.1:8080) is what restricts
+      # reachability to loopback.
       HOST: "0.0.0.0"
       # Empty disables bearer auth — fine because the published port is bound to
       # 127.0.0.1 only (loopback-trusted). Set a token to require one.

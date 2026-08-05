@@ -16,6 +16,23 @@ gateway with `MAX_FLEET` ≤ 3 to exercise it; at a larger cap the fleet is neve
 full and `run.mjs` prints a `SKIP` for the past-the-cap checks rather than
 asserting something untrue.
 
+`gateway-reachability.mjs` proves the network property the unit tests can't
+(CHK-002 / #20): it provisions two real browsers and, from inside one, asserts
+the gateway's `:8080` is **unreachable** while a peer browser's CDP `:9222` and
+noVNC `:6080` **are** reachable — the residual [ADR 0003](../docs/adr/0003-accept-cross-browser-reachability-close-the-gateway.md)
+knowingly accepts. Close that gap one day and the `EXPECTED_PEER_REACHABLE`
+checks fail on purpose; flip them rather than deleting them.
+
+```bash
+GATEWAY_TOKEN=<your token> node gateway-reachability.mjs   # exits non-zero on any failed check
+```
+
+The probing page's **origin** is load-bearing: it runs from the browser's own
+`http://<ip>:6080/`, because from an `https://` page every `http://` probe is
+blocked as mixed content before a packet moves — which made an earlier version
+report four confident, wrong answers. The self-`:6080` check is the control that
+catches that class of breakage.
+
 `reaper-helper.mjs` drives the live reaper test. Every mode calls
 `chikin_identify` before touching a browser tool (the gate added in #54) and
 exits non-zero the moment the gateway refuses a call. `hold` keeps one real
