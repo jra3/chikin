@@ -41,9 +41,22 @@ if (mode === "mark") {
   // reap. Identify (browser tools are gated on it), then make one browser tool
   // call to force the container into existence, and only then stay attached
   // with the SSE stream open, which is what the attached-tier TTL measures.
+  // Both calls report a gateway-side refusal (fleet full, a handle already
+  // claimed, provisioning failure, the identify gate) as a normal result with
+  // `isError: true` rather than by throwing, so check it: sleeping past that
+  // would print HELD while holding no browser and no fleet slot.
   const handle = `itest-hold-${name}`.slice(0, 32).replace(/-+$/, "");
-  await s.client.callTool({ name: "chikin_identify", arguments: { handle } });
-  await s.client.callTool({ name: "list_pages", arguments: {} });
+  const held = async (tool, args) => {
+    const res = await s.client.callTool({ name: tool, arguments: args });
+    if (res?.isError) {
+      const text = (res.content ?? []).map((c) => c.text ?? "").join("\n").trim();
+      console.error(`HOLD FAILED: ${tool} for '${name}': ${text || "(no message)"}`);
+      await teardown(s);
+      process.exit(1);
+    }
+  };
+  await held("chikin_identify", { handle });
+  await held("list_pages", {});
   await new Promise((r) => setTimeout(r, Number(arg) * 1000));
   console.log("HELD");
   await teardown(s);

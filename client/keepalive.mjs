@@ -39,18 +39,46 @@ const transport = new StreamableHTTPClientTransport(
   token ? { requestInit: { headers: { Authorization: `Bearer ${token}` } } } : undefined,
 );
 const client = new Client({ name: "chikin-keepalive", version: "0.0.0" }, { capabilities: {} });
-await client.connect(transport);
+try {
+  await client.connect(transport);
+} catch (e) {
+  console.error(`keepalive: could not connect to ${url.href}: ${e.message}`);
+  process.exit(1);
+}
 
-// Browser tools are gated until the session identifies.
-await client.callTool({ name: "chikin_identify", arguments: { handle } });
+// A gateway-side refusal — fleet full, a Docker/provisioning failure, the
+// identify gate, a handle already claimed — comes back as an ordinary MCP tool
+// *result* carrying `isError: true`, not as a rejection. Unchecked, this script
+// would announce a browser it never got and send the human to a noVNC URL that
+// 502s: the exact dead end it exists to remove.
+const call = async (tool, args = {}) => {
+  const res = await client.callTool({ name: tool, arguments: args });
+  if (res?.isError) {
+    const text = (res.content ?? []).map((c) => c.text ?? "").join("\n").trim();
+    throw new Error(`${tool} failed for browser '${name}': ${text || "(no message)"}`);
+  }
+  return res;
+};
 
-// The call that actually creates chikin-chrome-<name>, and with it the noVNC URL.
-const beat = () => client.callTool({ name: "list_pages", arguments: {} });
-await beat();
+// The list_pages call is what actually creates chikin-chrome-<name>, and with
+// it the noVNC URL. Browser tools are gated until the session identifies.
+const beat = () => call("list_pages");
+try {
+  await call("chikin_identify", { handle });
+  await beat();
+} catch (e) {
+  console.error(`keepalive: ${e.message}`);
+  process.exit(1);
+}
 
 console.log(`keepalive: holding ${name} as '${handle}' — log in at ${vnc} (kill to release)`);
+// A mid-run failure is recoverable (a fleet slot can free up, and the next beat
+// re-provisions), so warn loudly and keep beating rather than exiting.
 setInterval(
-  () => beat().catch((e) => console.error(`keepalive: browser beat failed: ${e.message}`)),
+  () =>
+    beat().catch((e) =>
+      console.error(`keepalive: browser beat failed — ${name} may have been reclaimed: ${e.message}`),
+    ),
   BROWSER_BEAT_MS,
 );
 setInterval(
