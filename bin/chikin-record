@@ -70,8 +70,12 @@ Arguments:
 
 Outputs are named <name>-<timestamp>.mp4 / .gif in the output dir.
 
-Prerequisites: ffmpeg and docker on the host, Node >= 22, and the browser must be
-running (connect a client to /b/<name>/ once to provision chikin-chrome-<name>).`;
+Prerequisites: ffmpeg and docker on the host, Node >= 22, and the browser must
+already be running. Connecting a client no longer provisions one — the session
+has to make at least one browser tool call. To bring chikin-chrome-<name> up:
+
+    chikin-claude <name>        # attach a client to that browser
+    > navigate to https://example.com     # any browser tool call provisions it`;
 
 function parseArgs(argv) {
   const a = {
@@ -150,9 +154,11 @@ function resolveContainerIp(name) {
   if (running.status !== 0 || running.stdout.trim() !== "true") {
     die(
       `browser '${name}' is not running (container ${container} absent or stopped).\n` +
-        `  Provision it by connecting a client to the browser once, e.g.:\n` +
+        `  Connecting a client does not start a browser — only a browser tool call does.\n` +
+        `  Attach one and have it drive a page:\n` +
         `      chikin-claude ${name}\n` +
-        `  or open  http://localhost:8080/b/${name}/  — then re-run ${PROG}.`,
+        `      > navigate to https://example.com\n` +
+        `  That provisions ${container}; leave it attached and re-run ${PROG}.`,
       69,
     );
   }
