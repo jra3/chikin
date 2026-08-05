@@ -49,7 +49,11 @@ function cdpForName(name) {
       { encoding: "utf8" },
     ).trim();
   } catch {
-    console.error(`could not docker inspect ${cname} — is that browser provisioned?`);
+    console.error(
+      `could not docker inspect ${cname} — no such container. A browser exists only ` +
+        `after a client attached to that name makes a browser tool call; connecting alone ` +
+        `provisions nothing.`,
+    );
     process.exit(2);
   }
   const nets = Object.fromEntries(

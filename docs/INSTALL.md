@@ -46,7 +46,7 @@ That single command:
 
 ## Using it
 
-Just run `claude` — every instance automatically connects to its own isolated browser (the fleet multiplexes them). Pin a **sticky, persistent** browser by name:
+Just run `claude` — every instance automatically gets its own isolated browser (the fleet multiplexes them). The browser is built the first time that instance actually browses, so instances that never touch the web cost nothing and hold no fleet slot. Pin a **sticky, persistent** browser by name:
 
 ```bash
 chikin-claude giard            # this instance always drives the "giard" profile

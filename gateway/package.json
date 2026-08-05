@@ -5,7 +5,7 @@
   "description": "Multi-Chrome MCP gateway: fronts a fleet of per-name chikin Chrome containers over HTTP/MCP.",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "main": "dist/src/index.js",
   "scripts": {

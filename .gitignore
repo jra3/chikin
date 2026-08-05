@@ -1,4 +1,8 @@
-node_modules/
+# No trailing slash: `node_modules/` matches directories only, so it missed the
+# `itest/node_modules` SYMLINK that itest/README.md tells you to create (and
+# calls gitignored). Without the slash this matches a directory, a file, or a
+# symlink of that name at any depth.
+node_modules
 *.log
 .DS_Store
 .claude/

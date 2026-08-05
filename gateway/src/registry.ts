@@ -41,16 +41,51 @@ export class Registry {
   private bySessionId = new Map<string, Session>();
   private byHandle = new Map<string, Session>();
   private pending = new Set<string>();
+  private provisioning = new Map<string, number>();
   private activity = new Map<string, Activity>();
 
-  /** True if a session exists or is being provisioned for this name. */
+  /**
+   * True if a live SESSION exists for this name, or one is being created. Says
+   * nothing about a browser: since issue #63 a session owns no container until
+   * its first browser tool call, so `has()` is true for names with no browser
+   * behind them. For an in-flight provision use `isPending()`.
+   */
   has(name: string): boolean {
     return this.byName.has(name) || this.pending.has(name);
   }
 
-  /** True while a name is reserved but not yet a live session (mid-provision). */
+  /**
+   * True while ANY provision for this name is in flight: a name reserved for a
+   * session still being created, or a container being provisioned for a session
+   * that is already live (lazy attach / child respawn — see markProvisioning).
+   * The reaper reads this both to skip a mid-provision name and, re-evaluated
+   * inside the provisioner's create gate, to call off a profile-volume removal
+   * that would otherwise land between seeding a volume and mounting it
+   * (CHK-015).
+   */
   isPending(name: string): boolean {
-    return this.pending.has(name);
+    return this.pending.has(name) || this.provisioning.has(name);
+  }
+
+  /**
+   * Mark a container provision as in flight OUTSIDE the reserve/add window.
+   * Since issue #63 the container is created lazily, on the session's first
+   * browser tool call — long after `add()` cleared the reservation — and a child
+   * respawn re-provisions later still, so `reserve()` no longer covers every
+   * provision site and CHK-015's guarantee would have a hole exactly where the
+   * new code provisions. Counted rather than a boolean because two provisions
+   * for one name can overlap (a respawn during an attach). Always balance with
+   * `clearProvisioning` in a `finally`, or the name becomes unreapable.
+   */
+  markProvisioning(name: string): void {
+    this.provisioning.set(name, (this.provisioning.get(name) ?? 0) + 1);
+  }
+
+  clearProvisioning(name: string): void {
+    const n = this.provisioning.get(name);
+    if (n === undefined) return;
+    if (n > 1) this.provisioning.set(name, n - 1);
+    else this.provisioning.delete(name);
   }
 
   /**

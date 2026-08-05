@@ -5,8 +5,10 @@ import {
   identifyRequiredMessage,
   augmentInstructions,
   isBrowserWork,
+  browserUnavailableMessage,
 } from "../src/bridge.js";
 import { Registry } from "../src/registry.js";
+import { FleetFullError, ProvisionError } from "../src/provisioner.js";
 
 // --- gate: which client frames are blocked before identify -----------------
 
@@ -100,6 +102,36 @@ test("gating error names chikin_identify, the format, and an example", () => {
   assert.match(msg, /navigate_page/, "names the blocked tool");
   assert.match(msg, /1-32 chars/, "states the handle format");
   assert.match(msg, /"handle"/, "shows a worked example");
+});
+
+// --- lazy provisioning: the fleet-full error is now a TOOL error (issue #63) --
+// It used to be an HTTP 429 on the MCP handshake, which took the whole session
+// with it — and an MCP client fixes its tool registry at session start, so the
+// caller could not get the browser lane back even after a slot freed. Now one
+// call fails and the session is intact, so the message has to say so.
+
+test("the fleet-full tool error names the cause, the tool, and that the session survived", () => {
+  const msg = browserUnavailableMessage("navigate_page", new FleetFullError(8));
+  assert.match(msg, /navigate_page/, "names the tool that failed");
+  assert.match(msg, /fleet is full/, "and the real reason");
+  assert.match(msg, /still registered/, "tells the caller nothing was lost");
+  assert.match(msg, /[Rr]etry/, "and that retrying is the fix");
+  assert.match(msg, /dashboard/, "fleet-full is the case the slot accounting explains");
+});
+
+// Anything that is NOT fleet-full lands here too — a Docker or socket-proxy
+// failure. Sending the model to a page listing who holds the slots explains
+// nothing when no slot is the problem, so the guidance has to branch.
+test("a non-fleet-full failure gets guidance that actually applies", () => {
+  const msg = browserUnavailableMessage("navigate_page", new ProvisionError("docker: 400 Bad request"));
+  assert.match(msg, /navigate_page/, "names the tool that failed");
+  assert.match(msg, /400 Bad request/, "and the real reason");
+  assert.doesNotMatch(msg, /dashboard/, "no slot accounting to send it to");
+  assert.match(msg, /Docker/, "names what actually failed");
+  // Both branches must still say the session survived and the call is retryable
+  // — that sentence is the fix for issue #63's reported impact.
+  assert.match(msg, /still registered/, "tells the caller nothing was lost");
+  assert.match(msg, /[Rr]etry/, "and that retrying is the fix");
 });
 
 // --- layer 1: initialize instructions are augmented, upstream preserved ----

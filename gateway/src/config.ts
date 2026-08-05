@@ -95,9 +95,11 @@ export const config = {
   // applies to a DETACHED browser and is measured against MCP traffic; this one
   // applies while a client stream is still attached and is measured against
   // Activity.lastBrowserActivity — real forwarded tool calls, not the client
-  // bridge's 120s keepalive ping. An attached session that has done no browser
-  // work for this long is holding a fleet slot for nothing and is reclaimed;
-  // the client bridge reconnects transparently.
+  // bridge's 120s keepalive ping. A session that browsed ONCE and then went idle
+  // is holding a fleet slot for nothing, so its browser is reclaimed; the client
+  // bridge reconnects transparently. (A session that has never browsed holds no
+  // slot to reclaim — since issue #63 it owns no container at all, and the
+  // reaper skips it.)
   //   0 = never reap an attached browser (the pre-#57 behaviour).
   // Keep it well above IDLE_TTL_SEC: below it, a detached browser would outlive
   // an attached one.
