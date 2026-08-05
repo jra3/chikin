@@ -35,7 +35,15 @@ if (mode === "mark") {
   console.log("MARKER=" + got.replace(/\s+/g, " ").trim());
   await teardown(s);
 } else if (mode === "hold") {
-  // Stay connected (keeps the SSE stream open) for arg seconds.
+  // Hold a REAL browser attached for arg seconds. Connecting is not enough:
+  // since issue #63 it provisions nothing, and the reaper skips names with no
+  // container — so a connect-only session holds no fleet slot and blocks no
+  // reap. Identify (browser tools are gated on it), then make one browser tool
+  // call to force the container into existence, and only then stay attached
+  // with the SSE stream open, which is what the attached-tier TTL measures.
+  const handle = `itest-hold-${name}`.slice(0, 32).replace(/-+$/, "");
+  await s.client.callTool({ name: "chikin_identify", arguments: { handle } });
+  await s.client.callTool({ name: "list_pages", arguments: {} });
   await new Promise((r) => setTimeout(r, Number(arg) * 1000));
   console.log("HELD");
   await teardown(s);
