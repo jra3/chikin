@@ -128,6 +128,8 @@ A session's browser name (`inst-<pid>`) says *which profile* it drives, not *wha
 
 Open the dashboard at <http://localhost:8080/> and click **open noVNC** next to any running browser, or go straight to `http://localhost:8080/vnc/<name>/`. You can drive that Chrome window by hand — useful for logging in or clearing a captcha while the MCP client keeps the session. The page title and the dashboard's **handle** column show which session (`chikin_identify` handle) owns each browser.
 
+The dashboard is also the only place the connected-vs-driven split is visible: **`fleet slots in use: N/MAX`** counts only sessions that have actually made a browser tool call, and sessions that haven't are listed as **`connected — holds no fleet slot`** with no noVNC link (there is no browser to view yet — that URL 502s until one exists). The **`browser idle`** column is time since a real browser tool call, which is what the attached reap TTL measures; the plain **`idle`** column stays near zero on any attached session because the client bridge pings.
+
 ### Recording (video / GIF)
 
 `chikin-record` captures a running browser to an **mp4** and/or animated **GIF** in one command. It records the browser over CDP `Page.startScreencast` (reached at the container's IP on chikin's docker network — the fleet never publishes port 9222 to the host) and assembles the frames with `ffmpeg`.
@@ -163,12 +165,21 @@ echo 'SEED_VOLUME=chikin-seed' >> .env && docker compose up -d --force-recreate 
 #    then confirm the RUNNING gateway actually got it:
 curl -s localhost:8080/healthz | grep -o '"seedVolume":"[^"]*"'   # -> "seedVolume":"chikin-seed"
 
-# 2. log into your sites by hand, once
-chikin-claude golden                       # launch the golden browser
-#  -> open http://localhost:8080/vnc/golden/ and sign in to your sites
+# 2. create the golden browser, then log into your sites by hand, once
+chikin-claude golden                       # attach a client to the name "golden"
+#  -> ask it to browse once ("open example.com"). That FIRST browser tool call is
+#     what creates chikin-chrome-golden and chikin-profile-golden — attaching
+#     alone provisions nothing, so /vnc/golden/ 502s until you make it.
+#  -> now open http://localhost:8080/vnc/golden/ and sign in to your sites
 
 # 3. freeze it as the seed
 chikin-snapshot                            # clones golden's profile -> chikin-seed
+```
+
+No MCP client handy? `client/keepalive.mjs` does step 2 for you from a repo checkout — it identifies, makes one browser tool call to provision the browser, and then keeps driving it so it isn't reaped while you log in:
+
+```bash
+node client/keepalive.mjs http://localhost:8080/b/golden/   # ^C when you're done
 ```
 
 `chikin-profile-golden` and `chikin-seed` are now the most expensive things on the host to lose, and a single `docker volume prune --all` takes both — read [Profile volumes and cleaning them up](#profile-volumes-and-cleaning-them-up) before you run any prune.
@@ -268,7 +279,7 @@ Set in `.env` (see `.env.example`) or the environment.
 | `ATTACHED_IDLE_TTL_SEC` | `14400` | Seconds an **attached** browser may go with no real browser tool call before it is reclaimed anyway. Measured against actual forwarded `tools/call`s — *not* the client bridge's keepalive ping, which by design keeps the plain idle clock fresh — and shown as the dashboard's `browser idle` column. Without this, a window that made one browser tool call and then went idle holds that fleet slot for its whole lifetime and the fleet saturates with browsers parked on `about:blank`. Eviction is survivable: the bridge reconnects transparently, though a disposable `inst-*` browser's profile is discarded with it (logged explicitly). `0` = never reap an attached browser (pre-#57 behaviour). Keep it well above `IDLE_TTL_SEC`. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
 | `CHIKIN_VOLUME_GC` | `1` | Sweep orphaned `chikin-profile-inst-*` volumes (disposable profiles whose container is gone) once at startup. Scoped by name — `golden`, `hermes` and named client profiles are never candidates. `0` disables. See [Profile volumes](#profile-volumes-and-cleaning-them-up). |
-| `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up before failing the connect. |
+| `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up. Nothing is provisioned when a client connects, so this bounds the **first browser tool call** — overrunning it fails that one call as a retryable tool error ("chikin could not start a browser"), leaving the session up with every tool registered. |
 | `WINDOW_SIZE` | `1920,1080` | Chrome window / Xvfb screen size for provisioned browsers. |
 | `CDM_EXTRA_ARGS` | *(empty)* | Extra flags for every `chrome-devtools-mcp` child, whitespace-separated. E.g. `--experimentalPageIdRouting` routes page-scoped tools by explicit `pageId` instead of the sticky selected-page binding (sidesteps the stale-target wedge, but changes tool schemas). |
 | `NAV_VERIFY_DELAY_MS` | `2500` | How long after a "successful" navigation the wedge watchdog waits before checking the browser's real CDP page list. |
@@ -430,7 +441,7 @@ The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTranspor
 
 **Gateway healthy but `curl localhost:8080` refuses from the host.** The gateway must bind `0.0.0.0` *inside* the container for Docker's port-forward to reach it (compose sets `HOST=0.0.0.0`); loopback-only safety comes from the `127.0.0.1:8080:8080` host mapping.
 
-**A connect hangs then fails with "provisioning failed".** Chrome didn't come up within `PROVISION_TIMEOUT_SEC`. Check `docker logs chikin-chrome-<name>`; most often `/dev/shm` pressure (the fleet sets `shm_size` 2 GB per browser).
+**The first browser tool call hangs, then returns "chikin could not start a browser".** Chrome didn't come up within `PROVISION_TIMEOUT_SEC` (connecting provisions nothing, so this can only surface on a tool call, never on the connect). If the message also says no slot is missing, check `docker logs chikin-chrome-<name>` and the gateway's own log for the underlying Docker error; most often it's `/dev/shm` pressure (the fleet sets `shm_size` 2 GB per browser). The session survives — the same call works once the browser can be built.
 
 **"browser '<name>' already has an active session" (409).** That name is in use by another client. Pick a different name, or have the other client disconnect (MCP `DELETE`/terminate frees the name immediately).
 

@@ -16,9 +16,16 @@ gateway with `MAX_FLEET` ≤ 3 to exercise it; at a larger cap the fleet is neve
 full and `run.mjs` prints a `SKIP` for the past-the-cap checks rather than
 asserting something untrue.
 
-`reaper-helper.mjs` drives the live reaper test (mark / read / hold a browser);
-see the commands in the repo's test notes. Run the gateway with a short
+`reaper-helper.mjs` drives the live reaper test. `hold` keeps one real browser
+attached for N seconds: it identifies and makes a browser tool call first,
+because since issue #63 connecting provisions nothing and the reaper skips names
+with no container — a connect-only session holds no slot and blocks no reap.
+(`mark` / `read`, which write and read back a `localStorage` marker to prove a
+profile survived a reap, never call `chikin_identify`; the identify gate blocks
+their tool calls, so they too provision nothing and assert nothing. That is
+issue **#66**, still open — don't trust a green `mark`/`read` until it is
+fixed.) See the commands in the repo's test notes. Run the gateway with a short
 `IDLE_TTL_SEC` / `REAP_INTERVAL_SEC` to watch idle reclaim quickly. Add a short
-`ATTACHED_IDLE_TTL_SEC` to watch the second tier — an *attached* session with no
-browser tool call being evicted, and the client bridge reconnecting through it
-(issue #57).
+`ATTACHED_IDLE_TTL_SEC` to watch the second tier — an *attached* session whose
+browser has gone unused since its last tool call being evicted anyway, and the
+client bridge reconnecting through it (issue #57).
