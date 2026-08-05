@@ -44,7 +44,12 @@ export class Registry {
   private provisioning = new Map<string, number>();
   private activity = new Map<string, Activity>();
 
-  /** True if a session exists or is being provisioned for this name. */
+  /**
+   * True if a live SESSION exists for this name, or one is being created. Says
+   * nothing about a browser: since issue #63 a session owns no container until
+   * its first browser tool call, so `has()` is true for names with no browser
+   * behind them. For an in-flight provision use `isPending()`.
+   */
   has(name: string): boolean {
     return this.byName.has(name) || this.pending.has(name);
   }

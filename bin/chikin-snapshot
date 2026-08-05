@@ -6,8 +6,12 @@
 # already logged in (SEED_VOLUME=chikin-seed must be set for the gateway).
 #
 # Workflow:
-#   chikin-claude golden        # launch the golden browser
-#   #  -> log into your sites by hand at http://localhost:8080/vnc/golden/
+#   chikin-claude golden        # attach a client to the name "golden"
+#   #  -> ask it to browse once ("open example.com"). Browsers are provisioned
+#   #     on the FIRST browser tool call, not on connect (issue #63), so that
+#   #     call is what creates chikin-chrome-golden, chikin-profile-golden and
+#   #     the noVNC page; attaching alone creates none of them.
+#   #  -> then log into your sites by hand at http://localhost:8080/vnc/golden/
 #   chikin-snapshot             # freeze it as the seed
 #   #  -> refresh anytime by logging back in and re-running this
 #
@@ -24,8 +28,19 @@ IMG="${CHIKIN_IMAGE:-chikin:local}"
 CONTAINER="chikin-chrome-${GOLDEN}"
 
 if ! docker volume inspect "$SRC" >/dev/null 2>&1; then
-  echo "chikin-snapshot: no profile volume '$SRC'." >&2
-  echo "  Launch it first:  chikin-claude ${GOLDEN}   then log in via http://localhost:8080/vnc/${GOLDEN}/" >&2
+  cat >&2 <<EOF
+chikin-snapshot: no profile volume '$SRC'.
+  Nothing has driven '${GOLDEN}' yet. A browser is provisioned on the FIRST
+  browser tool call, not on connect (issue #63) — so attaching a client to that
+  name leaves no container, no profile volume and no noVNC page. Do this:
+    1. chikin-claude ${GOLDEN}
+    2. ask it to browse once ("open example.com") — that call creates the browser
+    3. sign in to your sites at http://localhost:8080/vnc/${GOLDEN}/
+    4. re-run: chikin-snapshot ${GOLDEN}
+  Scripted alternative, from a repo checkout — provisions the browser and holds
+  it open while you log in:
+    node client/keepalive.mjs http://localhost:8080/b/${GOLDEN}/
+EOF
   exit 1
 fi
 

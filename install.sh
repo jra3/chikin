@@ -281,7 +281,8 @@ banner() {
   Prove it's non-headless:      make verify
 
   Just run 'claude' — every instance automatically gets its own isolated
-  browser. Pin a sticky, persistent one by name:  chikin-claude <name>
+  browser, built the first time that instance actually browses (idle
+  instances cost nothing). Pin a sticky one by name:  chikin-claude <name>
 
   Update later:   git pull && make update
   Remove:         ./install.sh --uninstall     (keeps your logged-in profiles)

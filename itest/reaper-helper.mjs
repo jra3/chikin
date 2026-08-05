@@ -35,7 +35,28 @@ if (mode === "mark") {
   console.log("MARKER=" + got.replace(/\s+/g, " ").trim());
   await teardown(s);
 } else if (mode === "hold") {
-  // Stay connected (keeps the SSE stream open) for arg seconds.
+  // Hold a REAL browser attached for arg seconds. Connecting is not enough:
+  // since issue #63 it provisions nothing, and the reaper skips names with no
+  // container — so a connect-only session holds no fleet slot and blocks no
+  // reap. Identify (browser tools are gated on it), then make one browser tool
+  // call to force the container into existence, and only then stay attached
+  // with the SSE stream open, which is what the attached-tier TTL measures.
+  // Both calls report a gateway-side refusal (fleet full, a handle already
+  // claimed, provisioning failure, the identify gate) as a normal result with
+  // `isError: true` rather than by throwing, so check it: sleeping past that
+  // would print HELD while holding no browser and no fleet slot.
+  const handle = `itest-hold-${name}`.slice(0, 32).replace(/-+$/, "");
+  const held = async (tool, args) => {
+    const res = await s.client.callTool({ name: tool, arguments: args });
+    if (res?.isError) {
+      const text = (res.content ?? []).map((c) => c.text ?? "").join("\n").trim();
+      console.error(`HOLD FAILED: ${tool} for '${name}': ${text || "(no message)"}`);
+      await teardown(s);
+      process.exit(1);
+    }
+  };
+  await held("chikin_identify", { handle });
+  await held("list_pages", {});
   await new Promise((r) => setTimeout(r, Number(arg) * 1000));
   console.log("HELD");
   await teardown(s);

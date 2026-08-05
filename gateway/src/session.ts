@@ -2,8 +2,11 @@ import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/se
 import { log } from "./log.js";
 
 /**
- * One live MCP session = one client connection to a named browser. Bridges the
- * client's HTTP MCP transport to a `chrome-devtools-mcp` child (stdio).
+ * One live MCP session = one client connection to a NAME. Bridges the client's
+ * HTTP MCP transport to a `chrome-devtools-mcp` child (stdio). Note "name", not
+ * "browser": since issue #63 the child starts browser-less and the container is
+ * provisioned on the session's first browser tool call, so a session may have no
+ * browser behind it for its entire life.
  *
  * A Session is ephemeral: it exists only while a client is connected, and is
  * used for request routing and the single-active-session-per-name guard. The
