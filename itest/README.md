@@ -29,7 +29,7 @@ container — a connect-only session holds no slot and blocks no reap.
 GATEWAY_TOKEN=<your token> node reaper-helper.mjs hold inst-hold1 120
 
 # write a localStorage marker, then read it back after a reap to prove whether
-# the profile survived. Print SET ok / MARKER=<value>, or <MODE> FAILED + exit 1.
+# the profile survived. Prints SET ok / MARKER=<value>, or <MODE> FAILED + exit 1.
 GATEWAY_TOKEN=<your token> node reaper-helper.mjs mark inst-mark1 hello
 GATEWAY_TOKEN=<your token> node reaper-helper.mjs read inst-mark1
 ```
@@ -40,10 +40,11 @@ as a thrown error, so every call here is checked. Until #66 that check was
 missing from `mark`/`read` and they printed the gate's error text in place of
 the marker, exiting 0: green, and asserting nothing.
 
-Exit codes: **0** success, **1** the gateway refused a call or a marker failed
-to read back (`<MODE> FAILED` on stderr), **2** bad arguments. Usage is checked
-before connecting, so a mistyped invocation never opens a session or provisions
-a browser.
+Exit codes: **0** success, **1** a call failed — refused by the gateway, returned
+no usable value, or wrote a marker that did not read back (`<MODE> FAILED` on
+stderr) — **2** bad arguments, including a `hold` duration that is not a positive
+number of seconds. Usage is checked before connecting, so a mistyped invocation
+never opens a session or provisions a browser.
 
 Every mode takes a browser name; use a disposable `inst-*` one. A reap discards
 that name's profile volume, and only `inst-*` profiles are ever discarded — a
