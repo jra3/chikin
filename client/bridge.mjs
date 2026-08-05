@@ -19,8 +19,9 @@
 //      `initialize` (+ `notifications/initialized`) against a fresh gateway
 //      session, swallowing the replayed responses (the client already has them);
 //   3. keep the stdio side — and the process — alive throughout.
-// The client never sees the session drop; its next tool call just works (a
-// reconnect re-provisions the browser for this name, warm profile intact).
+// The client never sees the session drop; its next tool call just works (the
+// rebuilt session provisions this name's browser again on its next browser tool
+// call — lazily, since issue #63 — with the warm profile intact).
 //
 // Heartbeat: the gateway reaps a browser after IDLE_TTL_SEC with no MCP traffic.
 // Claude Code sits idle between tool calls far longer than that, so we send a

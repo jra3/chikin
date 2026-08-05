@@ -29,7 +29,9 @@
 //
 // Preflight: requires `ffmpeg` and `docker` on the host, and a Node with the
 // global WebSocket (Node >= 22). The container chikin-chrome-<name> must already
-// be running — a client has to connect to /b/<name>/ once to provision it.
+// be running — since issue #63 the gateway provisions it lazily, so a client has
+// to connect to /b/<name>/ AND make one browser tool call; connecting alone
+// leaves no container to record.
 "use strict";
 
 const { spawn, spawnSync } = require("node:child_process");

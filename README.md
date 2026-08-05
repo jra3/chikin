@@ -62,7 +62,7 @@ open http://localhost:8080/                   # fleet dashboard
 `/healthz` carries the **effective runtime config of the running gateway** — see
 [Checking the effective config](#checking-the-effective-config).
 
-The gateway listens on `127.0.0.1:8080` only. Browsers are **not** compose services — they appear on demand when a client connects.
+The gateway listens on `127.0.0.1:8080` only. Browsers are **not** compose services — they appear on demand, on a client's first browser tool call.
 
 ### Wire up a client
 
@@ -144,7 +144,7 @@ chikin-record --help    # full options: --seconds --fps --width --out …
 
 Outputs are named `<name>-<timestamp>.mp4` / `.gif`. If neither `--mp4` nor `--gif` is given it defaults to an mp4.
 
-**Prerequisites:** `ffmpeg` and Node ≥ 22 on the **host** (the global `WebSocket` used to drive CDP needs Node ≥ 22), plus a running browser — connect a client to `/b/<name>/` once (e.g. `chikin-claude <name>`) to provision `chikin-chrome-<name>` before recording.
+**Prerequisites:** `ffmpeg` and Node ≥ 22 on the **host** (the global `WebSocket` used to drive CDP needs Node ≥ 22), plus a running browser — connecting alone no longer provisions one, so drive **one browser tool call** against `/b/<name>/` first (e.g. `chikin-claude <name>`, then have it navigate somewhere) to provision `chikin-chrome-<name>` before recording.
 
 **Timing note:** screencast frames are **event-driven** — Chrome emits one only when the page changes visually, not at a fixed fps — so `chikin-record` timestamps every frame and reconstructs real timing (a mostly-static page still yields a full-length clip by holding the last frame). A page with no visual change at all can emit very few frames.
 
@@ -244,6 +244,9 @@ saves you from an **unfiltered** `docker volume prune --all`.
 The gateway also sweeps orphaned `chikin-profile-inst-*` volumes (instance profiles
 whose container no longer exists) once at startup — that reclaims leftovers from
 before it removed them with the container. Set `CHIKIN_VOLUME_GC=0` to disable.
+The reaper does the same during normal operation for a name it is tracking whose
+container went away out-of-band, once that name has no session, no open stream,
+and has been idle past `IDLE_TTL_SEC` — sticky profiles are never candidates.
 
 ---
 
@@ -262,7 +265,7 @@ Set in `.env` (see `.env.example`) or the environment.
 | `BROWSER_NOFILE` | `8192` | Open-file-descriptor ceiling per browser (soft=hard). Kept generous because Chrome is fd-hungry. `0` disables. |
 | `SEED_VOLUME` | *(empty)* | Docker volume cloned into every new profile so browsers start logged in. Empty = off. Populate with `bin/chikin-snapshot` (see [Pre-authenticated browsers](#pre-authenticated-browsers-golden-profile)). |
 | `IDLE_TTL_SEC` | `900` | Idle seconds before a **detached** browser (no attached client stream) is reaped. Measured against any MCP traffic. |
-| `ATTACHED_IDLE_TTL_SEC` | `14400` | Seconds an **attached** browser may go with no real browser tool call before it is reclaimed anyway. Measured against actual forwarded `tools/call`s — *not* the client bridge's keepalive ping, which by design keeps the plain idle clock fresh — and shown as the dashboard's `browser idle` column. Without this, one connected-but-idle window holds a fleet slot for its whole lifetime and the fleet saturates with browsers parked on `about:blank`. Eviction is survivable: the bridge reconnects transparently, though a disposable `inst-*` browser's profile is discarded with it (logged explicitly). `0` = never reap an attached browser (pre-#57 behaviour). Keep it well above `IDLE_TTL_SEC`. |
+| `ATTACHED_IDLE_TTL_SEC` | `14400` | Seconds an **attached** browser may go with no real browser tool call before it is reclaimed anyway. Measured against actual forwarded `tools/call`s — *not* the client bridge's keepalive ping, which by design keeps the plain idle clock fresh — and shown as the dashboard's `browser idle` column. Without this, a window that made one browser tool call and then went idle holds that fleet slot for its whole lifetime and the fleet saturates with browsers parked on `about:blank`. Eviction is survivable: the bridge reconnects transparently, though a disposable `inst-*` browser's profile is discarded with it (logged explicitly). `0` = never reap an attached browser (pre-#57 behaviour). Keep it well above `IDLE_TTL_SEC`. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
 | `CHIKIN_VOLUME_GC` | `1` | Sweep orphaned `chikin-profile-inst-*` volumes (disposable profiles whose container is gone) once at startup. Scoped by name — `golden`, `hermes` and named client profiles are never candidates. `0` disables. See [Profile volumes](#profile-volumes-and-cleaning-them-up). |
 | `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up before failing the connect. |
@@ -397,8 +400,13 @@ Exit codes: `0` all required checks passed · `1` a required check failed · `2`
 cd gateway
 npm install
 npm run build        # tsc -> dist/
-npm test             # unit tests (names, registry, reaper)
+npm test             # unit tests (run in CI too)
 ```
+
+Needs **Node ≥ 22** on the host (the gateway's `engines`, matching its
+`node:22-bookworm-slim` runtime): `npm test` runs `node --test "dist/test/*.test.js"`,
+and `--test` only expands a glob from Node 21 on — on Node 20 the pattern is taken
+literally and nothing runs.
 
 **Local images need the dev override — always.** `docker-compose.yml` hardcodes
 `CHROME_IMAGE: ghcr.io/jra3/chikin:${CHIKIN_VERSION}` (only the *tag* is variable,
