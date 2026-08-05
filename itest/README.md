@@ -16,26 +16,35 @@ gateway with `MAX_FLEET` ≤ 3 to exercise it; at a larger cap the fleet is neve
 full and `run.mjs` prints a `SKIP` for the past-the-cap checks rather than
 asserting something untrue.
 
-`reaper-helper.mjs` drives the live reaper test. `hold` keeps one real browser
-attached for N seconds: it identifies and makes a browser tool call first,
-because since issue #63 connecting provisions nothing and the reaper skips names
-with no container — a connect-only session holds no slot and blocks no reap.
+`reaper-helper.mjs` drives the live reaper test. Every mode calls
+`chikin_identify` before touching a browser tool (the gate added in #54) and
+exits non-zero the moment the gateway refuses a call. `hold` keeps one real
+browser attached for N seconds: it makes a browser tool call first, because
+since issue #63 connecting provisions nothing and the reaper skips names with no
+container — a connect-only session holds no slot and blocks no reap.
 
 ```bash
 # hold a real browser attached for 120s, then release it.
 # Prints HELD, or HOLD FAILED + exit 1 if the gateway refused either call.
 GATEWAY_TOKEN=<your token> node reaper-helper.mjs hold inst-hold1 120
 
-# mark / read — BROKEN, see below. Shown so the invocation is on record:
+# write a localStorage marker, then read it back after a reap to prove whether
+# the profile survived. Prints SET ok / MARKER=<value>, or <MODE> FAILED + exit 1.
 GATEWAY_TOKEN=<your token> node reaper-helper.mjs mark inst-mark1 hello
 GATEWAY_TOKEN=<your token> node reaper-helper.mjs read inst-mark1
 ```
 
-`mark` / `read` are meant to write and read back a `localStorage` marker to prove
-a profile survived a reap, but they never call `chikin_identify`; the identify
-gate blocks their tool calls, so they provision nothing and assert nothing — the
-`SET` / `MARKER=` line they print is the gate's error text, not data. That is
-issue **#66**, still open: don't trust a green `mark`/`read` until it is fixed.
+A refusal — the identify gate, fleet-full, a handle already claimed, a failed
+provision — comes back as a normal tool result with `isError: true` rather than
+as a thrown error, so every call here is checked. Until #66 that check was
+missing from `mark`/`read` and they printed the gate's error text in place of
+the marker, exiting 0: green, and asserting nothing.
+
+Exit codes: **0** success, **1** a call failed — refused by the gateway, returned
+no usable value, or wrote a marker that did not read back (`<MODE> FAILED` on
+stderr) — **2** bad arguments, including a `hold` duration that is not a positive
+number of seconds. Usage is checked before connecting, so a mistyped invocation
+never opens a session or provisions a browser.
 
 Every mode takes a browser name; use a disposable `inst-*` one. A reap discards
 that name's profile volume, and only `inst-*` profiles are ever discarded — a
