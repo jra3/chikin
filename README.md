@@ -31,7 +31,7 @@ Real (non-headless) Google Chrome in Docker, for browser automation that should 
 
 - The gateway exposes **one MCP endpoint per browser** at `/b/<name>/`. `<name>` must match `[a-z0-9-]+` (1–32 chars). It maps to container `chikin-chrome-<name>` and volume `chikin-profile-<name>`.
 - On connect, the gateway spawns **one** `chrome-devtools-mcp` child and bridges the client's HTTP MCP session to the child's stdio. No container yet: the child answers `initialize`, `tools/list` and pings on its own. On the session's **first browser tool call** the gateway provisions the container (creating the profile volume if needed), waits for Chrome to come up, and rebinds the child to that browser's CDP endpoint.
-- **Networks.** `chikin-net` is `internal: true` and carries the control plane (gateway ↔ socket-proxy ↔ Chrome CDP). `chikin-egress` is a normal bridge that gives the browsers internet access. No Chrome ports are published to the host.
+- **Networks.** Three, since the control plane was split off (ADR 0002): `chikin-control` is `internal: true` and carries **only** gateway ↔ socket-proxy, so a compromised browser cannot reach the Docker API. `chikin-net` is `internal: true` and carries the gateway ↔ browser data plane (CDP, VNC). `chikin-egress` is a normal bridge giving browsers internet access, with inter-container forwarding off. No Chrome ports are published to the host. Browsers still share `chikin-net` with each other — cross-browser isolation is [#20](https://github.com/jra3/chikin/issues/20).
 - The gateway talks to Docker **only** through `tecnativa/docker-socket-proxy`, scoped to containers + volumes + images (+ POST). No `exec`, no host `info`, no swarm/secrets.
 
 ---
