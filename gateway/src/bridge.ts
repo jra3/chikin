@@ -8,7 +8,7 @@ import { log } from "./log.js";
 import { isValidHandle, HANDLE_RULE } from "./names.js";
 import type { Registry } from "./registry.js";
 import type { Provisioner } from "./provisioner.js";
-import { ProvisionError } from "./provisioner.js";
+import { FleetFullError, ProvisionError } from "./provisioner.js";
 
 export interface BridgeDeps {
   provisioner: Provisioner;
@@ -47,6 +47,20 @@ const NAV_WEDGE_STRIKES = 2;
 // force a respawn. Internal fetch errors never surface on the stdio transport.
 const CDP_FAIL_LIMIT = 3;
 const CDP_FAIL_RE = /fetch failed|ECONNREFUSED|ERR_CONNECTION_REFUSED|socket hang up/i;
+
+// --- Lazy browser attachment (issue #63) ------------------------------------
+// The `--browserUrl` a BROWSER-LESS child is spawned against. chrome-devtools-mcp
+// resolves its browser connection lazily — `getContext()` is called from inside
+// the tool handler, never at startup — so a child pointed here answers
+// `initialize`, `tools/list` and `ping` perfectly well while no container exists
+// at all. That is what lets a session complete its MCP handshake, register every
+// tool, and hold NO fleet slot until it does real browser work.
+//
+// Port 1 refuses instantly. If a future upstream ever did dereference this at
+// startup we want a loud immediate error, not a hang against a black-holed
+// address — and the CDP-failure watchdog is disabled while browser-less
+// (startChild below), so such an error could never respawn-loop.
+const NO_BROWSER_URL = "http://127.0.0.1:1";
 
 // Two URLs point at the same document if origin+path match (query/hash differ
 // across redirects too often to compare strictly).
@@ -161,6 +175,37 @@ export function isBrowserWork(
   return classifyClientFrame(f, identified) === "forward";
 }
 
+/**
+ * The tool error returned when a browser tool arrives but the browser cannot be
+ * provisioned — usually `FleetFullError` (issue #63), but a Docker or
+ * socket-proxy failure lands here too and needs different advice: pointing the
+ * model at the dashboard's slot accounting explains nothing when no slot is the
+ * problem.
+ *
+ * Before lazy provisioning this was an HTTP 429 on the MCP handshake, which
+ * killed the whole session: an MCP client fixes its tool registry at session
+ * start, so the browser lane stayed unavailable for the rest of that session
+ * even after a slot freed. Now the session is already up and every tool is
+ * registered; only this one call failed, and the model can free a slot and
+ * retry. Both branches therefore say so — what happened, that the session is
+ * intact, and what to do.
+ */
+export function browserUnavailableMessage(tool: string | undefined, cause: unknown): string {
+  const guidance =
+    cause instanceof FleetFullError
+      ? "Retry the call once a slot frees; the chikin dashboard (the gateway's root URL) lists which browsers " +
+        "are holding them and how long each has been idle."
+      : "No fleet slot is missing — chikin failed to build the browser itself (Docker or the socket proxy). " +
+        "Retry the call; if it fails the same way again the gateway host needs attention, and its logs carry " +
+        "the underlying Docker error.";
+  return (
+    `chikin could not start a browser for '${tool ?? "that tool"}': ${String(cause)}. ` +
+    "This session is still connected and every browser tool is still registered — nothing has been lost, " +
+    "and the very same call works as soon as a browser can be started. " +
+    guidance
+  );
+}
+
 // Layer 3 of the self-directing design: the actionable error a blocked browser
 // tool returns, naming chikin_identify, the handle format, and a worked example
 // so a caller that just starts browsing self-corrects on its first call.
@@ -181,10 +226,20 @@ export function augmentInstructions(result: { instructions?: string }): void {
 }
 
 /**
- * Provision (or reuse) the named browser, spawn its chrome-devtools-mcp child,
- * and wire a transparent JSON-RPC pump between the client's HTTP MCP transport
- * and the child's stdio. Returns once both transports are started; the caller
- * then drives the initialize handshake via `session.http.handleRequest`.
+ * Spawn this session's chrome-devtools-mcp child and wire a transparent
+ * JSON-RPC pump between the client's HTTP MCP transport and the child's stdio.
+ * Returns once both transports are started; the caller then drives the
+ * initialize handshake via `session.http.handleRequest`.
+ *
+ * LAZY PROVISIONING (issue #63). Creating a session does NOT create a browser.
+ * The child starts BROWSER-LESS (see NO_BROWSER_URL) and the container is
+ * provisioned by `attachBrowser` on the first frame `isBrowserWork` recognises
+ * — the same predicate the reap TTL runs on. Everything before that (the
+ * handshake, `tools/list`, the keepalive ping, `chikin_identify`,
+ * `chikin_reset`, identity-blocked calls) is served with no container in
+ * existence, so MAX_FLEET now bounds browsers actually being DRIVEN rather than
+ * MCP clients that happen to be connected. Eight idle Claude Code windows used
+ * to saturate the fleet and lock out the one session that needed a browser.
  *
  * RESILIENCE (issue: a wedged Chrome / crashed child must not kill the client
  * session). The child is REPLACEABLE. If it exits or its send fails, we:
@@ -214,7 +269,17 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   const inflight = new Map<string | number, true>();
 
   // --- wedge-watchdog state ---
-  let currentIp: string | null = null; // container IP of the live child's CDP
+  // Container IP the CHILD is bound to (null = this child is browser-less, so
+  // the session holds no fleet slot — issue #63). It tracks the child, not the
+  // session's claim: `startChild` stamps it before the new child is spawned, so
+  // through the whole attach swap it names a browser no child is serving yet.
+  let currentIp: string | null = null;
+  // In-flight `attachBrowser`, so concurrent first calls share one provision —
+  // and so a frame landing mid-swap joins that attach instead of racing it.
+  let attaching: Promise<void> | null = null;
+  // "Can a browser frame go straight to the child?" — the question `currentIp`
+  // alone cannot answer, and the reason it must not be asked alone.
+  const browserReady = (): boolean => currentIp !== null && attaching === null;
   // nav request id -> what was asked for + the real page set before the nav
   const pendingNavs = new Map<string | number, { url?: string; before: string[] | null }>();
   let navStrikes = 0;
@@ -274,13 +339,24 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // container over a transient proxy error (or recreate-looping a slow cold
   // boot) would be worse than the failure itself.
   async function provision(): Promise<string> {
+    // Declare the provision so the reaper can see it (CHK-015). `registry.reserve`
+    // no longer implies this: since issue #63 the container is created on the
+    // first browser tool call, long after the name stopped being pending, so
+    // without this mark a sweep landing mid-provision could remove the profile
+    // volume between the moment it is seeded and the moment the container mounts
+    // it — silently handing out a blank profile instead of a golden clone.
+    deps.registry.markProvisioning(name);
     try {
-      return await deps.provisioner.ensureContainer(name, { canRotateImage });
-    } catch (e) {
-      if (!(e instanceof ProvisionError)) throw e;
-      log.warn(`session[${name}]: container unhealthy, recreating`, String(e));
-      await deps.provisioner.recreateContainer(name);
-      return await deps.provisioner.ensureContainer(name, { canRotateImage });
+      try {
+        return await deps.provisioner.ensureContainer(name, { canRotateImage });
+      } catch (e) {
+        if (!(e instanceof ProvisionError)) throw e;
+        log.warn(`session[${name}]: container unhealthy, recreating`, String(e));
+        await deps.provisioner.recreateContainer(name);
+        return await deps.provisioner.ensureContainer(name, { canRotateImage });
+      }
+    } finally {
+      deps.registry.clearProvisioning(name);
     }
   }
 
@@ -377,17 +453,21 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     });
   }
 
-  // Spawn + start a chrome-devtools-mcp child bound to the browser's CDP.
-  async function startChild(gen: number): Promise<StdioClientTransport> {
-    const ip = await provision();
+  /**
+   * Spawn + start a chrome-devtools-mcp child. With `ip`, it is bound to that
+   * browser's CDP; with null it is BROWSER-LESS — it serves the handshake,
+   * `tools/list` and pings while no container exists (issue #63).
+   */
+  async function startChild(gen: number, ip: string | null): Promise<StdioClientTransport> {
     currentIp = ip;
     cdpFailStreak = 0;
     // Connect by IP (not container name): Chrome's DevTools HTTP endpoint
     // rejects a DNS-name Host header but accepts an IP; socat in the container
     // bridges to Chrome's loopback CDP port.
+    const browserUrl = ip ? `http://${ip}:${config.cdpPort}` : NO_BROWSER_URL;
     const c = new StdioClientTransport({
       command: config.cdmCommand,
-      args: ["--browserUrl", `http://${ip}:${config.cdpPort}`, ...config.cdmExtraArgs],
+      args: ["--browserUrl", browserUrl, ...config.cdmExtraArgs],
       stderr: "pipe",
     });
     wireChild(c, gen);
@@ -399,7 +479,9 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       // docker-rm'd and it keeps hitting a dead IP) without ever closing the
       // stdio transport — count consecutive failures and respawn. Any
       // successful child reply resets the streak (see wireChild.onmessage).
-      if (gen === childGen && CDP_FAIL_RE.test(line)) {
+      // Disabled while browser-less: NO_BROWSER_URL refuses by design, so a
+      // stray CDP error there is expected, not evidence of a wedged browser.
+      if (gen === childGen && currentIp && CDP_FAIL_RE.test(line)) {
         cdpFailStreak++;
         if (cdpFailStreak >= CDP_FAIL_LIMIT && !respawning && !session?.isClosed) {
           cdpFailStreak = 0;
@@ -414,37 +496,140 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   async function respawnChild(why: string): Promise<void> {
     if (session?.isClosed || respawning) return;
     respawning = true;
-    log.warn(`session[${name}]: child gone (${why}); respawning`);
-    failAllInflight(`chikin browser restarted (${why}); retry the request`);
-    // Those requests got error replies; nothing left to verify or decorate.
-    pendingNavs.clear();
-    toolsListIds.clear();
-    navStrikes = 0;
     try {
-      await child?.close();
-    } catch {
-      /* already gone */
-    }
-    for (let attempt = 1; attempt <= MAX_RESPAWN_ATTEMPTS; attempt++) {
-      if (session?.isClosed) return;
-      const gen = ++childGen;
+      log.warn(`session[${name}]: child gone (${why}); respawning`);
+      failAllInflight(`chikin browser restarted (${why}); retry the request`);
+      // Those requests got error replies; nothing left to verify or decorate.
+      pendingNavs.clear();
+      toolsListIds.clear();
+      navStrikes = 0;
       try {
-        const c = await startChild(gen);
-        await replayInitialize(c, gen);
-        child = c;
-        respawning = false;
-        log.info(`session[${name}]: child respawned (gen ${gen})`);
-        return;
-      } catch (e) {
-        log.warn(`session[${name}]: respawn attempt ${attempt} failed`, String(e));
-        await sleep(Math.min(500 * attempt, 5000));
+        await child?.close();
+      } catch {
+        /* already gone */
+      }
+      // Rebuild the child in whatever state this session is currently in: a
+      // browser-less session (issue #63) respawns browser-less and must NOT
+      // provision a container just because its child died.
+      const wantBrowser = currentIp !== null;
+      for (let attempt = 1; attempt <= MAX_RESPAWN_ATTEMPTS; attempt++) {
+        if (session?.isClosed) return;
+        const gen = ++childGen;
+        let spawned: StdioClientTransport | null = null;
+        try {
+          spawned = await startChild(gen, wantBrowser ? await provision() : null);
+          await replayInitialize(spawned, gen);
+          child = spawned;
+          spawned = null;
+          log.info(`session[${name}]: child respawned (gen ${gen})`);
+          return;
+        } catch (e) {
+          log.warn(`session[${name}]: respawn attempt ${attempt} failed`, String(e));
+          try {
+            await spawned?.close();
+          } catch {
+            /* already gone */
+          }
+          await sleep(Math.min(500 * attempt, 5000));
+        }
+      }
+      // Exhausted: fall back to dropping the session. The self-healing client
+      // bridge will then reconnect from scratch.
+      log.error(`session[${name}]: child respawn exhausted; closing session`);
+      await session.close("child respawn exhausted");
+    } finally {
+      respawning = false;
+    }
+  }
+
+  /**
+   * Claim this session's fleet slot: provision the browser and swap the
+   * browser-less child for one bound to its CDP. This is the whole of the lazy
+   * half of issue #63 — it runs on the FIRST frame that is real browser work,
+   * never on the MCP handshake.
+   *
+   * `provision()` deliberately runs BEFORE anything is torn down, so the common
+   * failure — `FleetFullError` — leaves the browser-less child exactly as it
+   * was. The session stays connected with every tool registered, and the same
+   * call succeeds the moment a slot frees. That is the difference between "one
+   * tool call failed" and the old "this session has no browser lane at all".
+   */
+  async function attachBrowser(): Promise<void> {
+    const ip = await provision();
+
+    // A cold provision blocks for tens of seconds, and the session can end or
+    // another child swap can begin inside that window — so re-establish both
+    // preconditions before touching any child state, exactly as respawnChild
+    // and handleReset do at their own spawn sites:
+    //  - the client may have disconnected, in which case `Session.close` has
+    //    already closed the BROWSER-LESS child. A child spawned after that
+    //    belongs to nobody and would outlive the session holding a CDP
+    //    connection open until the gateway restarts.
+    //  - the browser-less child may have died and `respawnChild` may be part
+    //    way through installing its replacement. Two swaps interleaving their
+    //    `childGen` bumps orphan one of them: the pump then drops every reply
+    //    from the live child (client requests hang instead of failing) and the
+    //    loser's retry reinstalls a browser-less child over the browser we just
+    //    provisioned, stranding its container. Waiting the other swap out keeps
+    //    the invariant every other site assumes — at most one swap at a time.
+    if (session.isClosed) return;
+    while (respawning && !session.isClosed) await sleep(250);
+    if (session.isClosed) return;
+
+    // Swap the child. `respawning` carries its established meaning here — "the
+    // child is being replaced" — so the pump fails concurrent frames retryably
+    // instead of sending them into a child that is going away.
+    respawning = true;
+    const old = child;
+    const gen = ++childGen; // orphans `old`: its onmessage/onclose go quiet
+    // Non-null while nothing else owns the new child yet, so the `finally` below
+    // is what closes it if the swap fails or the session went away mid-swap.
+    let spawned: StdioClientTransport | null = null;
+    try {
+      failAllInflight("chikin browser attaching; retry the request");
+      pendingNavs.clear();
+      toolsListIds.clear();
+      navStrikes = 0;
+      spawned = await startChild(gen, ip);
+      await replayInitialize(spawned, gen);
+      respawning = false;
+      if (session.isClosed) return;
+      child = spawned;
+      spawned = null;
+      log.info(`session[${name}]: browser attached at ${ip} (child gen ${gen})`);
+    } catch (e) {
+      // The container is up but the child swap failed. `currentIp` is set, so
+      // the ordinary respawn path re-attaches to that same warm container (and,
+      // if it must, drops the session for the client bridge to rebuild).
+      respawning = false;
+      log.warn(`session[${name}]: browser attach failed`, String(e));
+      void respawnChild("browser attach failed");
+      throw e;
+    } finally {
+      for (const c of [old, spawned]) {
+        try {
+          await c?.close();
+        } catch {
+          /* already gone */
+        }
       }
     }
-    // Exhausted: fall back to dropping the session. The self-healing client
-    // bridge will then reconnect from scratch.
-    respawning = false;
-    log.error(`session[${name}]: child respawn exhausted; closing session`);
-    await session.close("child respawn exhausted");
+  }
+
+  /**
+   * Attach the browser at most once, sharing one attach across racers. The
+   * in-flight attach is checked FIRST: from `startChild` onwards `currentIp` is
+   * set while the browser-bound child is still starting, and a racer that
+   * short-circuited on it there would be forwarded into a child that does not
+   * exist yet. Awaiting the shared promise also keeps racers in arrival order.
+   */
+  function ensureBrowser(): Promise<void> {
+    if (attaching) return attaching;
+    if (currentIp) return Promise.resolve();
+    attaching = attachBrowser().finally(() => {
+      attaching = null;
+    });
+    return attaching;
   }
 
   // The model asked for a hard reset (it noticed the browser is wedged before
@@ -453,8 +638,36 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // child; never tracked in inflight (respawnChild would fail it mid-reset).
   async function handleReset(id: string | number | undefined): Promise<void> {
     log.warn(`session[${name}]: chikin_reset requested by client`);
-    while (respawning) await sleep(250); // let any in-progress respawn settle first
+    while (respawning && !session?.isClosed) await sleep(250); // let any in-progress respawn settle first
     if (session?.isClosed) return;
+    // A browser IS on its way — a cold provision blocks for tens of seconds,
+    // which is exactly when a model gets impatient and calls this. Saying
+    // "nothing to reset" here would be a lie about the one state where it
+    // matters, so answer with what is actually happening. Not awaited: the
+    // reset the caller asked for is a container recreate, and running one over
+    // a container that is still being built is worse than telling it to wait.
+    if (attaching) {
+      replyTool(
+        id,
+        "chikin is starting a browser for this session right now — your first browser tool call is still " +
+          "in flight. Nothing is wedged yet, so nothing was reset. Wait for that call to return, and use " +
+          "chikin_reset only if the browser it gives you is genuinely stuck.",
+        true,
+      );
+      return;
+    }
+    // Nothing exists to reset before the first browser tool call (issue #63) —
+    // and provisioning one here would hand a fleet slot to a session that has
+    // not asked for a browser, which is the bug this laziness fixes.
+    if (!currentIp) {
+      replyTool(
+        id,
+        "No browser is attached to this chikin session yet, so there is nothing to reset. " +
+          "A fresh browser is provisioned automatically on your first browser tool call.",
+        false,
+      );
+      return;
+    }
     try {
       await deps.provisioner.recreateContainer(name);
       await respawnChild("chikin_reset");
@@ -533,6 +746,59 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     );
   }
 
+  // Everything past the identify gate: track the request, record nav state, and
+  // hand the frame to the child. Split out of the pump below so the lazy-attach
+  // path can re-enter it with the very same frame once the browser is up.
+  function forwardToChild(msg: JSONRPCMessage, f: Frame): void {
+    const tracked = f && f.method !== undefined && f.id !== undefined;
+    if (tracked) {
+      inflight.set(f.id as string | number, true);
+      if (f.method === "tools/list") toolsListIds.add(f.id as string | number);
+      // Record nav requests + the browser's REAL page set right now, so the
+      // reply can be verified out-of-band (see verifyNav).
+      if (f.method === "tools/call" && NAV_TOOLS.has(f.params?.name ?? "")) {
+        const id = f.id as string | number;
+        const url = typeof f.params?.arguments?.url === "string" ? f.params.arguments.url : undefined;
+        const nav = { url, before: null as string[] | null };
+        pendingNavs.set(id, nav);
+        void realPages().then((p) => {
+          nav.before = p;
+        });
+      }
+    }
+
+    if (respawning || !child) {
+      if (tracked) failRequest(f.id as string | number, "chikin browser restarting; retry the request");
+      return;
+    }
+    const gen = childGen; // bind this send to the child it used
+    child.send(msg).catch((e) => {
+      const why = String(e);
+      log.warn(`session[${name}]: child send failed`, why);
+      // Only fail if a respawn hasn't already failed it (no duplicate replies),
+      // and never let a STALE rejection (child already replaced while this
+      // send's failure was in flight) kill the freshly respawned child.
+      if (tracked && inflight.has(f.id as string | number))
+        failRequest(f.id as string | number, `chikin browser send failed (${why}); retry the request`);
+      if (gen === childGen) void respawnChild(`child send failed: ${why}`);
+    });
+  }
+
+  // First browser work on a browser-less session (issue #63): provision, rebind
+  // the child, then forward the frame that triggered it. If provisioning fails
+  // the session SURVIVES — the caller gets a retryable tool error with every
+  // tool still registered, instead of losing the browser lane for good.
+  async function attachThenForward(msg: JSONRPCMessage, f: Frame): Promise<void> {
+    try {
+      await ensureBrowser();
+    } catch (e) {
+      replyTool(f.id, browserUnavailableMessage(f.params?.name, e), true);
+      return;
+    }
+    if (session.isClosed) return;
+    forwardToChild(msg, f);
+  }
+
   // Client -> child pump. Cache initialize; track requests; fail fast while a
   // respawn is in flight so the client retries instead of hanging.
   http.onmessage = (msg) => {
@@ -566,39 +832,19 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     // handles itself above (identify/reset/block) and every non-tools/call frame
     // (ping, initialize, tools/list, notifications) is excluded by construction,
     // which is exactly what makes that clock meaningful.
-    if (isBrowserWork(f, session.handle !== undefined)) deps.registry.touchBrowserActivity(name);
-    const tracked = f && f.method !== undefined && f.id !== undefined;
-    if (tracked) {
-      inflight.set(f.id as string | number, true);
-      if (f.method === "tools/list") toolsListIds.add(f.id as string | number);
-      // Record nav requests + the browser's REAL page set right now, so the
-      // reply can be verified out-of-band (see verifyNav).
-      if (f.method === "tools/call" && NAV_TOOLS.has(f.params?.name ?? "")) {
-        const id = f.id as string | number;
-        const url = typeof f.params?.arguments?.url === "string" ? f.params.arguments.url : undefined;
-        const nav = { url, before: null as string[] | null };
-        pendingNavs.set(id, nav);
-        void realPages().then((p) => {
-          nav.before = p;
-        });
+    if (isBrowserWork(f, session.handle !== undefined)) {
+      deps.registry.touchBrowserActivity(name);
+      // ...and the same predicate is where the FLEET SLOT is claimed (issue
+      // #63). A container is created here, on the first frame that genuinely
+      // drives the browser — never on the handshake every MCP client sends at
+      // startup. One definition of "browser work", used for both the clock and
+      // the allocation, so the two can never disagree.
+      if (!browserReady()) {
+        void attachThenForward(msg, f);
+        return;
       }
     }
-
-    if (respawning || !child) {
-      if (tracked) failRequest(f.id as string | number, "chikin browser restarting; retry the request");
-      return;
-    }
-    const gen = childGen; // bind this send to the child it used
-    child.send(msg).catch((e) => {
-      const why = String(e);
-      log.warn(`session[${name}]: child send failed`, why);
-      // Only fail if a respawn hasn't already failed it (no duplicate replies),
-      // and never let a STALE rejection (child already replaced while this
-      // send's failure was in flight) kill the freshly respawned child.
-      if (tracked && inflight.has(f.id as string | number))
-        failRequest(f.id as string | number, `chikin browser send failed (${why}); retry the request`);
-      if (gen === childGen) void respawnChild(`child send failed: ${why}`);
-    });
+    forwardToChild(msg, f);
   };
 
   http.onclose = () => void session.close("http transport closed");
@@ -616,8 +862,11 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     (s) => deps.registry.remove(s),
   );
 
-  // Child first so its stdin is ready before the initialize frame arrives.
-  child = await startChild(++childGen);
+  // Child first so its stdin is ready before the initialize frame arrives — but
+  // BROWSER-LESS (issue #63). It answers the handshake, tools/list and pings on
+  // its own; `attachBrowser` provisions the container later, if and when this
+  // session actually drives a browser.
+  child = await startChild(++childGen, null);
   await http.start();
 
   return session;

@@ -26,6 +26,28 @@ test("a live session blocks a new reserve for the same name", () => {
   assert.equal(r.reserve("alice"), false, "live session must block reserve");
 });
 
+// CHK-015: the reaper calls off a profile-volume removal while a provision is in
+// flight. Since issue #63 that is no longer the reserve/add window — the
+// container is created on the first browser tool call, with the session long
+// since live — so the mark has to cover the lazy attach and respawn paths too,
+// or a sweep can delete a freshly seeded volume out from under them.
+test("a provision on a live session still reads as pending (CHK-015)", () => {
+  const r = new Registry();
+  r.reserve("inst-9");
+  r.add(fakeSession("inst-9", r));
+  assert.equal(r.isPending("inst-9"), false, "add() ended the reservation");
+
+  r.markProvisioning("inst-9");
+  assert.equal(r.isPending("inst-9"), true, "a lazy attach is a provision in flight");
+  r.markProvisioning("inst-9"); // a respawn overlapping the attach
+  r.clearProvisioning("inst-9");
+  assert.equal(r.isPending("inst-9"), true, "overlapping provisions are counted, not a boolean");
+  r.clearProvisioning("inst-9");
+  assert.equal(r.isPending("inst-9"), false, "and the name is reapable again once both finish");
+  r.clearProvisioning("inst-9"); // unbalanced clear must not go negative
+  assert.equal(r.isPending("inst-9"), false);
+});
+
 test("session id binding and removal; name reusable but activity persists", () => {
   const r = new Registry();
   r.reserve("bob", 100);

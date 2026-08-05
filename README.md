@@ -6,7 +6,7 @@ Real (non-headless) Google Chrome in Docker, for browser automation that should 
 
 - Full **headed** Chrome with no physical display (Xvfb). No `HeadlessChrome` in the User-Agent; `navigator.webdriver` is `undefined`; `navigator.plugins` populated.
 - **Per-name sticky profiles**: connect as `alice` and you always get the same cookies/history; `bob` is fully isolated.
-- **On-demand lifecycle**: browsers are provisioned on first connect and reaped when idle — nothing runs until someone asks for it.
+- **On-demand lifecycle**: a browser is provisioned on a session's first *browser tool call* — not on connect — and reaped when idle. Merely having chikin in your MCP config costs nothing, so idle clients can't sit on the fleet.
 - **noVNC** for every browser, so a human can watch or solve a captcha from one dashboard.
 - A per-browser host directory (`/tmp/chikin-shared/<name>`) wired into that browser as `~/Downloads` for file upload/download.
 
@@ -24,13 +24,13 @@ Real (non-headless) Google Chrome in Docker, for browser automation that should 
  Claude Code B (host) ─┤  HTTP/MCP + bearer      │     vol chikin-profile-alice)
  Claude Code C (host) ─┼──► GATEWAY ─────────────┼─ chikin-chrome-bob    (…chikin-profile-bob…)
                        │   127.0.0.1:8080         │
-                       └                          └─ (provisioned on demand, reaped when idle)
+                       └                          └─ (provisioned on first browser tool call, reaped when idle)
                               │ scoped docker API (tecnativa/docker-socket-proxy)
                               └─ create / start / stop chrome containers
 ```
 
 - The gateway exposes **one MCP endpoint per browser** at `/b/<name>/`. `<name>` must match `[a-z0-9-]+` (1–32 chars). It maps to container `chikin-chrome-<name>` and volume `chikin-profile-<name>`.
-- On first connect to a name, the gateway provisions the container (creating the profile volume if needed), waits for Chrome to come up, spawns **one** `chrome-devtools-mcp` child bound to that browser's CDP endpoint, and bridges the client's HTTP MCP session to the child's stdio.
+- On connect, the gateway spawns **one** `chrome-devtools-mcp` child and bridges the client's HTTP MCP session to the child's stdio. No container yet: the child answers `initialize`, `tools/list` and pings on its own. On the session's **first browser tool call** the gateway provisions the container (creating the profile volume if needed), waits for Chrome to come up, and rebinds the child to that browser's CDP endpoint.
 - **Networks.** `chikin-net` is `internal: true` and carries the control plane (gateway ↔ socket-proxy ↔ Chrome CDP). `chikin-egress` is a normal bridge that gives the browsers internet access. No Chrome ports are published to the host.
 - The gateway talks to Docker **only** through `tecnativa/docker-socket-proxy`, scoped to containers + volumes + images (+ POST). No `exec`, no host `info`, no swarm/secrets.
 
@@ -62,7 +62,7 @@ open http://localhost:8080/                   # fleet dashboard
 `/healthz` carries the **effective runtime config of the running gateway** — see
 [Checking the effective config](#checking-the-effective-config).
 
-The gateway listens on `127.0.0.1:8080` only. Browsers are **not** compose services — they appear on demand when a client connects.
+The gateway listens on `127.0.0.1:8080` only. Browsers are **not** compose services — they appear on demand, on a client's first browser tool call.
 
 ### Wire up a client
 
@@ -87,9 +87,9 @@ chikin-claude carey --continue # another instance, isolated "carey"
 
 Env (read by `chikin-mcp`): `CHIKIN_GATEWAY` (default `http://localhost:8080`), `CHIKIN_NAME` (explicit browser name), `CHIKIN_TOKEN` (bearer, only if `GATEWAY_TOKEN` is set).
 
-The first tool call provisions and starts the browser (a few seconds). A named browser (`giard`) always gets the same profile. Disconnect and the browser stays warm for a fast reconnect; leave it idle past `IDLE_TTL_SEC` with no client attached and it's **removed** — for a named browser the profile volume is preserved, so reconnecting restores everything, while a disposable `inst-<pid>` browser's profile goes with it (see [Profile volumes](#profile-volumes-and-cleaning-them-up)).
+The first browser tool call provisions and starts the browser (about a second). Connecting alone does not — a client that never browses holds no fleet slot. A named browser (`giard`) always gets the same profile. Disconnect and the browser stays warm for a fast reconnect; leave it idle past `IDLE_TTL_SEC` with no client attached and it's **removed** — for a named browser the profile volume is preserved, so reconnecting restores everything, while a disposable `inst-<pid>` browser's profile goes with it (see [Profile volumes](#profile-volumes-and-cleaning-them-up)).
 
-Staying connected is no longer enough on its own: a session that holds the link open but runs no browser tool for `ATTACHED_IDLE_TTL_SEC` (4h) is reclaimed too, so a fleet of connected-but-idle windows can't sit on every slot. The client bridge reconnects transparently on the next tool call.
+A connected client that never browses costs nothing at all — it holds no container, so it can't sit on a slot however long it stays open. And a session that *did* browse but has run no browser tool for `ATTACHED_IDLE_TTL_SEC` (4h) is reclaimed even while attached; the client bridge reconnects transparently on the next tool call.
 
 #### Direct HTTP transport (pin a browser, or non–Claude-Code clients)
 
@@ -103,7 +103,7 @@ claude mcp add --transport http bob   http://localhost:8080/b/bob/ \
   --header "Authorization: Bearer $GATEWAY_TOKEN"
 ```
 
-`alice` and `bob` get fully isolated profiles (volumes `chikin-profile-alice`, `chikin-profile-bob`); the gateway provisions each browser on first use. Only one client may hold a given name at a time — a second concurrent connect to `alice` is rejected with `409`. This is exactly the form any streamable-HTTP MCP client uses; `chikin-mcp` is just a convenience wrapper that fills in the name (and the bearer) for you.
+`alice` and `bob` get fully isolated profiles (volumes `chikin-profile-alice`, `chikin-profile-bob`); the gateway provisions each browser on its first browser tool call. Only one client may hold a given name at a time — a second concurrent connect to `alice` is rejected with `409`. This is exactly the form any streamable-HTTP MCP client uses; `chikin-mcp` is just a convenience wrapper that fills in the name (and the bearer) for you.
 
 ### Identify your session first (`chikin_identify`) — **required**
 
@@ -144,7 +144,7 @@ chikin-record --help    # full options: --seconds --fps --width --out …
 
 Outputs are named `<name>-<timestamp>.mp4` / `.gif`. If neither `--mp4` nor `--gif` is given it defaults to an mp4.
 
-**Prerequisites:** `ffmpeg` and Node ≥ 22 on the **host** (the global `WebSocket` used to drive CDP needs Node ≥ 22), plus a running browser — connect a client to `/b/<name>/` once (e.g. `chikin-claude <name>`) to provision `chikin-chrome-<name>` before recording.
+**Prerequisites:** `ffmpeg` and Node ≥ 22 on the **host** (the global `WebSocket` used to drive CDP needs Node ≥ 22), plus a running browser — connecting alone no longer provisions one, so drive **one browser tool call** against `/b/<name>/` first (e.g. `chikin-claude <name>`, then have it navigate somewhere) to provision `chikin-chrome-<name>` before recording.
 
 **Timing note:** screencast frames are **event-driven** — Chrome emits one only when the page changes visually, not at a fixed fps — so `chikin-record` timestamps every frame and reconstructs real timing (a mostly-static page still yields a full-length clip by holding the last frame). A page with no visual change at all can emit very few frames.
 
@@ -244,6 +244,9 @@ saves you from an **unfiltered** `docker volume prune --all`.
 The gateway also sweeps orphaned `chikin-profile-inst-*` volumes (instance profiles
 whose container no longer exists) once at startup — that reclaims leftovers from
 before it removed them with the container. Set `CHIKIN_VOLUME_GC=0` to disable.
+The reaper does the same during normal operation for a name it is tracking whose
+container went away out-of-band, once that name has no session, no open stream,
+and has been idle past `IDLE_TTL_SEC` — sticky profiles are never candidates.
 
 ---
 
@@ -255,14 +258,14 @@ Set in `.env` (see `.env.example`) or the environment.
 |---|---|---|
 | `GATEWAY_TOKEN` | *(empty)* | Bearer token clients must present. **Empty disables auth** — safe because the port is bound to `127.0.0.1`. Set one (`openssl rand -hex 32`) to require it. |
 | `CHIKIN_SANDBOX` | `auto` | Chrome renderer-sandbox policy (H1). `auto` sandboxes where the host permits unprivileged user namespaces and falls back to `--no-sandbox` (loud WARN) where it doesn't; `on` forces it (fails loudly if unsupported); `off` forces `--no-sandbox`. See [Renderer sandbox](#renderer-sandbox-h1). |
-| `MAX_FLEET` | `8` | Max concurrent browsers. Provisioning past the cap is rejected with HTTP 429 instead of OOMing the host. |
+| `MAX_FLEET` | `8` | Max concurrent browsers — counting only those actually provisioned, i.e. sessions that have made a browser tool call. A browser tool call past the cap comes back as a retryable tool error naming the cap; the session stays up with every tool registered, so it just works once a slot frees. |
 | `BROWSER_MEMORY_MB` | `3072` | Hard RAM cap per browser (swap pinned equal — no swap escape). Must exceed the 2g `/dev/shm` each browser gets (that tmpfs is charged to the same cgroup); `3072` leaves ~1g headroom for Chrome above a full shm. `0` disables. |
 | `BROWSER_PIDS_LIMIT` | `512` | Max processes/threads per browser — the fork-bomb guard. `0` disables. |
 | `BROWSER_CPUS` | `2.0` | CPU cap per browser in cores (fractions allowed, e.g. `1.5`); mapped to Docker `NanoCpus`. `0` disables. |
 | `BROWSER_NOFILE` | `8192` | Open-file-descriptor ceiling per browser (soft=hard). Kept generous because Chrome is fd-hungry. `0` disables. |
 | `SEED_VOLUME` | *(empty)* | Docker volume cloned into every new profile so browsers start logged in. Empty = off. Populate with `bin/chikin-snapshot` (see [Pre-authenticated browsers](#pre-authenticated-browsers-golden-profile)). |
 | `IDLE_TTL_SEC` | `900` | Idle seconds before a **detached** browser (no attached client stream) is reaped. Measured against any MCP traffic. |
-| `ATTACHED_IDLE_TTL_SEC` | `14400` | Seconds an **attached** browser may go with no real browser tool call before it is reclaimed anyway. Measured against actual forwarded `tools/call`s — *not* the client bridge's keepalive ping, which by design keeps the plain idle clock fresh — and shown as the dashboard's `browser idle` column. Without this, one connected-but-idle window holds a fleet slot for its whole lifetime and the fleet saturates with browsers parked on `about:blank`. Eviction is survivable: the bridge reconnects transparently, though a disposable `inst-*` browser's profile is discarded with it (logged explicitly). `0` = never reap an attached browser (pre-#57 behaviour). Keep it well above `IDLE_TTL_SEC`. |
+| `ATTACHED_IDLE_TTL_SEC` | `14400` | Seconds an **attached** browser may go with no real browser tool call before it is reclaimed anyway. Measured against actual forwarded `tools/call`s — *not* the client bridge's keepalive ping, which by design keeps the plain idle clock fresh — and shown as the dashboard's `browser idle` column. Without this, a window that made one browser tool call and then went idle holds that fleet slot for its whole lifetime and the fleet saturates with browsers parked on `about:blank`. Eviction is survivable: the bridge reconnects transparently, though a disposable `inst-*` browser's profile is discarded with it (logged explicitly). `0` = never reap an attached browser (pre-#57 behaviour). Keep it well above `IDLE_TTL_SEC`. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
 | `CHIKIN_VOLUME_GC` | `1` | Sweep orphaned `chikin-profile-inst-*` volumes (disposable profiles whose container is gone) once at startup. Scoped by name — `golden`, `hermes` and named client profiles are never candidates. `0` disables. See [Profile volumes](#profile-volumes-and-cleaning-them-up). |
 | `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up before failing the connect. |
@@ -304,7 +307,9 @@ To fix a drifted gateway, recreate it *from the repo dir* so compose reads `.env
 2. **`chikin_reset` tool** — injected into every `tools/list` (alongside `chikin_identify`, see [Identify your session first](#identify-your-session-first-chikin_identify--required)), so the model itself can hard-reset a wedged browser (container recreated, profile/logins preserved) without human help.
 3. **Self-healing transports** — both the client bridge and the gateway replay the cached `initialize` over a rebuilt link, so none of the above ever drops the client's MCP session.
 
-Gateway responses use JSON-RPC error envelopes with these HTTP statuses: `401` (bad/missing token), `400` (invalid name or non-initialize without a session), `409` (a name already has an active session), `429` (fleet full), `503` (provisioning failed).
+**SSE keepalive.** Node's `fetch` (undici) kills a response body that has been idle for 300s, and the MCP event stream is silent whenever a client sits between tool calls — so every long-lived session used to be torn down and rebuilt on a ~301s cycle. That was invisible except for one symptom: a reconnect frees the session's `chikin_identify` handle, so sessions kept losing their identity (and, with it, access to every browser tool until they re-identified) every five minutes. The gateway now writes a `: keepalive` SSE comment into open streams every 30s. It is protocol-invisible, and it covers POST replies too, so a tool call slower than 300s no longer dies mid-flight.
+
+Gateway responses use JSON-RPC error envelopes with these HTTP statuses: `401` (bad/missing token), `400` (invalid name or non-initialize without a session), `409` (a name already has an active session), `503` (session setup failed). A full fleet is no longer an HTTP status: since provisioning is lazy it surfaces on the offending tool call, as a retryable tool error.
 
 ---
 
@@ -395,8 +400,13 @@ Exit codes: `0` all required checks passed · `1` a required check failed · `2`
 cd gateway
 npm install
 npm run build        # tsc -> dist/
-npm test             # unit tests (names, registry, reaper)
+npm test             # unit tests (run in CI too)
 ```
+
+Needs **Node ≥ 22** on the host (the gateway's `engines`, matching its
+`node:22-bookworm-slim` runtime): `npm test` runs `node --test "dist/test/*.test.js"`,
+and `--test` only expands a glob from Node 21 on — on Node 20 the pattern is taken
+literally and nothing runs.
 
 **Local images need the dev override — always.** `docker-compose.yml` hardcodes
 `CHROME_IMAGE: ghcr.io/jra3/chikin:${CHIKIN_VERSION}` (only the *tag* is variable,
@@ -424,7 +434,7 @@ The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTranspor
 
 **"browser '<name>' already has an active session" (409).** That name is in use by another client. Pick a different name, or have the other client disconnect (MCP `DELETE`/terminate frees the name immediately).
 
-**"fleet is full" (429).** Raise `MAX_FLEET` or let an idle browser get reaped.
+**"fleet is full" on a browser tool call.** Every slot is held by a browser that has actually been driven. Raise `MAX_FLEET`, let an idle browser get reaped, or retry — the session survives, so the same call succeeds once a slot frees. The dashboard's "fleet slots in use" line and `browser idle` column show what is holding them.
 
 **New browsers are logged out / the golden profile isn't applied.** Seeding is off
 in the *running* gateway. Check `curl -s localhost:8080/healthz | grep seed` or the

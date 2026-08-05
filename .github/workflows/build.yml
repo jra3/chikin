@@ -56,14 +56,32 @@ jobs:
           cache-from: type=gha,scope=gateway-${{ matrix.short }}
           cache-to: type=gha,mode=max,scope=gateway-${{ matrix.short }}
 
+      # 22 to match the gateway runtime image (node:22-bookworm-slim), and
+      # because the gateway suite is run with `node --test "dist/test/*.test.js"`:
+      # glob expansion for --test only arrived in Node 21, so on 20 the pattern
+      # is taken literally and the step fails before running a single test.
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Unit tests (verify)
         working-directory: verify
         run: |
           npm ci
+          npm test
+
+      # The gateway's own suite, which CI never ran. Every fleet-lifecycle
+      # invariant lives there and nowhere else: lazy provisioning (a connected
+      # client must claim no fleet slot — issue #63), the two-tier idle reap
+      # (#57), and the name-based profile-volume safety rules (#58/#59). The
+      # smoke test below drives one browser; it cannot see any of those.
+      - name: Unit tests (gateway)
+        working-directory: gateway
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "1"
+        run: |
+          npm ci
+          npm run build
           npm test
 
       # Stand up the whole fleet from the locally-built images and prove a
