@@ -128,7 +128,7 @@ A session's browser name (`inst-<pid>`) says *which profile* it drives, not *wha
 
 Open the dashboard at <http://localhost:8080/> and click **open noVNC** next to any running browser, or go straight to `http://localhost:8080/vnc/<name>/`. You can drive that Chrome window by hand — useful for logging in or clearing a captcha while the MCP client keeps the session. The page title and the dashboard's **handle** column show which session (`chikin_identify` handle) owns each browser.
 
-The dashboard is also the only place the connected-vs-driven split is visible: **`fleet slots in use: N/MAX`** counts only sessions that have actually made a browser tool call, and sessions that haven't are listed as **`connected — holds no fleet slot`** with no noVNC link (there is no browser to view yet — that URL 502s until one exists). The **`browser idle`** column is time since a real browser tool call, which is what the attached reap TTL measures; the plain **`idle`** column stays near zero on any attached session because the client bridge pings.
+The dashboard is also the only place the connected-vs-driven split is visible: **`fleet slots in use: N/MAX`** counts *browsers that exist* — every fleet container, i.e. every name that has made a browser tool call and not yet been reaped, including ones whose client has since disconnected. Live sessions that have never made one hold no slot and are listed as **`connected — holds no fleet slot`**, with no noVNC link (there is no browser to view yet — that URL 502s until one exists). The **`browser idle`** column is time since a real browser tool call, which is what the attached reap TTL measures; the plain **`idle`** column stays near zero on any attached session because the client bridge pings.
 
 ### Recording (video / GIF)
 
@@ -179,7 +179,7 @@ chikin-snapshot                            # clones golden's profile -> chikin-s
 No MCP client handy? `client/keepalive.mjs` does step 2 for you from a repo checkout — it identifies, makes one browser tool call to provision the browser, and then keeps driving it so it isn't reaped while you log in:
 
 ```bash
-# prefix GATEWAY_TOKEN=<token> if you set a bearer in .env
+# prefix GATEWAY_TOKEN=<token> (or CHIKIN_TOKEN) if you set a bearer in .env
 node client/keepalive.mjs http://localhost:8080/b/golden/   # ^C when you're done
 ```
 

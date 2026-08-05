@@ -20,7 +20,7 @@
 // plain idle clock and the session warm between beats.
 //
 // Usage: node keepalive.mjs [http://localhost:8080/b/<name>/]
-//        GATEWAY_TOKEN=<token>   if the gateway requires a bearer
+//        GATEWAY_TOKEN=<token> (or CHIKIN_TOKEN)   if the gateway requires a bearer
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -32,7 +32,11 @@ const name = url.pathname.split("/").filter(Boolean).pop() ?? "golden";
 // Handle rule (gateway names.ts): 1-32 chars, [a-z0-9-], no leading/trailing dash.
 const handle = `keepalive-${name}`.slice(0, 32).replace(/-+$/, "");
 const vnc = new URL(`/vnc/${name}/`, url).href;
-const token = process.env.GATEWAY_TOKEN;
+// Both spellings of the same bearer: GATEWAY_TOKEN is what .env and the README
+// snippet for this script use, CHIKIN_TOKEN is the client-side convention
+// (bridge.mjs, chikin-mcp, verify-fleet.js) an operator may already have
+// exported. `||`, not `??`: an exported-but-empty var means "no auth", not "".
+const token = process.env.GATEWAY_TOKEN || process.env.CHIKIN_TOKEN || "";
 
 const transport = new StreamableHTTPClientTransport(
   url,
@@ -42,7 +46,15 @@ const client = new Client({ name: "chikin-keepalive", version: "0.0.0" }, { capa
 try {
   await client.connect(transport);
 } catch (e) {
-  console.error(`keepalive: could not connect to ${url.href}: ${e.message}`);
+  // The SDK's StreamableHTTPError carries the HTTP status as `.code` but does
+  // NOT put it in the message, so a rejected bearer otherwise reads only as the
+  // gateway's raw JSON-RPC body — with no hint about which env var to set.
+  const msg = String(e?.message ?? e);
+  const hint =
+    e?.code === 401
+      ? ` — the gateway rejected ${token ? "this bearer" : "an unauthenticated request"}; set GATEWAY_TOKEN (or CHIKIN_TOKEN) to the gateway's GATEWAY_TOKEN`
+      : "";
+  console.error(`keepalive: could not connect to ${url.href}: ${msg}${hint}`);
   process.exit(1);
 }
 
