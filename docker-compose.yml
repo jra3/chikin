@@ -157,5 +157,15 @@ networks:
     name: chikin-net
     internal: true
   # Egress: gives provisioned browsers real internet access for browsing.
+  # enable_icc=false (CHK-002): no browser-to-browser traffic is ever legitimate
+  # on the egress plane, and the gateway reaches browsers on chikin-net, so
+  # dropping bridge-internal forwarding here costs nothing and removes one of
+  # the two L2 domains every browser shared. Verified behaviourally: the DROP
+  # rule is br->br only, so published-port ingress, container->internet egress
+  # and embedded DNS all survive it. NOTE the same option on chikin-net would
+  # break the product — that rule is symmetric and the gateway's own CDP connect
+  # rides that bridge. Cross-browser isolation there needs per-name networks.
   chikin-egress:
     name: chikin-egress
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"

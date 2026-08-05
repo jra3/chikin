@@ -85,8 +85,12 @@ socat "TCP-LISTEN:$CDP_PORT,fork,reuseaddr" "TCP:127.0.0.1:$CHROME_LOOPBACK_PORT
 # Optional noVNC: a human can watch/drive this browser (captcha solving) via
 # the gateway's /vnc/<name>/ reverse proxy. x11vnc exposes the Xvfb display on
 # 5900; websockify serves the noVNC web client + a websocket bridge on VNC_PORT.
+# -localhost is load-bearing (CHK-002): x11vnc runs -nopw, so a 0.0.0.0 bind put
+# unauthenticated full keyboard/mouse into this X display on every interface,
+# reachable by any peer browser on the shared networks — no handshake at all.
+# websockify is the only legitimate client and it dials localhost:5900 below.
 if [ "$ENABLE_VNC" = "1" ]; then
-  x11vnc -display ":$DISPLAY_NUM" -forever -shared -nopw -rfbport 5900 -quiet -bg \
+  x11vnc -display ":$DISPLAY_NUM" -forever -shared -nopw -localhost -rfbport 5900 -quiet -bg \
     || echo "entrypoint: x11vnc failed to start" >&2
   websockify --web=/usr/share/novnc "$VNC_PORT" localhost:5900 &
 fi
@@ -142,6 +146,11 @@ case "$CHIKIN_SANDBOX" in
     ;;
 esac
 
+# --remote-allow-origins stays `*` deliberately (CHK-002). chrome-devtools-mcp
+# sends NO Origin header on the CDP websocket upgrade, and Chrome >=111 rejects
+# an absent origin unless the allow-list is `*` — narrowing this to the
+# gateway's origin breaks every tool call. It is not the isolation boundary
+# anyway: a deliberate peer just omits Origin. Isolation is the network's job.
 # shellcheck disable=SC2086
 exec google-chrome \
   --remote-debugging-port="$CHROME_LOOPBACK_PORT" \
