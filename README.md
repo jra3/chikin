@@ -78,7 +78,7 @@ ln -s "$PWD/bin/chikin-claude" ~/.local/bin/chikin-claude
 claude mcp add --scope user chikin -- ~/.local/bin/chikin-mcp
 ```
 
-Now any `claude` instance — even several in the same directory — connects to its own isolated browser, and the gateway multiplexes them (up to `MAX_FLEET`). The default name `inst-<pid>` is unique per running instance; **pin a sticky, persistent browser** by name with the wrapper (it just exports `CHIKIN_NAME`):
+Now any `claude` instance — even several in the same directory — gets its own isolated browser, and the gateway multiplexes them (up to `MAX_FLEET`). The default name `inst-<pid>` is unique per running instance; **pin a sticky, persistent browser** by name with the wrapper (it just exports `CHIKIN_NAME`):
 
 ```bash
 chikin-claude giard            # this instance drives the sticky "giard" profile
@@ -179,6 +179,7 @@ chikin-snapshot                            # clones golden's profile -> chikin-s
 No MCP client handy? `client/keepalive.mjs` does step 2 for you from a repo checkout — it identifies, makes one browser tool call to provision the browser, and then keeps driving it so it isn't reaped while you log in:
 
 ```bash
+# prefix GATEWAY_TOKEN=<token> if you set a bearer in .env
 node client/keepalive.mjs http://localhost:8080/b/golden/   # ^C when you're done
 ```
 
