@@ -37,12 +37,19 @@ const usage = (msg) => {
 };
 if (!mode || !name) usage("missing mode or browser name");
 if (!["mark", "read", "hold"].includes(mode)) usage(`unknown mode '${mode}'`);
-if (mode === "mark" && arg === undefined) usage("mark needs a marker value");
-// hold's whole contract is a duration, and `Number(undefined) * 1000` is NaN,
-// which setTimeout fires immediately — printing HELD having held nothing, exit
-// 0. That is the same silent-green failure this file exists to stop.
+// An empty or whitespace-only marker asserts nothing: the read-back below would
+// compare it against itself and pass having proven no profile survived anything.
+if (mode === "mark" && !(arg ?? "").trim()) usage("mark needs a non-empty marker value");
+// hold's whole contract is a duration, and any duration setTimeout cannot
+// actually wait on fires the timer immediately — printing HELD having held
+// nothing, exit 0. `Number(undefined)` is NaN, zero/negatives are instant, and
+// anything past setTimeout's 2^31-1 ms ceiling wraps to ~1ms. All of it is the
+// same silent-green failure this file exists to stop.
+const MAX_HOLD_SECONDS = 2147483;
 const seconds = Number(arg);
-if (mode === "hold" && !Number.isFinite(seconds)) usage(`hold needs seconds, got ${JSON.stringify(arg)}`);
+if (mode === "hold" && !(Number.isFinite(seconds) && seconds > 0 && seconds <= MAX_HOLD_SECONDS)) {
+  usage(`hold needs seconds in 1..${MAX_HOLD_SECONDS}, got ${JSON.stringify(arg)}`);
+}
 
 const label = mode.toUpperCase();
 const s = await connect(name);
@@ -68,6 +75,22 @@ async function die(msg) {
   process.exit(1);
 }
 
+// chrome-devtools-mcp reports an evaluate_script return value as `JSON.stringify`
+// inside a ```json fence, wrapped in a larger envelope (page list, console
+// noise). Matching a marker against that whole envelope is #66's trap in a new
+// costume — a substring that happens to appear in the surrounding text passes
+// while proving nothing — so pull the value out and compare the value itself.
+async function evalValue(fn) {
+  const text = textOf(await mustCall("evaluate_script", { function: fn }));
+  const fence = text.match(/```json\s*([\s\S]*?)```/);
+  if (!fence) await die(`evaluate_script returned no value: ${text.slice(0, 120)}`);
+  try {
+    return JSON.parse(fence[1].trim());
+  } catch {
+    await die(`evaluate_script value is not JSON: ${fence[1].slice(0, 120)}`);
+  }
+}
+
 await mustCall("chikin_identify", { handle: handleFor(mode, name) });
 
 if (mode === "mark" || mode === "read") {
@@ -79,15 +102,17 @@ if (mode === "mark" || mode === "read") {
     await mustCall("evaluate_script", {
       function: `() => localStorage.setItem('reapmark', ${JSON.stringify(arg)})`,
     });
-    const got = textOf(await mustCall("evaluate_script", { function: "() => localStorage.getItem('reapmark')" }));
+    const got = await evalValue("() => localStorage.getItem('reapmark')");
     // Read back what we just wrote. A mismatch means the write didn't stick, so
     // it fails loudly too — printing SET with the wrong value and exiting 0 is
     // the same "looks like data" trap as the gate error was.
-    if (!got.includes(arg)) await die(`marker did not read back: ${got.slice(0, 120)}`);
+    if (got !== arg) {
+      await die(`marker did not read back: wrote ${JSON.stringify(arg)}, got ${JSON.stringify(got)}`);
+    }
     console.log("SET ok");
   } else {
-    const got = textOf(await mustCall("evaluate_script", { function: "() => String(localStorage.getItem('reapmark'))" }));
-    console.log("MARKER=" + got.replace(/\s+/g, " ").trim());
+    const got = await evalValue("() => String(localStorage.getItem('reapmark'))");
+    console.log("MARKER=" + got);
   }
   await teardown(s);
 } else {
