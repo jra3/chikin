@@ -36,9 +36,17 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // while the underlying Chrome is perfectly healthy. None of that is a
 // transport failure, so the respawn path would never trigger. Instead we
 // verify navigations OUT OF BAND: after the child reports a nav succeeded, we
-// ask the container's CDP /json/list (ground truth) whether the page set
-// actually moved. Strikes on consecutive failures force a child respawn — a
-// fresh child binds the browser's REAL current target.
+// compare the page list the CHILD reports against the container's CDP
+// /json/list (ground truth). Strikes on consecutive failures force a child
+// respawn — a fresh child binds the browser's REAL current target.
+//
+// The test is "does the child's view of the browser match the browser?", NOT
+// "did the page set move?". Those look equivalent and are not: a nav to a URL
+// that redirects to the page you are ALREADY on moves nothing, and the older
+// did-it-move test struck healthy children for it (a live session took a
+// strike on Ancestry's legacy->canonical person-page redirect; two in a row
+// bounce a working child mid-task). A wedged child is identifiable directly —
+// it reports a stale URL the browser no longer has open — so test that.
 const NAV_TOOLS = new Set(["navigate_page", "new_page", "navigate_page_history"]);
 const NAV_VERIFY_DELAY_MS = Number(process.env.NAV_VERIFY_DELAY_MS || 2500);
 const NAV_WEDGE_STRIKES = 2;
@@ -61,6 +69,49 @@ const CDP_FAIL_RE = /fetch failed|ECONNREFUSED|ERR_CONNECTION_REFUSED|socket han
 // address — and the CDP-failure watchdog is disabled while browser-less
 // (startChild below), so such an error could never respawn-loop.
 const NO_BROWSER_URL = "http://127.0.0.1:1";
+
+// The child's own view of the browser, parsed out of the "## Pages" block
+// chrome-devtools-mcp appends to every page-scoped tool reply:
+//
+//   ## Pages
+//   0: https://example.com/
+//   1: https://example.org/ [selected]
+//
+// `selected` is the page the child believes its tools act on — the value that
+// goes stale when it wedges. Returns null when no page block is parseable,
+// which must NOT be read as "healthy" (see navVerdict).
+export function reportedPages(result: unknown): { pages: string[]; selected?: string } | null {
+  const content = (result as { content?: Array<{ type?: string; text?: string }> })?.content;
+  if (!Array.isArray(content)) return null;
+  const text = content
+    .filter((c) => c?.type === "text" && typeof c.text === "string")
+    .map((c) => c.text as string)
+    .join("\n");
+  const pages: string[] = [];
+  let selected: string | undefined;
+  for (const line of text.split("\n")) {
+    const m = /^\s*\d+:\s+(\S+)(\s+\[selected\])?\s*$/.exec(line);
+    if (!m) continue;
+    pages.push(m[1]);
+    if (m[2]) selected = m[1];
+  }
+  return pages.length ? { pages, selected } : null;
+}
+
+// The whole wedge decision, kept pure so it can be tested without a browser.
+//
+//   "ok"      — the child's selected page is really open; it is not wedged
+//   "wedge"   — the child is acting on a page the browser does not have
+//   "unknown" — not enough evidence; NEVER strike (no ground truth, or the
+//               child's reply carried no page block, e.g. upstream changed the
+//               format — reportedPagesFormat below is what catches that)
+export function navVerdict(
+  reported: { pages: string[]; selected?: string } | null,
+  real: string[] | null,
+): "ok" | "wedge" | "unknown" {
+  if (!real || !reported?.selected) return "unknown";
+  return real.some((u) => sameDoc(u, reported.selected as string)) ? "ok" : "wedge";
+}
 
 // Two URLs point at the same document if origin+path match (query/hash differ
 // across redirects too often to compare strictly).
@@ -280,8 +331,8 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // "Can a browser frame go straight to the child?" — the question `currentIp`
   // alone cannot answer, and the reason it must not be asked alone.
   const browserReady = (): boolean => currentIp !== null && attaching === null;
-  // nav request id -> what was asked for + the real page set before the nav
-  const pendingNavs = new Map<string | number, { url?: string; before: string[] | null }>();
+  // nav request id -> what was asked for (the child's view comes off its reply)
+  const pendingNavs = new Map<string | number, { url?: string }>();
   let navStrikes = 0;
   let cdpFailStreak = 0;
   // tools/list request ids whose replies need the synthetic chikin_reset appended
@@ -387,7 +438,10 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         if (nav) {
           pendingNavs.delete(f.id);
           if (!f.error && !f.result?.isError) {
-            setTimeout(() => void verifyNav(nav), NAV_VERIFY_DELAY_MS).unref?.();
+            // Capture the child's OWN view from this reply; verifyNav compares
+            // it against the browser a moment later.
+            const withView = { ...nav, reported: reportedPages(f.result) };
+            setTimeout(() => void verifyNav(withView), NAV_VERIFY_DELAY_MS).unref?.();
           }
         }
       }
@@ -400,25 +454,34 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     c.onerror = (e) => log.warn(`session[${name}]: child transport error`, String(e));
   }
 
-  // The child said the nav succeeded — did the browser actually move? Strike
-  // when the real page set is byte-identical to the pre-nav snapshot AND the
-  // requested URL is nowhere in it; two consecutive strikes = the stale-target
-  // wedge, and a fresh child (which binds the REAL current target) clears it.
-  // Redirects are safe: they change the page set, which resets the strikes.
-  async function verifyNav(nav: { url?: string; before: string[] | null }): Promise<void> {
+  // The child said the nav succeeded — is it still talking about the browser we
+  // actually have? Two consecutive disagreements = the stale-target wedge, and
+  // a fresh child (which binds the REAL current target) clears it. A nav that
+  // moved nothing is NOT evidence of a wedge on its own: see navVerdict.
+  async function verifyNav(nav: { url?: string; reported: ReturnType<typeof reportedPages> }): Promise<void> {
     if (session?.isClosed || respawning) return;
-    const after = await realPages();
-    if (!after || !nav.before) return; // no ground truth — never strike blind
-    const changed = JSON.stringify(after) !== JSON.stringify(nav.before);
-    const landed = nav.url !== undefined && after.some((u) => sameDoc(u, nav.url as string));
-    if (changed || landed) {
+    const real = await realPages();
+    const verdict = navVerdict(nav.reported, real);
+    if (verdict === "unknown") {
+      // A nav reply with no parseable page block means the signal is gone, not
+      // that the browser is fine — say so, or an upstream format change would
+      // silently retire the watchdog. (`reportedPages` is pinned by tests.)
+      if (real && !nav.reported)
+        log.warn(
+          `session[${name}]: nav reply carried no page list — wedge detection is blind ` +
+            `(chrome-devtools-mcp output format may have changed)`,
+        );
+      return;
+    }
+    if (verdict === "ok") {
       navStrikes = 0;
       return;
     }
     navStrikes++;
     log.warn(
       `session[${name}]: nav verify failed (${navStrikes}/${NAV_WEDGE_STRIKES}): ` +
-        `requested ${nav.url ?? "(history)"} but real pages unchanged [${after.join(", ")}]`,
+        `requested ${nav.url ?? "(history)"}; child is on ${nav.reported?.selected} ` +
+        `but the browser's real pages are [${(real ?? []).join(", ")}]`,
     );
     if (navStrikes >= NAV_WEDGE_STRIKES) {
       navStrikes = 0;
@@ -759,11 +822,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       if (f.method === "tools/call" && NAV_TOOLS.has(f.params?.name ?? "")) {
         const id = f.id as string | number;
         const url = typeof f.params?.arguments?.url === "string" ? f.params.arguments.url : undefined;
-        const nav = { url, before: null as string[] | null };
-        pendingNavs.set(id, nav);
-        void realPages().then((p) => {
-          nav.before = p;
-        });
+        pendingNavs.set(id, { url });
       }
     }
 

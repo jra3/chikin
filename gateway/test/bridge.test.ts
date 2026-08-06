@@ -6,6 +6,8 @@ import {
   augmentInstructions,
   isBrowserWork,
   browserUnavailableMessage,
+  reportedPages,
+  navVerdict,
 } from "../src/bridge.js";
 import { Registry } from "../src/registry.js";
 import { FleetFullError, ProvisionError } from "../src/provisioner.js";
@@ -151,4 +153,73 @@ test("augmentInstructions works with no upstream instructions", () => {
   const result: { instructions?: string } = {};
   augmentInstructions(result);
   assert.match(result.instructions!, /chikin_identify/);
+});
+
+// --- nav watchdog: the stale-target wedge (issue #15) ----------------------
+// The format below is chrome-devtools-mcp's real nav reply. If an upstream bump
+// changes it, THIS is the test that fails — not the watchdog, silently.
+
+const navReply = (body: string) => ({ content: [{ type: "text", text: body }] });
+
+test("reportedPages parses the child's page block and the selected page", () => {
+  const got = reportedPages(
+    navReply(
+      "Successfully navigated to https://example.org/.\n" +
+        "## Pages\n" +
+        "0: https://example.com/\n" +
+        "1: https://example.org/ [selected]\n",
+    ),
+  );
+  assert.deepEqual(got, {
+    pages: ["https://example.com/", "https://example.org/"],
+    selected: "https://example.org/",
+  });
+});
+
+test("reportedPages returns null when no page block is present", () => {
+  assert.equal(reportedPages(navReply("Successfully navigated.")), null);
+  assert.equal(reportedPages({}), null);
+  assert.equal(reportedPages(undefined), null);
+});
+
+test("a redirect landing on the page you're already on is NOT a wedge", () => {
+  // The exact false positive that bounced healthy children: requested URL never
+  // appears anywhere, and the page set does not move — but the child's view is
+  // correct, so it is not wedged. (Observed live on Ancestry's legacy person-URL
+  // redirect, reproduced with http->https on iana.org.)
+  const reported = reportedPages(
+    navReply("## Pages\n2: https://www.iana.org/help/example-domains [selected]\n"),
+  );
+  const real = ["https://www.iana.org/help/example-domains"];
+  assert.equal(navVerdict(reported, real), "ok");
+});
+
+test("a child reporting a page the browser does not have IS a wedge", () => {
+  const reported = reportedPages(navReply("## Pages\n1: https://old.example/stale [selected]\n"));
+  const real = ["https://new.example/current"];
+  assert.equal(navVerdict(reported, real), "wedge");
+});
+
+test("query and hash differences across a redirect do not count as a wedge", () => {
+  const reported = reportedPages(navReply("## Pages\n0: https://example.com/doc?utm=x#frag [selected]\n"));
+  assert.equal(navVerdict(reported, ["https://example.com/doc"]), "ok");
+});
+
+test("missing evidence is 'unknown', never a strike", () => {
+  const reported = reportedPages(navReply("## Pages\n0: https://example.com/ [selected]\n"));
+  assert.equal(navVerdict(reported, null), "unknown", "no CDP ground truth");
+  assert.equal(navVerdict(null, ["https://example.com/"]), "unknown", "no child page block");
+  assert.equal(
+    navVerdict({ pages: ["https://example.com/"] }, ["https://other.example/"]),
+    "unknown",
+    "page block with nothing selected",
+  );
+});
+
+test("a multi-tab child is judged on its SELECTED page, not the whole set", () => {
+  const reported = reportedPages(
+    navReply("## Pages\n0: https://a.example/\n1: https://b.example/ [selected]\n"),
+  );
+  assert.equal(navVerdict(reported, ["https://b.example/", "https://z.example/"]), "ok");
+  assert.equal(navVerdict(reported, ["https://a.example/", "https://z.example/"]), "wedge");
 });
