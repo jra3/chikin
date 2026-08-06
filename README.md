@@ -440,7 +440,7 @@ The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTranspor
 
 ## Troubleshooting
 
-**Gateway healthy but `curl localhost:8080` refuses from the host.** The gateway must bind `0.0.0.0` *inside* the container for Docker's port-forward to reach it (compose sets `HOST=0.0.0.0`); loopback-only safety comes from the `127.0.0.1:8080:8080` host mapping.
+**Gateway healthy but `curl localhost:8080` refuses from the host.** Compose sets `HOST=0.0.0.0`, which the gateway reads as "listen broadly, except on the browser data plane": it resolves its own `chikin-egress` address at startup and binds loopback plus that address, never `chikin-net` (CHK-002 — see [ADR 0003](docs/adr/0003-accept-cross-browser-reachability-close-the-gateway.md)). Docker's port-forward reaches it over the egress address; loopback-only safety comes from the `127.0.0.1:8080:8080` host mapping. If that resolution ever fails the gateway falls back to all interfaces and says so in `/healthz`'s `warnings` — check there first. A `HOST` set to anything other than `0.0.0.0` is bound verbatim, so pinning it to `127.0.0.1` will refuse host traffic exactly this way.
 
 **The first browser tool call hangs, then returns "chikin could not start a browser".** Chrome didn't come up within `PROVISION_TIMEOUT_SEC` (connecting provisions nothing, so this can only surface on a tool call, never on the connect). If the message also says no slot is missing, check `docker logs chikin-chrome-<name>` and the gateway's own log for the underlying Docker error; most often it's `/dev/shm` pressure (the fleet sets `shm_size` 2 GB per browser). The session survives — the same call works once the browser can be built.
 

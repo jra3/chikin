@@ -1,4 +1,5 @@
 import Docker from "dockerode";
+import { hostname } from "node:os";
 import {
   config,
   containerName,
@@ -283,6 +284,31 @@ export class Provisioner {
       .map((v) => v?.Name ?? "")
       .filter((n) => n && /seed/i.test(n) && !n.startsWith(config.volumePrefix))
       .sort();
+  }
+
+  /**
+   * This gateway's own IP on the egress network, or null if it can't be read.
+   *
+   * Used to pick the listen set (CHK-002 — see bind.ts). It must be resolved at
+   * startup rather than configured: the address is assigned by Docker and moves
+   * whenever the gateway container is recreated (observed shifting within
+   * 172.28.0.0/16 across a single `up -d --force-recreate`).
+   *
+   * Identifies itself by hostname, which Docker sets to the container's short
+   * id — so this does not depend on `container_name` and keeps working if the
+   * gateway is ever run outside compose. Returns null (never throws) so a
+   * lookup failure degrades to a warning rather than taking the fleet down.
+   */
+  async selfEgressIp(): Promise<string | null> {
+    try {
+      const info = (await this.docker
+        .getContainer(hostname())
+        .inspect()) as Docker.ContainerInspectInfo;
+      const ip = info.NetworkSettings?.Networks?.[config.egressNetwork]?.IPAddress;
+      return ip ? ip : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Containers we manage, by the `chikin.fleet=1` label. */
