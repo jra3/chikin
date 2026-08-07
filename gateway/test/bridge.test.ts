@@ -223,3 +223,97 @@ test("a multi-tab child is judged on its SELECTED page, not the whole set", () =
   assert.equal(navVerdict(reported, ["https://b.example/", "https://z.example/"]), "ok");
   assert.equal(navVerdict(reported, ["https://a.example/", "https://z.example/"]), "wedge");
 });
+
+// structuredContent is the machine-readable twin of the "## Pages" block and is
+// what reportedPages reads first; the text parse is only the fallback.
+
+test("reportedPages prefers structuredContent.pages over the text block", () => {
+  const got = reportedPages({
+    ...navReply("## Pages\n0: https://stale.example/ [selected]\n"),
+    structuredContent: {
+      pages: [
+        { id: 0, url: "https://example.com/", selected: false },
+        { id: 1, url: "https://example.org/", selected: true, isolatedContext: "work" },
+      ],
+    },
+  });
+  assert.deepEqual(got, {
+    pages: ["https://example.com/", "https://example.org/"],
+    selected: "https://example.org/",
+  });
+});
+
+test("reportedPages falls back to the text block when structuredContent is absent or unusable", () => {
+  const text = navReply("## Pages\n0: https://example.com/ [selected]\n");
+  const expected = { pages: ["https://example.com/"], selected: "https://example.com/" };
+  assert.deepEqual(reportedPages(text), expected);
+  assert.deepEqual(reportedPages({ ...text, structuredContent: {} }), expected);
+  assert.deepEqual(reportedPages({ ...text, structuredContent: { pages: [] } }), expected);
+});
+
+test("a structuredContent page list with nothing selected leaves selected unset", () => {
+  const got = reportedPages({
+    content: [],
+    structuredContent: { pages: [{ id: 0, url: "https://example.com/", selected: false }] },
+  });
+  assert.deepEqual(got, { pages: ["https://example.com/"], selected: undefined });
+  assert.equal(navVerdict(got, ["https://example.com/"]), "unknown");
+});
+
+test("the text parse tolerates the isolatedContext label upstream appends", () => {
+  // 1.1.1 emits "<id>: <url>[ [selected]][ isolatedContext=<name>]". An anchored
+  // parse drops such a line entirely, which silently blinds the watchdog for any
+  // session using new_page's isolatedContext.
+  const got = reportedPages(
+    navReply(
+      "## Pages\n" +
+        "0: https://example.com/ isolatedContext=scratch\n" +
+        "1: https://example.org/ [selected] isolatedContext=work\n",
+    ),
+  );
+  assert.deepEqual(got, {
+    pages: ["https://example.com/", "https://example.org/"],
+    selected: "https://example.org/",
+  });
+});
+
+test("the text parse reads the '## Pages' section only", () => {
+  const got = reportedPages(
+    navReply(
+      "## Pages\n" +
+        "0: https://example.com/ [selected]\n" +
+        "## Extension Pages\n" +
+        "1: chrome-extension://abc/popup.html\n" +
+        "## Network requests\n" +
+        "0: https://cdn.example/app.js\n",
+    ),
+  );
+  assert.deepEqual(got, { pages: ["https://example.com/"], selected: "https://example.com/" });
+});
+
+// A strike must mean "the child is bound to a target the browser no longer has",
+// never "the page moved after we looked" — so the child's view is checked
+// against every CDP sample taken, starting with one contemporaneous with the
+// reply. Anything else strikes healthy children on client-side redirects.
+
+test("a page that moves on its own after the reply is NOT a wedge", () => {
+  // meta refresh / window.location.replace / OAuth bounce / SPA pushState
+  // landing inside the verify delay: correct at reply time, moved by the time
+  // the delayed sample is taken.
+  const reported = reportedPages(navReply("## Pages\n0: https://example.com/start [selected]\n"));
+  const atReply = ["https://example.com/start"];
+  const later = ["https://example.com/after-redirect"];
+  assert.equal(navVerdict(reported, atReply, later), "ok");
+});
+
+test("a wedge is only called when the page is in NO sample", () => {
+  const reported = reportedPages(navReply("## Pages\n0: https://old.example/stale [selected]\n"));
+  assert.equal(
+    navVerdict(reported, ["https://new.example/a"], ["https://new.example/b"]),
+    "wedge",
+  );
+  // Ground truth that never arrived must not push the verdict either way.
+  assert.equal(navVerdict(reported, null, null), "unknown");
+  assert.equal(navVerdict(reported, null, ["https://old.example/stale"]), "ok");
+  assert.equal(navVerdict(reported, ["https://old.example/stale"], null), "ok");
+});
