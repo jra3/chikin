@@ -36,12 +36,32 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // while the underlying Chrome is perfectly healthy. None of that is a
 // transport failure, so the respawn path would never trigger. Instead we
 // verify navigations OUT OF BAND: after the child reports a nav succeeded, we
-// ask the container's CDP /json/list (ground truth) whether the page set
-// actually moved. Strikes on consecutive failures force a child respawn — a
-// fresh child binds the browser's REAL current target.
+// compare the page list the CHILD reports against the container's CDP
+// /json/list (ground truth). Strikes on consecutive failures force a child
+// respawn — a fresh child binds the browser's REAL current target.
+//
+// The test is "does the child's view of the browser match the browser?", NOT
+// "did the page set move?". Those look equivalent and are not: a nav to a URL
+// that redirects to the page you are ALREADY on moves nothing, and the older
+// did-it-move test struck healthy children for it (a live session took a
+// strike on Ancestry's legacy->canonical person-page redirect; two in a row
+// bounce a working child mid-task). A wedged child is identifiable directly —
+// it reports a stale URL the browser no longer has open — so test that.
+//
+// "No longer has open" is judged against the browser as it was when the child
+// reported AND as it is after the settle delay, so the strike cannot mean "the
+// page moved after we looked" — a self-redirect, meta refresh, OAuth bounce or
+// SPA route change all move the page set inside the verify window while the
+// child is perfectly healthy. There is no pre-nav CDP snapshot: the request-time
+// /json/list was traded for this reply-time one, which is what makes the verdict
+// accurate (it is contemporaneous with the view the child reported).
 const NAV_TOOLS = new Set(["navigate_page", "new_page", "navigate_page_history"]);
 const NAV_VERIFY_DELAY_MS = Number(process.env.NAV_VERIFY_DELAY_MS || 2500);
 const NAV_WEDGE_STRIKES = 2;
+// Consecutive superseded (therefore unjudged) nav verifications before the
+// session says so. A client navigating faster than NAV_VERIFY_DELAY_MS would
+// otherwise run with a quietly suppressed watchdog.
+const NAV_SUPERSEDED_ALARM = 5;
 // Consecutive child-stderr CDP connection failures (e.g. the container was
 // docker-rm'd out from under it and the child keeps fetching a dead IP) that
 // force a respawn. Internal fetch errors never surface on the stdio transport.
@@ -61,6 +81,120 @@ const CDP_FAIL_RE = /fetch failed|ECONNREFUSED|ERR_CONNECTION_REFUSED|socket han
 // address — and the CDP-failure watchdog is disabled while browser-less
 // (startChild below), so such an error could never respawn-loop.
 const NO_BROWSER_URL = "http://127.0.0.1:1";
+
+export interface ReportedPages {
+  pages: string[];
+  selected?: string;
+}
+
+// The child's own view of the browser, taken from its own tool reply.
+//
+// chrome-devtools-mcp reports the page list twice: machine-readably as
+// `structuredContent.pages` ([{id, url, selected, isolatedContext?}]), and as
+// the human-readable "## Pages" block appended to every page-scoped reply:
+//
+//   ## Pages
+//   0: https://example.com/
+//   1: https://example.org/ [selected] isolatedContext=work
+//
+// The structured form is authoritative; the text parse is only a fallback for a
+// reply that carries no structuredContent. `selected` is the page the child
+// believes its tools act on — the value that goes stale when it wedges.
+// Returns null when neither form is parseable, which must NOT be read as
+// "healthy" (see navVerdict).
+export function reportedPages(result: unknown): ReportedPages | null {
+  return pagesFromStructuredContent(result) ?? pagesFromText(result);
+}
+
+function pagesFromStructuredContent(result: unknown): ReportedPages | null {
+  const list = (result as { structuredContent?: { pages?: unknown } })?.structuredContent?.pages;
+  if (!Array.isArray(list)) return null;
+  const pages: string[] = [];
+  let selected: string | undefined;
+  for (const entry of list) {
+    const url = (entry as { url?: unknown })?.url;
+    if (typeof url !== "string" || !url) continue;
+    pages.push(url);
+    if ((entry as { selected?: unknown })?.selected === true) selected = url;
+  }
+  return pages.length ? { pages, selected } : null;
+}
+
+function pagesFromText(result: unknown): ReportedPages | null {
+  const content = (result as { content?: Array<{ type?: string; text?: string }> })?.content;
+  if (!Array.isArray(content)) return null;
+  const text = content
+    .filter((c) => c?.type === "text" && typeof c.text === "string")
+    .map((c) => c.text as string)
+    .join("\n");
+  const pages: string[] = [];
+  let selected: string | undefined;
+  let inPages = false;
+  for (const line of text.split("\n")) {
+    if (/^##\s/.test(line)) {
+      // Only the "## Pages" section — "## Extension Pages" and the other
+      // numbered sections are not what the child's tools act on.
+      inPages = /^##\s+Pages\s*$/.test(line);
+      continue;
+    }
+    if (!inPages) continue;
+    // Anything after the URL (`[selected]`, `isolatedContext=<name>`, whatever
+    // upstream adds next) is tolerated: dropping the line entirely would blind
+    // the watchdog rather than fail loudly.
+    const m = /^\s*\d+:\s+(\S+)(\s+\[selected\])?(\s.*)?$/.exec(line);
+    if (!m) continue;
+    pages.push(m[1]);
+    if (m[2]) selected = m[1];
+  }
+  return pages.length ? { pages, selected } : null;
+}
+
+// The whole wedge decision, kept pure so it can be tested without a browser.
+//
+//   "ok"      — the child's selected page really is open; it is not wedged
+//   "wedge"   — the child is acting on a page the browser does not have
+//   "unknown" — not enough evidence; NEVER strike (no ground truth, or the
+//               child's reply carried no usable page list, e.g. upstream
+//               changed the format — the format tests are what catch that)
+//
+// `samples` are CDP page sets observed at different instants; the child is only
+// judged wedged if its selected page is in NONE of them. That is what keeps
+// "the page moved after we looked" (client-side redirect, meta refresh, OAuth
+// bounce, SPA route change landing inside the verify delay) out of the strike
+// count: such a page WAS really open when the child reported it, so the
+// reply-time sample clears it. A strike then means only what it should — the
+// child is bound to a target the browser has never had open in this window.
+export function navVerdict(
+  reported: ReportedPages | null,
+  ...samples: Array<string[] | null>
+): "ok" | "wedge" | "unknown" {
+  const selected = reported?.selected;
+  const known = samples.filter((s): s is string[] => Array.isArray(s));
+  if (!selected || !known.length) return "unknown";
+  return known.some((real) => real.some((u) => sameDoc(u, selected))) ? "ok" : "wedge";
+}
+
+// Which scheduled verifications are allowed to reach navVerdict, kept pure for
+// the same reason it is.
+//
+// A verification is judged when its nav is still the newest one to have replied:
+// otherwise an automation loop's own NEXT navigation would read as this one's
+// wedge. Dropping every superseded nav outright, though, silently disables the
+// watchdog for any client that navigates faster than the verify delay — and a
+// wedged child replies in milliseconds, so it is the client's think-time that
+// sets that cadence. So a superseded nav is still judged when it names the same
+// page as the newest one. That is the wedge signature exactly: a wedged child
+// repeats one stale page for every nav, while a healthy fast loop reports a
+// different page each time and stays correctly suppressed.
+export function shouldJudgeNav(
+  nav: { seq: number; reported: ReportedPages | null },
+  newest: { seq: number; selected?: string },
+): boolean {
+  if (nav.seq === newest.seq) return true;
+  const selected = nav.reported?.selected;
+  if (selected === undefined || newest.selected === undefined) return false;
+  return sameDoc(selected, newest.selected);
+}
 
 // Two URLs point at the same document if origin+path match (query/hash differ
 // across redirects too often to compare strictly).
@@ -280,9 +414,17 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // "Can a browser frame go straight to the child?" — the question `currentIp`
   // alone cannot answer, and the reason it must not be asked alone.
   const browserReady = (): boolean => currentIp !== null && attaching === null;
-  // nav request id -> what was asked for + the real page set before the nav
-  const pendingNavs = new Map<string | number, { url?: string; before: string[] | null }>();
+  // nav request id -> what was asked for (the child's view comes off its reply)
+  const pendingNavs = new Map<string | number, { url?: string }>();
   let navStrikes = 0;
+  // The newest verifiable nav REPLY: its sequence number and the page the child
+  // reported selected. Anything older is normally not judged — back-to-back navs
+  // would otherwise judge an older nav's view against a browser that has
+  // legitimately moved on since (see shouldJudgeNav).
+  let navNewest: { seq: number; selected?: string } = { seq: 0 };
+  // Consecutive verifications dropped that way, so a session whose watchdog is
+  // effectively suppressed says so instead of just going quiet.
+  let navSuperseded = 0;
   let cdpFailStreak = 0;
   // tools/list request ids whose replies need the synthetic chikin_reset appended
   const toolsListIds = new Set<string | number>();
@@ -387,7 +529,19 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         if (nav) {
           pendingNavs.delete(f.id);
           if (!f.error && !f.result?.isError) {
-            setTimeout(() => void verifyNav(nav), NAV_VERIFY_DELAY_MS).unref?.();
+            // Capture the child's OWN view from this reply AND sample the
+            // browser right now, while the two are still contemporaneous — a
+            // page that moves on its own afterwards must not read as a wedge.
+            const reported = reportedPages(f.result);
+            navNewest = { seq: navNewest.seq + 1, selected: reported?.selected };
+            const withView = {
+              ...nav,
+              gen, // bind this check to the child (and container) it came from
+              seq: navNewest.seq,
+              reported,
+              atReply: realPages(),
+            };
+            setTimeout(() => void verifyNav(withView), NAV_VERIFY_DELAY_MS).unref?.();
           }
         }
       }
@@ -400,25 +554,59 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     c.onerror = (e) => log.warn(`session[${name}]: child transport error`, String(e));
   }
 
-  // The child said the nav succeeded — did the browser actually move? Strike
-  // when the real page set is byte-identical to the pre-nav snapshot AND the
-  // requested URL is nowhere in it; two consecutive strikes = the stale-target
-  // wedge, and a fresh child (which binds the REAL current target) clears it.
-  // Redirects are safe: they change the page set, which resets the strikes.
-  async function verifyNav(nav: { url?: string; before: string[] | null }): Promise<void> {
+  // The child said the nav succeeded — is it still talking about the browser we
+  // actually have? Two consecutive disagreements = the stale-target wedge, and
+  // a fresh child (which binds the REAL current target) clears it. A nav that
+  // moved nothing is NOT evidence of a wedge on its own, and neither is a page
+  // that moved after the child reported it: see navVerdict.
+  async function verifyNav(nav: {
+    url?: string;
+    gen: number;
+    seq: number;
+    reported: ReportedPages | null;
+    atReply: Promise<string[] | null>;
+  }): Promise<void> {
     if (session?.isClosed || respawning) return;
-    const after = await realPages();
-    if (!after || !nav.before) return; // no ground truth — never strike blind
-    const changed = JSON.stringify(after) !== JSON.stringify(nav.before);
-    const landed = nav.url !== undefined && after.some((u) => sameDoc(u, nav.url as string));
-    if (changed || landed) {
+    // The child that scheduled this check is gone — a respawn (or a
+    // chikin_reset, which swaps the CONTAINER too) has happened since, so its
+    // view says nothing about the child now serving this session.
+    if (nav.gen !== childGen) return;
+    if (!shouldJudgeNav(nav, navNewest)) {
+      navSuperseded++;
+      if (navSuperseded === NAV_SUPERSEDED_ALARM)
+        log.warn(
+          `session[${name}]: ${navSuperseded} consecutive nav verifications superseded — ` +
+            `this client navigates faster than NAV_VERIFY_DELAY_MS (${NAV_VERIFY_DELAY_MS}ms), ` +
+            `so wedge detection is only running on navs that report the same page`,
+        );
+      return;
+    }
+    navSuperseded = 0;
+    const [atReply, real] = await Promise.all([nav.atReply, realPages()]);
+    const verdict = navVerdict(nav.reported, atReply, real);
+    if (verdict === "unknown") {
+      // A nav reply with no usable page list means the signal is gone, not that
+      // the browser is fine — say so, or an upstream format change would
+      // silently retire the watchdog. (`reportedPages` is pinned by tests.)
+      // Note this covers a page list that parsed but selected nothing, not just
+      // a missing one: both blind the watchdog identically.
+      if ((atReply !== null || real !== null) && !nav.reported?.selected)
+        log.warn(
+          `session[${name}]: nav reply carried no selected page — wedge detection is blind ` +
+            `(chrome-devtools-mcp output format may have changed)`,
+        );
+      return;
+    }
+    if (verdict === "ok") {
       navStrikes = 0;
       return;
     }
     navStrikes++;
     log.warn(
       `session[${name}]: nav verify failed (${navStrikes}/${NAV_WEDGE_STRIKES}): ` +
-        `requested ${nav.url ?? "(history)"} but real pages unchanged [${after.join(", ")}]`,
+        `requested ${nav.url ?? "(history)"}; child is on ${nav.reported?.selected} ` +
+        `but the browser's real pages were [${(atReply ?? []).join(", ")}] at reply time ` +
+        `and are [${(real ?? []).join(", ")}] now`,
     );
     if (navStrikes >= NAV_WEDGE_STRIKES) {
       navStrikes = 0;
@@ -503,6 +691,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       pendingNavs.clear();
       toolsListIds.clear();
       navStrikes = 0;
+      navSuperseded = 0;
       try {
         await child?.close();
       } catch {
@@ -590,6 +779,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       pendingNavs.clear();
       toolsListIds.clear();
       navStrikes = 0;
+      navSuperseded = 0;
       spawned = await startChild(gen, ip);
       await replayInitialize(spawned, gen);
       respawning = false;
@@ -754,16 +944,13 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     if (tracked) {
       inflight.set(f.id as string | number, true);
       if (f.method === "tools/list") toolsListIds.add(f.id as string | number);
-      // Record nav requests + the browser's REAL page set right now, so the
-      // reply can be verified out-of-band (see verifyNav).
+      // Record what each nav asked for, so its reply can be verified
+      // out-of-band. Only the requested URL is kept here: the child's own view
+      // of the browser comes off the reply itself (see wireChild/verifyNav).
       if (f.method === "tools/call" && NAV_TOOLS.has(f.params?.name ?? "")) {
         const id = f.id as string | number;
         const url = typeof f.params?.arguments?.url === "string" ? f.params.arguments.url : undefined;
-        const nav = { url, before: null as string[] | null };
-        pendingNavs.set(id, nav);
-        void realPages().then((p) => {
-          nav.before = p;
-        });
+        pendingNavs.set(id, { url });
       }
     }
 
