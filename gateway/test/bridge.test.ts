@@ -8,6 +8,7 @@ import {
   browserUnavailableMessage,
   reportedPages,
   navVerdict,
+  shouldJudgeNav,
 } from "../src/bridge.js";
 import { Registry } from "../src/registry.js";
 import { FleetFullError, ProvisionError } from "../src/provisioner.js";
@@ -316,4 +317,48 @@ test("a wedge is only called when the page is in NO sample", () => {
   assert.equal(navVerdict(reported, null, null), "unknown");
   assert.equal(navVerdict(reported, null, ["https://old.example/stale"]), "ok");
   assert.equal(navVerdict(reported, ["https://old.example/stale"], null), "ok");
+});
+
+// Which scheduled verifications survive to be judged. A client navigating faster
+// than the verify delay must not end up with a watchdog that is quietly off.
+
+const nav = (seq: number, selected?: string) => ({
+  seq,
+  reported: selected ? { pages: [selected], selected } : null,
+});
+
+test("the newest nav is always judged", () => {
+  assert.equal(shouldJudgeNav(nav(7, "https://a.example/"), { seq: 7, selected: "https://a.example/" }), true);
+  // Even with nothing selected — navVerdict is what turns that into 'unknown'.
+  assert.equal(shouldJudgeNav(nav(7), { seq: 7 }), true);
+});
+
+test("a fast client that is WEDGED is still judged (same page every nav)", () => {
+  // A wedged child no-ops in milliseconds, so replies land well inside the
+  // verify delay — but it keeps naming the one stale page it is stuck on.
+  const stale = "https://old.example/stale";
+  assert.equal(shouldJudgeNav(nav(1, stale), { seq: 3, selected: stale }), true);
+  assert.equal(shouldJudgeNav(nav(2, stale), { seq: 3, selected: stale }), true);
+  // Same document, different query/hash across a redirect is still the same page.
+  assert.equal(
+    shouldJudgeNav(nav(1, `${stale}?utm=x`), { seq: 2, selected: `${stale}#frag` }),
+    true,
+  );
+});
+
+test("a fast client that is HEALTHY stays suppressed (a different page each nav)", () => {
+  assert.equal(
+    shouldJudgeNav(nav(1, "https://a.example/"), { seq: 3, selected: "https://c.example/" }),
+    false,
+  );
+  assert.equal(
+    shouldJudgeNav(nav(2, "https://b.example/"), { seq: 3, selected: "https://c.example/" }),
+    false,
+  );
+});
+
+test("a superseded nav with nothing to compare is not judged", () => {
+  assert.equal(shouldJudgeNav(nav(1), { seq: 2, selected: "https://a.example/" }), false);
+  assert.equal(shouldJudgeNav(nav(1, "https://a.example/"), { seq: 2 }), false);
+  assert.equal(shouldJudgeNav(nav(1), { seq: 2 }), false);
 });

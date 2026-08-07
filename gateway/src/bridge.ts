@@ -49,14 +49,19 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // it reports a stale URL the browser no longer has open — so test that.
 //
 // "No longer has open" is judged against the browser as it was when the child
-// reported AND as it is after the settle delay, and only the newest nav is ever
-// judged. Both guards exist so the strike cannot mean "the page moved after we
-// looked" — a self-redirect, meta refresh, OAuth bounce, SPA route change or
-// simply the next navigation of a busy automation loop all move the page set
-// inside the verify window while the child is perfectly healthy.
+// reported AND as it is after the settle delay, so the strike cannot mean "the
+// page moved after we looked" — a self-redirect, meta refresh, OAuth bounce or
+// SPA route change all move the page set inside the verify window while the
+// child is perfectly healthy. There is no pre-nav CDP snapshot: the request-time
+// /json/list was traded for this reply-time one, which is what makes the verdict
+// accurate (it is contemporaneous with the view the child reported).
 const NAV_TOOLS = new Set(["navigate_page", "new_page", "navigate_page_history"]);
 const NAV_VERIFY_DELAY_MS = Number(process.env.NAV_VERIFY_DELAY_MS || 2500);
 const NAV_WEDGE_STRIKES = 2;
+// Consecutive superseded (therefore unjudged) nav verifications before the
+// session says so. A client navigating faster than NAV_VERIFY_DELAY_MS would
+// otherwise run with a quietly suppressed watchdog.
+const NAV_SUPERSEDED_ALARM = 5;
 // Consecutive child-stderr CDP connection failures (e.g. the container was
 // docker-rm'd out from under it and the child keeps fetching a dead IP) that
 // force a respawn. Internal fetch errors never surface on the stdio transport.
@@ -167,6 +172,28 @@ export function navVerdict(
   const known = samples.filter((s): s is string[] => Array.isArray(s));
   if (!selected || !known.length) return "unknown";
   return known.some((real) => real.some((u) => sameDoc(u, selected))) ? "ok" : "wedge";
+}
+
+// Which scheduled verifications are allowed to reach navVerdict, kept pure for
+// the same reason it is.
+//
+// A verification is judged when its nav is still the newest one to have replied:
+// otherwise an automation loop's own NEXT navigation would read as this one's
+// wedge. Dropping every superseded nav outright, though, silently disables the
+// watchdog for any client that navigates faster than the verify delay — and a
+// wedged child replies in milliseconds, so it is the client's think-time that
+// sets that cadence. So a superseded nav is still judged when it names the same
+// page as the newest one. That is the wedge signature exactly: a wedged child
+// repeats one stale page for every nav, while a healthy fast loop reports a
+// different page each time and stays correctly suppressed.
+export function shouldJudgeNav(
+  nav: { seq: number; reported: ReportedPages | null },
+  newest: { seq: number; selected?: string },
+): boolean {
+  if (nav.seq === newest.seq) return true;
+  const selected = nav.reported?.selected;
+  if (selected === undefined || newest.selected === undefined) return false;
+  return sameDoc(selected, newest.selected);
 }
 
 // Two URLs point at the same document if origin+path match (query/hash differ
@@ -390,10 +417,14 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // nav request id -> what was asked for (the child's view comes off its reply)
   const pendingNavs = new Map<string | number, { url?: string }>();
   let navStrikes = 0;
-  // Bumped on every verifiable nav REPLY. A scheduled verification that is no
-  // longer the newest is dropped: back-to-back navs would otherwise judge an
-  // older nav's view against a browser that has legitimately moved on since.
-  let navSeq = 0;
+  // The newest verifiable nav REPLY: its sequence number and the page the child
+  // reported selected. Anything older is normally not judged — back-to-back navs
+  // would otherwise judge an older nav's view against a browser that has
+  // legitimately moved on since (see shouldJudgeNav).
+  let navNewest: { seq: number; selected?: string } = { seq: 0 };
+  // Consecutive verifications dropped that way, so a session whose watchdog is
+  // effectively suppressed says so instead of just going quiet.
+  let navSuperseded = 0;
   let cdpFailStreak = 0;
   // tools/list request ids whose replies need the synthetic chikin_reset appended
   const toolsListIds = new Set<string | number>();
@@ -501,10 +532,13 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
             // Capture the child's OWN view from this reply AND sample the
             // browser right now, while the two are still contemporaneous — a
             // page that moves on its own afterwards must not read as a wedge.
+            const reported = reportedPages(f.result);
+            navNewest = { seq: navNewest.seq + 1, selected: reported?.selected };
             const withView = {
               ...nav,
-              seq: ++navSeq,
-              reported: reportedPages(f.result),
+              gen, // bind this check to the child (and container) it came from
+              seq: navNewest.seq,
+              reported,
               atReply: realPages(),
             };
             setTimeout(() => void verifyNav(withView), NAV_VERIFY_DELAY_MS).unref?.();
@@ -527,15 +561,27 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // that moved after the child reported it: see navVerdict.
   async function verifyNav(nav: {
     url?: string;
+    gen: number;
     seq: number;
     reported: ReportedPages | null;
     atReply: Promise<string[] | null>;
   }): Promise<void> {
     if (session?.isClosed || respawning) return;
-    // A newer nav has replied since this check was scheduled — only the most
-    // recent nav is ever judged, or an automation loop's own next navigation
-    // reads as this one's wedge.
-    if (nav.seq !== navSeq) return;
+    // The child that scheduled this check is gone — a respawn (or a
+    // chikin_reset, which swaps the CONTAINER too) has happened since, so its
+    // view says nothing about the child now serving this session.
+    if (nav.gen !== childGen) return;
+    if (!shouldJudgeNav(nav, navNewest)) {
+      navSuperseded++;
+      if (navSuperseded === NAV_SUPERSEDED_ALARM)
+        log.warn(
+          `session[${name}]: ${navSuperseded} consecutive nav verifications superseded — ` +
+            `this client navigates faster than NAV_VERIFY_DELAY_MS (${NAV_VERIFY_DELAY_MS}ms), ` +
+            `so wedge detection is only running on navs that report the same page`,
+        );
+      return;
+    }
+    navSuperseded = 0;
     const [atReply, real] = await Promise.all([nav.atReply, realPages()]);
     const verdict = navVerdict(nav.reported, atReply, real);
     if (verdict === "unknown") {
@@ -645,6 +691,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       pendingNavs.clear();
       toolsListIds.clear();
       navStrikes = 0;
+      navSuperseded = 0;
       try {
         await child?.close();
       } catch {
@@ -732,6 +779,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       pendingNavs.clear();
       toolsListIds.clear();
       navStrikes = 0;
+      navSuperseded = 0;
       spawned = await startChild(gen, ip);
       await replayInitialize(spawned, gen);
       respawning = false;
