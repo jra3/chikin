@@ -168,6 +168,22 @@ test("counters survive a record created by any entry point", () => {
   }
 });
 
+// A container can be recreated from a floating image tag under a live name, so
+// a version we can no longer read must not survive as the answer for the one
+// we now have: "unknown" is honest, the previous browser's version is not.
+test("an unreadable Chrome clears the cached version instead of keeping it", () => {
+  const reg = new Registry();
+  reg.setChromeVersion("inst-1", "Chrome/147.0.7727.101", 1000);
+  assert.equal(reg.getActivity("inst-1")?.chromeVersion, "Chrome/147.0.7727.101");
+
+  reg.setChromeVersion("inst-1", null);
+  assert.equal(reg.getActivity("inst-1")?.chromeVersion, undefined, "stale version is forgotten");
+  assert.equal(reg.canarySummary().chromeVersions.length, 0, "and drops out of the rollup");
+
+  reg.setChromeVersion("inst-1", "Chrome/150.0.7871.181");
+  assert.equal(reg.getActivity("inst-1")?.chromeVersion, "Chrome/150.0.7871.181");
+});
+
 test("the /healthz rollup sums the fleet and reports Chrome as a set", () => {
   const reg = new Registry();
   reg.touch("inst-1", 1000);

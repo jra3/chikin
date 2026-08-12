@@ -467,6 +467,20 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     }
   }
 
+  /**
+   * Re-read the browser's Chrome and cache it against this name, at EVERY child
+   * swap that has a browser rather than only at attach. `chikin_reset` and the
+   * unhealthy-container path both recreate the container from `config.image` —
+   * a fixed tag over moving content — so the browser on the far side of a
+   * respawn need not be the one last measured. A failed probe clears the cache
+   * (see `setChromeVersion`) so the canary never names a Chrome it cannot see.
+   */
+  async function refreshChromeVersion(ip: string): Promise<string | null> {
+    const chrome = await chromeVersion(ip);
+    deps.registry.setChromeVersion(name, chrome);
+    return chrome;
+  }
+
   /** Chrome for log lines: whatever we last learned, or an honest placeholder. */
   const chromeTag = (): string => deps.registry.getActivity(name)?.chromeVersion ?? "chrome unknown";
 
@@ -730,11 +744,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         const gen = ++childGen;
         let spawned: StdioClientTransport | null = null;
         try {
-          spawned = await startChild(gen, wantBrowser ? await provision() : null);
+          const ip = wantBrowser ? await provision() : null;
+          spawned = await startChild(gen, ip);
           await replayInitialize(spawned, gen);
           child = spawned;
           spawned = null;
-          log.info(`session[${name}]: child respawned (gen ${gen})`);
+          const chrome = ip ? await refreshChromeVersion(ip) : null;
+          log.info(
+            `session[${name}]: child respawned (gen ${gen}` +
+              `${ip ? `, ${chrome ?? "chrome unknown"}` : ""})`,
+          );
           return;
         } catch (e) {
           log.warn(`session[${name}]: respawn attempt ${attempt} failed`, String(e));
@@ -810,8 +829,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       if (session.isClosed) return;
       child = spawned;
       spawned = null;
-      const chrome = await chromeVersion(ip);
-      if (chrome) deps.registry.setChromeVersion(name, chrome);
+      const chrome = await refreshChromeVersion(ip);
       log.info(
         `session[${name}]: browser attached at ${ip} (child gen ${gen}, ${chrome ?? "chrome unknown"})`,
       );

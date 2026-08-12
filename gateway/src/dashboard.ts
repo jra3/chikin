@@ -188,8 +188,8 @@ export async function renderDashboard(
         .sort();
 
   const emptyRow = err
-    ? `<tr><td colspan="10" class="empty">Fleet state unknown — the fleet could not be listed (see the error above). Nothing here is a statement about what is running.</td></tr>`
-    : `<tr><td colspan="10" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> and make a browser tool call to spin one up.</td></tr>`;
+    ? `<tr><td colspan="13" class="empty">Fleet state unknown — the fleet could not be listed (see the error above). Nothing here is a statement about what is running.</td></tr>`
+    : `<tr><td colspan="13" class="empty">No browsers provisioned yet. Connect an MCP client to <code>/b/&lt;name&gt;/</code> and make a browser tool call to spin one up.</td></tr>`;
   const rows =
     members.length || browserless.length
       ? [
