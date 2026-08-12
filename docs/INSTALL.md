@@ -85,14 +85,12 @@ make update      # re-pull pinned images, restart, refresh the client bridge
 
 ### Pinning a version
 
-`CHIKIN_VERSION` in `.env` selects the image tag (`ghcr.io/jra3/chikin{,-gateway}:<tag>`). Pin it to a release for a reproducible install:
-
-```bash
-# .env
-CHIKIN_VERSION=v0.1.0
-```
-
-`latest` (the shipped default) tracks the newest build on `main`.
+`CHIKIN_VERSION` in `.env` selects the image tag for both first-party images
+(`ghcr.io/jra3/chikin{,-gateway}:<tag>`), and a fresh install is **already pinned**:
+[`.env.example`](../.env.example) ships an immutable per-commit `sha-<short>` tag, so
+the install is reproducible instead of silently tracking a moved `latest`. Bump it to
+a newer `sha-<short>` to upgrade, or set `latest` to always ride the newest build on
+`main`. That file carries the current default and the note on release tags.
 
 ---
 

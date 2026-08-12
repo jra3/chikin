@@ -45,7 +45,8 @@ Prerequisites: Docker 20.10+ with Compose v2, and ~1.5 GB disk for the images (t
 ```bash
 # 1. Pull the pinned gateway + fleet browser images from ghcr (builds nothing).
 cp .env.example .env
-# Optionally pin CHIKIN_VERSION in .env to a release tag; default is `latest`.
+# Already pinned: CHIKIN_VERSION defaults to an immutable per-commit `sha-<short>`
+# tag, so this install is reproducible. Set another one to move (see .env.example).
 docker compose --profile build pull
 
 # 2. Bring up the gateway + socket-proxy.
