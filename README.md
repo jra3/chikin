@@ -55,7 +55,7 @@ docker compose --profile build pull
 docker compose up -d
 
 # 3. Sanity check.
-curl -s http://localhost:8080/healthz        # {"status":"ok","config":{…},"warnings":[…]}
+curl -s http://localhost:8080/healthz        # {"status":"ok","config":{…},"warnings":[…],"canary":{…}}
 open http://localhost:8080/                   # fleet dashboard
 ```
 
@@ -329,7 +329,7 @@ To fix a drifted gateway, recreate it *from the repo dir* so compose reads `.env
 
 Many strikes with **no** respawns is the informative state: the detector is firing on something systematic that is not a wedge (both false-positive classes fixed in #72 had exactly that shape). A single combined number would hide it, which is why there are two.
 
-The **`chrome`** column (`canary.chromeVersions`, a *set* — more than one entry means an image rotated under long-lived containers) is read from the running browser's CDP `/json/version` at every attach and child swap, and stamped into the strike/respawn log lines. It is load-bearing, not trivia: `Dockerfile` leaves `google-chrome-stable` deliberately **unpinned** (the accepted CHK-009/M4 residual), and Chrome — not `chrome-devtools-mcp`, which has been the same 1.1.1 throughout — is the variable that governs whether the wedge reproduces at all (147.0.7727.101 wedged readily; 150.0.7871.181 does not reproduce). A strike that cannot name its Chrome is as unattributable as the original report was. If the browser cannot be probed the value is cleared rather than carried over, so `—` / `chrome unknown` means exactly that.
+The **`chrome`** column (`canary.chromeVersions`, a *set* — more than one entry means an image rotated under long-lived containers) is read from the running browser's CDP `/json/version` at every attach and child swap, and stamped into the strike/respawn log lines. It is load-bearing, not trivia: `Dockerfile` leaves `google-chrome-stable` deliberately **unpinned** (the accepted CHK-009/M4 non-reproducibility residual), and Chrome — not `chrome-devtools-mcp`, which has been the same 1.1.1 throughout — is the variable that governs whether the wedge reproduces at all (147.0.7727.101 wedged readily; 150.0.7871.181 does not reproduce). A strike that cannot name its Chrome is as unattributable as the original report was. If the browser cannot be probed the value is cleared rather than carried over, so `—` / `chrome unknown` means exactly that.
 
 These counters are **gauges, not monotonic totals.** They live on the browser's activity record, which the reaper deletes when it reclaims a name — so the `/healthz` totals *drop* when a browser is reaped, and a reaped browser's strike history leaves the dashboard entirely. The log lines are the durable record; anything scraping `/healthz` must not treat these as ever-increasing counters.
 

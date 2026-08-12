@@ -384,3 +384,33 @@ test("/healthz and the dashboard show the fleet canary", async () => {
     );
   }
 });
+
+// --- 5. a Chrome the gateway cannot read ------------------------------------
+// README promises that an unreadable browser CLEARS the cached version rather
+// than carrying the last known one over a swap, and that `chrome unknown` / `—`
+// therefore mean exactly that. A stale version on a strike names the wrong
+// Chrome, which is worse for attribution than naming none.
+test("an unreadable browser reports chrome unknown, not the version before it", async () => {
+  browser.pages = ["https://app.example/blind"];
+  browser.chrome = OLD_CHROME;
+  const client = await connect("inst-blind", "canary-blind");
+  await client.callTool({ name: "list_pages", arguments: {} });
+  assert.equal(act("inst-blind").chromeVersion, OLD_CHROME, "measured while it could be read");
+
+  browser.chrome = null; // /json/version now fails: the browser cannot be probed
+  await client.callTool({ name: "chikin_reset", arguments: {} });
+
+  const back = lines(/session\[inst-blind\].*child respawned/);
+  assert.match(back.at(-1)!, /chrome unknown/, "the log says so rather than repeating the old one");
+  assert.equal(act("inst-blind").chromeVersion, undefined, "and the cache is cleared, not stale");
+
+  const html = await renderDashboard(provisioner as never, registry);
+  const blindRow = html.split("<tr").find((r) => r.includes("inst-blind"))!;
+  assert.ok(!blindRow.includes(OLD_CHROME), "the dashboard does not show a Chrome it cannot see");
+
+  const dir = process.env.CHIKIN_EVIDENCE_DIR;
+  if (dir) {
+    const { writeFileSync: w } = await import("node:fs");
+    w(join(dir, "dashboard-chrome-unknown.html"), html);
+  }
+});
