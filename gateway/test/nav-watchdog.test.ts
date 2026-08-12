@@ -283,6 +283,28 @@ const blind = () => gatewayLog.filter((l) => /wedge detection is blind/.test(l))
 /** Long enough for a scheduled verification to have run and been judged. */
 const settle = () => new Promise((r) => setTimeout(r, VERIFY_MS + 400));
 
+/**
+ * A child swap is NOT over when the new child PROCESS exists: its pidfile line
+ * is written at exec, while the gateway goes on failing frames with a retryable
+ * "browser restarting" error until it has replayed `initialize` against that
+ * child and re-read the browser's Chrome for the canary (#73). So do with that
+ * error the one thing it tells a client to do — retry — rather than race the
+ * tail of the swap and read the gateway's own restart notice as a cure that
+ * never came.
+ */
+const callPastRespawn = async <T>(call: () => Promise<T>): Promise<T> => {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    try {
+      return await call();
+    } catch (e) {
+      const restarting = (e as { code?: number }).code === -32001 && /restarting/.test(String(e));
+      if (!restarting || Date.now() >= deadline) throw e;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+};
+
 test("a nav that redirects onto the page already open takes NO strike (issue #15)", async () => {
   // The live false positive, reduced: the browser is already on the canonical
   // page, and the client navigates to a form of it that redirects there. The
@@ -377,7 +399,9 @@ test("a genuinely wedged child still escalates 1/2 -> 2/2 -> respawn (issue #15)
     assert.equal(childCount(), childrenBefore + 1, "a new child process was spawned");
     assert.equal(ensured.length, ensuredBefore + 1, "against a re-ensured container");
 
-    const after = await client.callTool({ name: "list_pages", arguments: {} });
+    const after = await callPastRespawn(() =>
+      client.callTool({ name: "list_pages", arguments: {} }),
+    );
     console.log(`[wedge] after respawn the fresh child reports ${childSelected(after)}`);
     assert.equal(childSelected(after), moved, "the fresh child is on the browser's real page");
 
@@ -450,7 +474,9 @@ test("a client navigating FASTER than the verify delay is still watched", async 
     const deadline = Date.now() + 10_000;
     while (childCount() === childrenBefore && Date.now() < deadline)
       await new Promise((r) => setTimeout(r, 50));
-    const after = await client.callTool({ name: "list_pages", arguments: {} });
+    const after = await callPastRespawn(() =>
+      client.callTool({ name: "list_pages", arguments: {} }),
+    );
     assert.equal(childSelected(after), "https://fast.example/moved", "fresh child, real page");
   } finally {
     await close();
