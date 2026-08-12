@@ -26,6 +26,34 @@ export interface Activity {
    * heartbeat problem this field exists to escape.
    */
   lastBrowserActivity: number;
+  /**
+   * Canary counters for the stale-target wedge (#73). Deliberately TWO numbers,
+   * because they answer different questions and the interesting state is the
+   * gap between them:
+   *
+   *  - `navStrikes`    — how often the child's reported view disagreed with the
+   *                      browser's real page set (a SUSPICION, cumulative; not
+   *                      the consecutive counter the bridge escalates on).
+   *  - `childRespawns` — how often a child was actually torn down and replaced,
+   *                      for ANY reason (an ACTION: wedge verdict, transport
+   *                      close, CDP-failure streak, `chikin_reset`).
+   *
+   * Many strikes with no respawns means the detector is firing on something
+   * systematic that is not a wedge — the exact shape of both false-positive
+   * classes fixed in #72, and precisely what a single counter would hide.
+   */
+  navStrikes: number;
+  childRespawns: number;
+  /**
+   * Chrome as reported by the running browser's CDP `/json/version` at attach.
+   *
+   * Load-bearing, not trivia: `Dockerfile` leaves `google-chrome-stable`
+   * deliberately unpinned (CHK-009/M4), and Chrome — not chrome-devtools-mcp —
+   * is the variable that governs whether the wedge reproduces (147 wedged, 150
+   * does not). `chromeImage` is a fixed tag over moving content, so without
+   * this a recurrence is as unattributable as the original report was.
+   */
+  chromeVersion?: string;
 }
 
 /**
@@ -169,10 +197,14 @@ export class Registry {
 
   // --- activity -------------------------------------------------------------
 
+  private newActivity(now: number): Activity {
+    return { last: now, streams: 0, lastBrowserActivity: now, navStrikes: 0, childRespawns: 0 };
+  }
+
   touch(name: string, now: number = Date.now()): void {
     const a = this.activity.get(name);
     if (a) a.last = now;
-    else this.activity.set(name, { last: now, streams: 0, lastBrowserActivity: now });
+    else this.activity.set(name, this.newActivity(now));
   }
 
   /**
@@ -187,12 +219,12 @@ export class Registry {
       a.last = now;
       a.lastBrowserActivity = now;
     } else {
-      this.activity.set(name, { last: now, streams: 0, lastBrowserActivity: now });
+      this.activity.set(name, this.newActivity(now));
     }
   }
 
   streamOpened(name: string, now: number = Date.now()): void {
-    const a = this.activity.get(name) ?? { last: now, streams: 0, lastBrowserActivity: now };
+    const a = this.activity.get(name) ?? this.newActivity(now);
     a.streams += 1;
     a.last = now;
     this.activity.set(name, a);
@@ -203,6 +235,44 @@ export class Registry {
     if (!a) return;
     a.streams = Math.max(0, a.streams - 1);
     a.last = now;
+  }
+
+  /** A nav verification disagreed with the browser (suspicion, not action). */
+  noteNavStrike(name: string, now: number = Date.now()): void {
+    const a = this.activity.get(name) ?? this.newActivity(now);
+    a.navStrikes += 1;
+    this.activity.set(name, a);
+  }
+
+  /** A child was torn down and replaced, whatever the cause (action). */
+  noteChildRespawn(name: string, now: number = Date.now()): void {
+    const a = this.activity.get(name) ?? this.newActivity(now);
+    a.childRespawns += 1;
+    this.activity.set(name, a);
+  }
+
+  setChromeVersion(name: string, version: string, now: number = Date.now()): void {
+    const a = this.activity.get(name) ?? this.newActivity(now);
+    a.chromeVersion = version;
+    this.activity.set(name, a);
+  }
+
+  /**
+   * Fleet-wide canary rollup for /healthz. Chrome versions are reported as a
+   * SET: more than one means the fleet is running mixed browsers (an image
+   * rotated under long-lived containers), which is itself worth seeing when
+   * reading strike counts.
+   */
+  canarySummary(): { navStrikes: number; childRespawns: number; chromeVersions: string[] } {
+    let navStrikes = 0;
+    let childRespawns = 0;
+    const versions = new Set<string>();
+    for (const a of this.activity.values()) {
+      navStrikes += a.navStrikes;
+      childRespawns += a.childRespawns;
+      if (a.chromeVersion) versions.add(a.chromeVersion);
+    }
+    return { navStrikes, childRespawns, chromeVersions: [...versions].sort() };
   }
 
   getActivity(name: string): Activity | undefined {

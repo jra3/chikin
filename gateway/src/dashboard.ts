@@ -111,6 +111,9 @@ function row(
     <td>${attached}</td>
     <td>${idle}</td>
     <td>${browserIdle}</td>
+    <td>${act ? act.navStrikes : "—"}</td>
+    <td>${act ? act.childRespawns : "—"}</td>
+    <td>${act?.chromeVersion ? `<code>${esc(act.chromeVersion)}</code>` : "—"}</td>
     <td>${running ? `<a href="${vncHref}">open noVNC ↗</a>` : "—"}</td>
   </tr>`;
 }
@@ -138,6 +141,9 @@ function browserlessRow(name: string, registry: Registry, now: number): string {
     <td>live</td>
     <td>${act && act.streams > 0 ? "yes" : "no"}</td>
     <td>${idle}</td>
+    <td>—</td>
+    <td>${act ? act.navStrikes : "—"}</td>
+    <td>${act ? act.childRespawns : "—"}</td>
     <td>—</td>
     <td>—</td>
   </tr>`;
@@ -242,7 +248,7 @@ export async function renderDashboard(
   ${err ? `<p class="err">Could not list fleet: ${esc(err)}</p>` : ""}
   <table>
     <thead>
-      <tr><th>name</th><th>handle</th><th>state</th><th>status</th><th>sandbox</th><th>session</th><th>attached</th><th title="since any MCP frame — a client heartbeat ping keeps this near zero">idle</th><th title="since a real browser tool call — what the attached reap TTL measures">browser idle</th><th>view</th></tr>
+      <tr><th>name</th><th>handle</th><th>state</th><th>status</th><th>sandbox</th><th>session</th><th>attached</th><th title="since any MCP frame — a client heartbeat ping keeps this near zero">idle</th><th title="since a real browser tool call — what the attached reap TTL measures">browser idle</th><th title="nav verifications that disagreed with the browser (suspicion). Many strikes with no respawns = the detector is firing on something that is not a wedge">strikes</th><th title="children torn down and replaced, any cause (action)">respawns</th><th title="Chrome reported by the running browser. It floats unpinned, and it governs whether the wedge reproduces at all — see #73">chrome</th><th>view</th></tr>
     </thead>
     <tbody>
 ${rows}
