@@ -45,7 +45,8 @@ Prerequisites: Docker 20.10+ with Compose v2, and ~1.5 GB disk for the images (t
 ```bash
 # 1. Pull the pinned gateway + fleet browser images from ghcr (builds nothing).
 cp .env.example .env
-# Optionally pin CHIKIN_VERSION in .env to a release tag; default is `latest`.
+# Already pinned: CHIKIN_VERSION defaults to an immutable per-commit `sha-<short>`
+# tag, so this install is reproducible. Set another one to move (see .env.example).
 docker compose --profile build pull
 
 # 2. Bring up the gateway + socket-proxy.
@@ -55,12 +56,15 @@ docker compose --profile build pull
 docker compose up -d
 
 # 3. Sanity check.
-curl -s http://localhost:8080/healthz        # {"status":"ok","config":{…},"warnings":[…]}
+curl -s http://localhost:8080/healthz        # {"status":"ok","config":{…},"warnings":[…],"canary":{…}}
 open http://localhost:8080/                   # fleet dashboard
 ```
 
 `/healthz` carries the **effective runtime config of the running gateway** — see
-[Checking the effective config](#checking-the-effective-config).
+[Checking the effective config](#checking-the-effective-config) — plus a
+`"canary"` block (`{"navStrikes":N,"childRespawns":N,"chromeVersions":[…]}`)
+rolling the wedge watchdog up across the fleet; see
+[Wedge self-healing](#wedge-self-healing-issue-15) for how to read it.
 
 The gateway listens on `127.0.0.1:8080` only. Browsers are **not** compose services — they appear on demand, on a client's first browser tool call.
 
@@ -128,7 +132,7 @@ A session's browser name (`inst-<pid>`) says *which profile* it drives, not *wha
 
 Open the dashboard at <http://localhost:8080/> and click **open noVNC** next to any running browser, or go straight to `http://localhost:8080/vnc/<name>/`. You can drive that Chrome window by hand — useful for logging in or clearing a captcha while the MCP client keeps the session. The page title and the dashboard's **handle** column show which session (`chikin_identify` handle) owns each browser.
 
-The dashboard is also the only place the connected-vs-driven split is visible: **`fleet slots in use: N/MAX`** counts *browsers that exist* — every fleet container, i.e. every name that has made a browser tool call and not yet been reaped, including ones whose client has since disconnected. Live sessions that have never made one hold no slot and are listed as **`connected — holds no fleet slot`**, with no noVNC link (there is no browser to view yet — that URL 502s until one exists). The **`browser idle`** column is time since a real browser tool call, which is what the attached reap TTL measures; the plain **`idle`** column stays near zero on any attached session because the client bridge pings.
+The dashboard is also the only place the connected-vs-driven split is visible: **`fleet slots in use: N/MAX`** counts *browsers that exist* — every fleet container, i.e. every name that has made a browser tool call and not yet been reaped, including ones whose client has since disconnected. Live sessions that have never made one hold no slot and are listed as **`connected — holds no fleet slot`**, with no noVNC link (there is no browser to view yet — that URL 502s until one exists). The **`browser idle`** column is time since a real browser tool call, which is what the attached reap TTL measures; the plain **`idle`** column stays near zero on any attached session because the client bridge pings. The **`strikes`**, **`respawns`** and **`chrome`** columns are the wedge canary — read them together, as [Wedge self-healing](#wedge-self-healing-issue-15) explains.
 
 ### Recording (video / GIF)
 
@@ -282,7 +286,7 @@ Set in `.env` (see `.env.example`) or the environment.
 | `CHIKIN_VOLUME_GC` | `1` | Sweep orphaned `chikin-profile-inst-*` volumes (disposable profiles whose container is gone) once at startup. Scoped by name — `golden`, `hermes` and named client profiles are never candidates. `0` disables. See [Profile volumes](#profile-volumes-and-cleaning-them-up). |
 | `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up. Nothing is provisioned when a client connects, so this bounds the **first browser tool call** — overrunning it fails that one call as a retryable tool error ("chikin could not start a browser"), leaving the session up with every tool registered. |
 | `WINDOW_SIZE` | `1920,1080` | Chrome window / Xvfb screen size for provisioned browsers. |
-| `CDM_EXTRA_ARGS` | *(empty)* | Extra flags for every `chrome-devtools-mcp` child, whitespace-separated. E.g. `--experimentalPageIdRouting` routes page-scoped tools by explicit `pageId` instead of the sticky selected-page binding (sidesteps the stale-target wedge, but changes tool schemas). |
+| `CDM_EXTRA_ARGS` | *(empty)* | Extra flags for every `chrome-devtools-mcp` child, whitespace-separated. E.g. `--experimentalPageIdRouting` lets page-scoped tools be routed by an explicit `pageId`. **It is not wedge protection**: upstream routes by id only when the *caller* passes a `pageId`, and falls back to the same sticky selected page otherwise — and the gateway cannot supply that id on the caller's behalf, because the page a call was meant for *is* the selected page, the very signal that goes stale in a wedge. Without a caller-side contract to pass ids it changes nothing; it also changes tool schemas, which an MCP client fixes at session start. Off by default. |
 | `NAV_VERIFY_DELAY_MS` | `2500` | Settle time the wedge watchdog waits after a "successful" navigation before re-sampling the browser's real CDP page list (it also samples it at reply time). A client navigating faster than this has a nav judged only when it names the same page as the newest one (the wedge signature); the gateway warns when verifications keep being skipped that way. See [Wedge self-healing](#wedge-self-healing-issue-15). |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
 
@@ -318,6 +322,17 @@ To fix a drifted gateway, recreate it *from the repo dir* so compose reads `.env
 1. **Nav watchdog** — after the child reports a navigation succeeded, the gateway compares the page the *child* reports it is bound to against the container's CDP `/json/list` (ground truth), sampled both at reply time and after a settle delay. Two consecutive navs on which the child is provably bound to a page the browser does not have force a transparent child respawn, which re-binds the browser's real current target. The test is deliberately not "did the page set move?" — a nav that redirects onto the page you are already on moves nothing while the child is perfectly healthy, and a page that redirects on its own after the reply is still cleared by the reply-time sample. Repeated CDP connection failures on the child's stderr (e.g. the container was removed out-of-band) trigger the same respawn.
 2. **`chikin_reset` tool** — injected into every `tools/list` (alongside `chikin_identify`, see [Identify your session first](#identify-your-session-first-chikin_identify--required)), so the model itself can hard-reset a wedged browser (container recreated, profile/logins preserved) without human help.
 3. **Self-healing transports** — both the client bridge and the gateway replay the cached `initialize` over a rebuilt link, so none of the above ever drops the client's MCP session.
+
+**Reading the canary.** The watchdog is not a fix for the wedge — it is a canary on an unpinned dependency, so it reports two *different* numbers and you want the gap between them:
+
+- **`strikes`** (`canary.navStrikes`) are **suspicions**: a nav verification that disagreed with the browser. This is the cumulative per-browser count, deliberately not the consecutive counter the bridge escalates on.
+- **`respawns`** (`canary.childRespawns`) are **actions**: a child actually torn down and replaced, for *any* cause — wedge verdict, transport close, CDP-failure streak, `chikin_reset`.
+
+Many strikes with **no** respawns is the informative state: the detector is firing on something systematic that is not a wedge (both false-positive classes fixed in #72 had exactly that shape). A single combined number would hide it, which is why there are two.
+
+The **`chrome`** column (`canary.chromeVersions`, a *set* — more than one entry means an image rotated under long-lived containers) is read from the running browser's CDP `/json/version` at every attach and child swap, and stamped into the strike/respawn log lines. It is load-bearing, not trivia: `Dockerfile` leaves `google-chrome-stable` deliberately **unpinned** (the accepted CHK-009/M4 non-reproducibility residual), and Chrome — not `chrome-devtools-mcp`, which has been the same 1.1.1 throughout — is the variable that governs whether the wedge reproduces at all (147.0.7727.101 wedged readily; 150.0.7871.181 does not reproduce). A strike that cannot name its Chrome is as unattributable as the original report was. If the browser cannot be probed the value is cleared rather than carried over, so `—` / `chrome unknown` means exactly that.
+
+These counters are **gauges, not monotonic totals.** They live on the browser's activity record, which the reaper deletes when it reclaims a name — so the `/healthz` totals *drop* when a browser is reaped, and a reaped browser's strike history leaves the dashboard entirely. The log lines are the durable record; anything scraping `/healthz` must not treat these as ever-increasing counters.
 
 **SSE keepalive.** Node's `fetch` (undici) kills a response body that has been idle for 300s, and the MCP event stream is silent whenever a client sits between tool calls — so every long-lived session used to be torn down and rebuilt on a ~301s cycle. That was invisible except for one symptom: a reconnect frees the session's `chikin_identify` handle, so sessions kept losing their identity (and, with it, access to every browser tool until they re-identified) every five minutes. The gateway now writes a `: keepalive` SSE comment into open streams every 30s. It is protocol-invisible, and it covers POST replies too, so a tool call slower than 300s no longer dies mid-flight.
 
@@ -365,6 +380,7 @@ The container starts as **root** only long enough for `entrypoint.sh` to chown t
 - **Scoped Docker access.** The gateway reaches Docker only through `tecnativa/docker-socket-proxy` with a read-only socket mount, scoped to containers/volumes/images (+POST). `exec`, `info`, swarm, and secrets are denied — verify with the proxy returning `403` on `/info` and `/exec/...`.
 - **Chrome's renderer sandbox is ON by default** where the host supports it (see [Renderer sandbox](#renderer-sandbox-h1) below). This closes the H1 audit finding: a renderer exploit from a hostile page no longer means immediate in-container code execution — it now *also* needs a sandbox escape. On a host that can't sandbox, chikin falls back to `--no-sandbox` (loud WARN); there, still treat a profile volume as a fully compromised browser profile after visiting untrusted content.
 - Never change the gateway's host port binding from `127.0.0.1`.
+- **Audit history.** chikin was audited on 2026-07-21 (15 findings); all 15 are resolved. The tracking issue [#34](https://github.com/jra3/chikin/issues/34) is the record — it lists each finding with the PR that closed it, plus the one **deliberately accepted residual** (peer browsers can still reach each other's CDP `:9222` and noVNC `:6080`, per [ADR 0003](docs/adr/0003-accept-cross-browser-reachability-close-the-gateway.md), asserted as `EXPECTED_PEER_REACHABLE` in `itest/gateway-reachability.mjs`). There is no separate audit report file, by design: a second copy with nothing keeping it current is how a stale document ends up read as current posture.
 
 ### Renderer sandbox (H1)
 

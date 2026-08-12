@@ -26,6 +26,34 @@ export interface Activity {
    * heartbeat problem this field exists to escape.
    */
   lastBrowserActivity: number;
+  /**
+   * Canary counters for the stale-target wedge (#73). Deliberately TWO numbers,
+   * because they answer different questions and the interesting state is the
+   * gap between them:
+   *
+   *  - `navStrikes`    — how often the child's reported view disagreed with the
+   *                      browser's real page set (a SUSPICION, cumulative; not
+   *                      the consecutive counter the bridge escalates on).
+   *  - `childRespawns` — how often a child was actually torn down and replaced,
+   *                      for ANY reason (an ACTION: wedge verdict, transport
+   *                      close, CDP-failure streak, `chikin_reset`).
+   *
+   * Many strikes with no respawns means the detector is firing on something
+   * systematic that is not a wedge — the exact shape of both false-positive
+   * classes fixed in #72, and precisely what a single counter would hide.
+   */
+  navStrikes: number;
+  childRespawns: number;
+  /**
+   * Chrome as reported by the running browser's CDP `/json/version` at attach.
+   *
+   * Load-bearing, not trivia: `Dockerfile` leaves `google-chrome-stable`
+   * deliberately unpinned (CHK-009/M4), and Chrome — not chrome-devtools-mcp —
+   * is the variable that governs whether the wedge reproduces (147 wedged, 150
+   * does not). `chromeImage` is a fixed tag over moving content, so without
+   * this a recurrence is as unattributable as the original report was.
+   */
+  chromeVersion?: string;
 }
 
 /**
@@ -169,10 +197,24 @@ export class Registry {
 
   // --- activity -------------------------------------------------------------
 
+  private newActivity(now: number): Activity {
+    return { last: now, streams: 0, lastBrowserActivity: now, navStrikes: 0, childRespawns: 0 };
+  }
+
+  /**
+   * The record for `name`, created complete if this is the first thing that
+   * ever touched it. Every entry point below goes through here, so a counter
+   * bump can never land on a half-built record and no caller can forget the
+   * `set`; `newActivity` stays the single place the shape is defined.
+   */
+  private ensureActivity(name: string, now: number): Activity {
+    const a = this.activity.get(name) ?? this.newActivity(now);
+    this.activity.set(name, a);
+    return a;
+  }
+
   touch(name: string, now: number = Date.now()): void {
-    const a = this.activity.get(name);
-    if (a) a.last = now;
-    else this.activity.set(name, { last: now, streams: 0, lastBrowserActivity: now });
+    this.ensureActivity(name, now).last = now;
   }
 
   /**
@@ -182,20 +224,15 @@ export class Registry {
    * that pings and gateway-owned tools can never move this clock (issue #57).
    */
   touchBrowserActivity(name: string, now: number = Date.now()): void {
-    const a = this.activity.get(name);
-    if (a) {
-      a.last = now;
-      a.lastBrowserActivity = now;
-    } else {
-      this.activity.set(name, { last: now, streams: 0, lastBrowserActivity: now });
-    }
+    const a = this.ensureActivity(name, now);
+    a.last = now;
+    a.lastBrowserActivity = now;
   }
 
   streamOpened(name: string, now: number = Date.now()): void {
-    const a = this.activity.get(name) ?? { last: now, streams: 0, lastBrowserActivity: now };
+    const a = this.ensureActivity(name, now);
     a.streams += 1;
     a.last = now;
-    this.activity.set(name, a);
   }
 
   streamClosed(name: string, now: number = Date.now()): void {
@@ -203,6 +240,47 @@ export class Registry {
     if (!a) return;
     a.streams = Math.max(0, a.streams - 1);
     a.last = now;
+  }
+
+  /** A nav verification disagreed with the browser (suspicion, not action). */
+  noteNavStrike(name: string, now: number = Date.now()): void {
+    this.ensureActivity(name, now).navStrikes += 1;
+  }
+
+  /** A child was torn down and replaced, whatever the cause (action). */
+  noteChildRespawn(name: string, now: number = Date.now()): void {
+    this.ensureActivity(name, now).childRespawns += 1;
+  }
+
+  /**
+   * Record the Chrome the browser reports, or FORGET it when `version` is null
+   * (the probe failed, or the container was replaced by one we could not
+   * measure). Never keep the last known value across a browser we can no
+   * longer stand behind: the image tag floats, so a stale version would name
+   * the wrong Chrome on a strike, which is worse than naming none.
+   */
+  setChromeVersion(name: string, version: string | null, now: number = Date.now()): void {
+    const a = this.ensureActivity(name, now);
+    if (version) a.chromeVersion = version;
+    else delete a.chromeVersion;
+  }
+
+  /**
+   * Fleet-wide canary rollup for /healthz. Chrome versions are reported as a
+   * SET: more than one means the fleet is running mixed browsers (an image
+   * rotated under long-lived containers), which is itself worth seeing when
+   * reading strike counts.
+   */
+  canarySummary(): { navStrikes: number; childRespawns: number; chromeVersions: string[] } {
+    let navStrikes = 0;
+    let childRespawns = 0;
+    const versions = new Set<string>();
+    for (const a of this.activity.values()) {
+      navStrikes += a.navStrikes;
+      childRespawns += a.childRespawns;
+      if (a.chromeVersion) versions.add(a.chromeVersion);
+    }
+    return { navStrikes, childRespawns, chromeVersions: [...versions].sort() };
   }
 
   getActivity(name: string): Activity | undefined {

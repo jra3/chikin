@@ -112,8 +112,10 @@ services:
       PROVISION_TIMEOUT_SEC: "${PROVISION_TIMEOUT_SEC:-90}"
       WINDOW_SIZE: "${WINDOW_SIZE:-1920,1080}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
-      # Wedge self-healing knobs (issue #15). CDM_EXTRA_ARGS e.g.
-      # "--experimentalPageIdRouting" to bypass the sticky page binding.
+      # Wedge self-healing knobs (issue #15). CDM_EXTRA_ARGS passes arbitrary
+      # flags to every chrome-devtools-mcp child. Note "--experimentalPageIdRouting"
+      # is NOT wedge protection: upstream routes by id only when the CALLER
+      # passes a pageId, and the gateway cannot supply one (see README).
       CDM_EXTRA_ARGS: "${CDM_EXTRA_ARGS:-}"
       NAV_VERIFY_DELAY_MS: "${NAV_VERIFY_DELAY_MS:-2500}"
       CHROME_IMAGE: "ghcr.io/jra3/chikin:${CHIKIN_VERSION:-sha-e1b3e92}"

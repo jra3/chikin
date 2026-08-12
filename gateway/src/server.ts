@@ -153,7 +153,17 @@ export function createApp(deps: ServerDeps): express.Express {
   // `docker exec` into the container's env (see runtime.ts). Secret-free by
   // construction: GATEWAY_TOKEN appears only as `authEnabled`.
   app.get("/healthz", (_req, res) => {
-    res.json({ status: "ok", config: runtimeConfig(), warnings: configWarnings() });
+    // `canary` is the wedge watchdog's fleet-wide rollup (#73): strikes are
+    // suspicions, respawns are actions, and `chromeVersions` is the dependency
+    // that actually governs whether the wedge reproduces. Here rather than only
+    // on the dashboard because /healthz is the surface that answers "what does
+    // this process actually have" without a browser.
+    res.json({
+      status: "ok",
+      config: runtimeConfig(),
+      warnings: configWarnings(),
+      canary: deps.registry.canarySummary(),
+    });
   });
 
   // Fleet dashboard and the noVNC proxy below are intentionally NOT bearer-

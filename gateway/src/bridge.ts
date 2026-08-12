@@ -448,6 +448,42 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     }
   }
 
+  // The browser's own Chrome version, from CDP `/json/version` ("Browser":
+  // "Chrome/150.0.7871.181"). Read once per attach and stamped into every
+  // canary log line: Chrome floats unpinned (Dockerfile, CHK-009/M4) and is the
+  // variable that governs whether the wedge reproduces at all (#73), so a
+  // strike that does not say which Chrome it happened on is a strike nobody can
+  // act on later.
+  async function chromeVersion(ip: string): Promise<string | null> {
+    try {
+      const res = await fetch(`http://${ip}:${config.cdpPort}/json/version`, {
+        signal: AbortSignal.timeout(2000),
+      });
+      if (!res.ok) return null;
+      const v = (await res.json()) as { Browser?: string };
+      return typeof v.Browser === "string" && v.Browser ? v.Browser : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Re-read the browser's Chrome and cache it against this name, at EVERY child
+   * swap that has a browser rather than only at attach. `chikin_reset` and the
+   * unhealthy-container path both recreate the container from `config.image` —
+   * a fixed tag over moving content — so the browser on the far side of a
+   * respawn need not be the one last measured. A failed probe clears the cache
+   * (see `setChromeVersion`) so the canary never names a Chrome it cannot see.
+   */
+  async function refreshChromeVersion(ip: string): Promise<string | null> {
+    const chrome = await chromeVersion(ip);
+    deps.registry.setChromeVersion(name, chrome);
+    return chrome;
+  }
+
+  /** Chrome for log lines: whatever we last learned, or an honest placeholder. */
+  const chromeTag = (): string => deps.registry.getActivity(name)?.chromeVersion ?? "chrome unknown";
+
   const http = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     onsessioninitialized: (sid: string) => {
@@ -602,8 +638,9 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       return;
     }
     navStrikes++;
+    deps.registry.noteNavStrike(name);
     log.warn(
-      `session[${name}]: nav verify failed (${navStrikes}/${NAV_WEDGE_STRIKES}): ` +
+      `session[${name}] (${chromeTag()}): nav verify failed (${navStrikes}/${NAV_WEDGE_STRIKES}): ` +
         `requested ${nav.url ?? "(history)"}; child is on ${nav.reported?.selected} ` +
         `but the browser's real pages were [${(atReply ?? []).join(", ")}] at reply time ` +
         `and are [${(real ?? []).join(", ")}] now`,
@@ -685,7 +722,8 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     if (session?.isClosed || respawning) return;
     respawning = true;
     try {
-      log.warn(`session[${name}]: child gone (${why}); respawning`);
+      deps.registry.noteChildRespawn(name);
+      log.warn(`session[${name}] (${chromeTag()}): child gone (${why}); respawning`);
       failAllInflight(`chikin browser restarted (${why}); retry the request`);
       // Those requests got error replies; nothing left to verify or decorate.
       pendingNavs.clear();
@@ -706,11 +744,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         const gen = ++childGen;
         let spawned: StdioClientTransport | null = null;
         try {
-          spawned = await startChild(gen, wantBrowser ? await provision() : null);
+          const ip = wantBrowser ? await provision() : null;
+          spawned = await startChild(gen, ip);
           await replayInitialize(spawned, gen);
           child = spawned;
           spawned = null;
-          log.info(`session[${name}]: child respawned (gen ${gen})`);
+          const chrome = ip ? await refreshChromeVersion(ip) : null;
+          log.info(
+            `session[${name}]: child respawned (gen ${gen}` +
+              `${ip ? `, ${chrome ?? "chrome unknown"}` : ""})`,
+          );
           return;
         } catch (e) {
           log.warn(`session[${name}]: respawn attempt ${attempt} failed`, String(e));
@@ -786,7 +829,10 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       if (session.isClosed) return;
       child = spawned;
       spawned = null;
-      log.info(`session[${name}]: browser attached at ${ip} (child gen ${gen})`);
+      const chrome = await refreshChromeVersion(ip);
+      log.info(
+        `session[${name}]: browser attached at ${ip} (child gen ${gen}, ${chrome ?? "chrome unknown"})`,
+      );
     } catch (e) {
       // The container is up but the child swap failed. `currentIp` is set, so
       // the ordinary respawn path re-attaches to that same warm container (and,
