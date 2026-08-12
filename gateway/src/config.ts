@@ -143,10 +143,14 @@ export const config = {
   // the container's CDP endpoint over the internal network.
   cdmCommand: str("CDM_COMMAND", "/app/node_modules/.bin/chrome-devtools-mcp"),
   // Extra flags appended to every chrome-devtools-mcp invocation, whitespace-
-  // separated. E.g. CDM_EXTRA_ARGS="--experimentalPageIdRouting" routes every
-  // page-scoped tool by explicit pageId instead of the sticky selected-page
-  // binding that causes the stale-target wedge (issue #15) — opt-in because it
-  // changes the tool schemas the client sees.
+  // separated. E.g. CDM_EXTRA_ARGS="--experimentalPageIdRouting" lets page-
+  // scoped tools be routed by an explicit pageId. It is NOT wedge protection
+  // (issue #73): upstream routes by id only when the CALLER passes one, and
+  // with none falls back to the same sticky selected page — and the gateway
+  // cannot supply that id on the caller's behalf, because the page a call was
+  // meant for IS the selected page, the very signal that goes stale in a wedge.
+  // Opt-in also because it changes the tool schemas, which an MCP client fixes
+  // at session start.
   cdmExtraArgs: str("CDM_EXTRA_ARGS", "").split(/\s+/).filter(Boolean),
 
   // Log verbosity (debug|info|warn|error). Read here too so the effective value
