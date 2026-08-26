@@ -226,7 +226,11 @@ test("a multi-tab child is judged on its SELECTED page, not the whole set", () =
 });
 
 // structuredContent is the machine-readable twin of the "## Pages" block and is
-// what reportedPages reads first; the text parse is only the fallback.
+// what reportedPages reads first WHEN PRESENT — but it never is: the MCP SDK
+// strips it from a tool result whose tool registered no outputSchema, and
+// chrome-devtools-mcp registers none (issue #75, pinned on the wire by
+// cdm-outputschema.test.ts). The cases below therefore cover a branch that is
+// inert in production; the text parse above is the only channel that runs.
 
 test("reportedPages prefers structuredContent.pages over the text block", () => {
   const got = reportedPages({
@@ -259,6 +263,81 @@ test("a structuredContent page list with nothing selected leaves selected unset"
   });
   assert.deepEqual(got, { pages: ["https://example.com/"], selected: undefined });
   assert.equal(navVerdict(got, ["https://example.com/"]), "unknown");
+});
+
+// chrome-devtools-mcp 1.6.0 renders a page that HAS a title as
+// "<id>: <title> (<url>)" instead of "<id>: <url>" (McpResponse.js, pageLabel /
+// fetchPageTitle), which is nearly every real page. The parse this replaced took
+// the first token as the URL and required [selected] immediately after it, so a
+// titled line yielded a junk URL and marked nothing selected — navVerdict then
+// returned "unknown" forever and the watchdog silently never struck (issue #75).
+// A title is arbitrary text, so these pin the awkward shapes, not just the happy one.
+
+test("the text parse reads 1.6.0's '<title> (<url>)' page line", () => {
+  const got = reportedPages(
+    navReply(
+      "## Pages\n" +
+        "0: Example Domain (https://example.com/)\n" +
+        "1: Example Domains (https://www.iana.org/help/example-domains) [selected]\n",
+    ),
+  );
+  assert.deepEqual(got, {
+    pages: ["https://example.com/", "https://www.iana.org/help/example-domains"],
+    selected: "https://www.iana.org/help/example-domains",
+  });
+});
+
+test("a titled page line still yields a verdict, rather than blinding the watchdog", () => {
+  // The regression that mattered: not a wrong strike, a strike that never comes.
+  const reported = reportedPages(
+    navReply("## Pages\n0: Stale App (https://app.example/stale) [selected]\n"),
+  );
+  assert.equal(navVerdict(reported, ["https://app.example/moved"]), "wedge");
+  assert.equal(navVerdict(reported, ["https://app.example/stale"]), "ok");
+});
+
+test("titled and untitled page lines mix in one block", () => {
+  // about:blank and a page whose title fetch timed out both render bare, so both
+  // forms appear in the same list.
+  const got = reportedPages(
+    navReply("## Pages\n0: about:blank\n1: Titled (https://b.example/) [selected]\n"),
+  );
+  assert.deepEqual(got, { pages: ["about:blank", "https://b.example/"], selected: "https://b.example/" });
+});
+
+test("a URL carrying its own parentheses survives the titled form", () => {
+  const got = reportedPages(
+    navReply(
+      "## Pages\n0: Foo (bar) - Wikipedia (https://en.wikipedia.org/wiki/Foo_(bar)) [selected]\n",
+    ),
+  );
+  assert.deepEqual(got, {
+    pages: ["https://en.wikipedia.org/wiki/Foo_(bar)"],
+    selected: "https://en.wikipedia.org/wiki/Foo_(bar)",
+  });
+});
+
+test("a title containing '[selected]' does not steal the selection", () => {
+  // [selected] is located relative to the URL, not by scanning the line, so the
+  // page upstream really marked is the one that wins.
+  const got = reportedPages(
+    navReply(
+      "## Pages\n" +
+        "0: Foo [selected] (https://x.example/)\n" +
+        "1: Bar (https://y.example/) [selected]\n",
+    ),
+  );
+  assert.deepEqual(got, {
+    pages: ["https://x.example/", "https://y.example/"],
+    selected: "https://y.example/",
+  });
+});
+
+test("the titled form tolerates the isolatedContext label after [selected]", () => {
+  const got = reportedPages(
+    navReply("## Pages\n1: Work App (https://example.org/) [selected] isolatedContext=work\n"),
+  );
+  assert.deepEqual(got, { pages: ["https://example.org/"], selected: "https://example.org/" });
 });
 
 test("the text parse tolerates the isolatedContext label upstream appends", () => {
