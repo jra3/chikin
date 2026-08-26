@@ -22,10 +22,9 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { execFileSync, spawn } from "node:child_process";
-import { createRequire } from "node:module";
-import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { reportedPages } from "../gateway/dist/src/bridge.js";
+import { resolveCdmBin, withCdmStdio } from "../gateway/dist/test/cdm-stdio.js";
 
 const BASE = process.env.BASE ?? "http://localhost:8080";
 const TOKEN = process.env.GATEWAY_TOKEN ?? "testtoken-abc123";
@@ -61,76 +60,27 @@ async function open(name, handle) {
   return { client, transport };
 }
 
-const require = createRequire(import.meta.url);
 // CDM_BIN points this at a build other than the pinned one, which is the whole
 // point of the harness: run it against a candidate BEFORE taking the bump. The
 // text block is the watchdog's only channel, so a version that restyles it
 // blinds the watchdog, and that is invisible to every test that does not spawn
-// the real binary.
-const BIN =
-  process.env.CDM_BIN ??
-  path.join(
-    path.dirname(require.resolve("chrome-devtools-mcp/package.json")),
-    "build/src/bin/chrome-devtools-mcp.js",
-  );
+// the real binary. Nothing below may assume where that build keeps its files.
+const BIN = resolveCdmBin(process.env.CDM_BIN);
 
 /** Drive the real binary against a real browser and return the raw tool result. */
-async function navigateOverStdio(browserUrl) {
-  const child = spawn(process.execPath, [BIN, "--browserUrl", browserUrl], {
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  const stderr = [];
-  child.stderr.on("data", (d) => stderr.push(String(d)));
-
-  const replies = new Map();
-  let buf = "";
-  child.stdout.on("data", (d) => {
-    buf += String(d);
-    const lines = buf.split("\n");
-    buf = lines.pop();
-    for (const line of lines) {
-      try {
-        const msg = JSON.parse(line);
-        if (typeof msg.id === "number") replies.set(msg.id, msg.result);
-      } catch {}
-    }
-  });
-
-  const send = (o) => child.stdin.write(JSON.stringify(o) + "\n");
-  const waitFor = async (id, what) => {
-    const deadline = Date.now() + 60_000;
-    while (!replies.has(id)) {
-      if (child.exitCode !== null)
-        throw new Error(`child exited (${child.exitCode}) before ${what}: ${stderr.join("")}`);
-      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}: ${stderr.join("")}`);
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    return replies.get(id);
-  };
-
-  try {
-    send({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-06-18",
-        capabilities: {},
-        clientInfo: { name: "itest-cdmwire", version: "0.0.0" },
-      },
-    });
-    await waitFor(1, "initialize");
-    send({ jsonrpc: "2.0", method: "notifications/initialized" });
-    send({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: { name: "navigate_page", arguments: { type: "url", url: TARGET } },
-    });
-    return await waitFor(2, "navigate_page");
-  } finally {
-    child.kill("SIGKILL");
-  }
+function navigateOverStdio(browserUrl) {
+  return withCdmStdio(
+    { bin: BIN, browserUrl, clientName: "itest-cdmwire", timeoutMs: 60_000 },
+    async (cdm) => {
+      // The build's own report of itself over the wire — the only version
+      // string that stays true for a relocated or bundled candidate.
+      console.log(`chrome-devtools-mcp/${cdm.serverInfo.version ?? "unknown"}  (${BIN})`);
+      return cdm.call("tools/call", {
+        name: "navigate_page",
+        arguments: { type: "url", url: TARGET },
+      });
+    },
+  );
 }
 
 const session = await open(NAME, "itest-cdmwire");
@@ -143,8 +93,7 @@ try {
     `{{(index .NetworkSettings.Networks "${NET}").IPAddress}}`,
   );
   const version = await (await fetch(`http://${ip}:9222/json/version`)).json();
-  const cdmVersion = require(path.join(path.dirname(path.dirname(path.dirname(path.dirname(BIN)))), "package.json")).version;
-  console.log(`browser ${NAME} ${NET}=${ip}  ${version["Browser"]}  chrome-devtools-mcp/${cdmVersion}`);
+  console.log(`browser ${NAME} ${NET}=${ip}  ${version["Browser"]}`);
 
   const result = await navigateOverStdio(`http://${ip}:9222`);
   const text = (result?.content ?? []).map((c) => c.text ?? "").join("\n");

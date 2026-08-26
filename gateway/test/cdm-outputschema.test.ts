@@ -1,8 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { createRequire } from "node:module";
-import path from "node:path";
+import { NAV_TOOLS } from "../src/bridge.js";
+import { withCdmStdio } from "./cdm-stdio.js";
 
 /**
  * The wire-level guard issue #75 asked for.
@@ -22,16 +21,12 @@ import path from "node:path";
  * so `initialize` and `tools/list` are served against a dead `--browserUrl` —
  * the same property the gateway's lazy provisioning relies on (issue #63).
  *
- * If upstream ever registers an `outputSchema`, this fails. That is the point:
- * the inert structured branch in `bridge.ts` would become live, and the failure
- * is the notification.
+ * If upstream ever registers an `outputSchema` ON A TOOL THE WATCHDOG PARSES,
+ * this fails. That is the point: the inert structured branch in `bridge.ts`
+ * would become live, and the failure is the notification. A schema anywhere
+ * else is reported and waved through — it changes nothing about the watchdog,
+ * and must not block a version bump.
  */
-
-const require = createRequire(import.meta.url);
-const BIN = path.join(
-  path.dirname(require.resolve("chrome-devtools-mcp/package.json")),
-  "build/src/bin/chrome-devtools-mcp.js",
-);
 
 // Unroutable on purpose: no browser is needed, and a black-holed address would
 // hang instead of failing fast if a handler ever did try to connect.
@@ -41,65 +36,12 @@ interface ToolsListResult {
   tools: Array<{ name: string; outputSchema?: unknown }>;
 }
 
-/** Drive a real chrome-devtools-mcp over stdio and return its `tools/list`. */
-async function toolsListOverStdio(): Promise<ToolsListResult> {
-  const child = spawn(process.execPath, [BIN, "--browserUrl", DEAD_BROWSER_URL], {
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  const stderr: string[] = [];
-  child.stderr.on("data", (d) => stderr.push(String(d)));
+test("chrome-devtools-mcp registers no outputSchema on the tools the watchdog reads", async () => {
+  const result = (await withCdmStdio(
+    { browserUrl: DEAD_BROWSER_URL, clientName: "chikin-wire-probe", timeoutMs: 30_000 },
+    (session) => session.call("tools/list"),
+  )) as ToolsListResult;
 
-  const send = (msg: unknown) => child.stdin.write(JSON.stringify(msg) + "\n");
-  const replies = new Map<number, unknown>();
-  let buf = "";
-  child.stdout.on("data", (d) => {
-    buf += String(d);
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      let msg: { id?: number; result?: unknown };
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        continue; // the child logs non-JSON on stdout in some versions
-      }
-      if (typeof msg.id === "number") replies.set(msg.id, msg.result);
-    }
-  });
-
-  const waitFor = async (id: number, what: string) => {
-    const deadline = Date.now() + 30_000;
-    while (!replies.has(id)) {
-      if (child.exitCode !== null)
-        throw new Error(`child exited (${child.exitCode}) before ${what}: ${stderr.join("")}`);
-      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    return replies.get(id);
-  };
-
-  try {
-    send({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-06-18",
-        capabilities: {},
-        clientInfo: { name: "chikin-wire-probe", version: "0.0.0" },
-      },
-    });
-    await waitFor(1, "initialize");
-    send({ jsonrpc: "2.0", method: "notifications/initialized" });
-    send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
-    return (await waitFor(2, "tools/list")) as ToolsListResult;
-  } finally {
-    child.kill("SIGKILL");
-  }
-}
-
-test("chrome-devtools-mcp registers no outputSchema, so structuredContent never reaches us", async () => {
-  const result = await toolsListOverStdio();
   const tools = result?.tools;
   assert.ok(Array.isArray(tools) && tools.length > 0, "the child served a non-empty tool list");
 
@@ -111,10 +53,22 @@ test("chrome-devtools-mcp registers no outputSchema, so structuredContent never 
   );
 
   const withSchema = tools.filter((t) => t.outputSchema !== undefined).map((t) => t.name);
+
+  // Everything outside NAV_TOOLS is reported, never failed: the watchdog never
+  // parses those replies, so a schema on a performance or network tool says
+  // nothing about the channel and must not stall a bump.
+  const unrelated = withSchema.filter((n) => !NAV_TOOLS.has(n));
+  if (unrelated.length)
+    console.log(
+      `note: chrome-devtools-mcp now registers an outputSchema on ${unrelated.join(", ")} — ` +
+        "not a tool the nav watchdog parses, so its channel is unchanged",
+    );
+
   assert.deepEqual(
-    withSchema,
+    withSchema.filter((n) => NAV_TOOLS.has(n)),
     [],
-    "upstream now registers an outputSchema — structuredContent reaches the gateway, so the " +
-      "structured branch in bridge.ts is live and should be promoted back over the text parse",
+    "upstream now registers an outputSchema on a tool the nav watchdog parses — structuredContent " +
+      "reaches the gateway, so the structured branch in bridge.ts is live and should be promoted " +
+      "back over the text parse",
   );
 });

@@ -340,6 +340,34 @@ test("the titled form tolerates the isolatedContext label after [selected]", () 
   assert.deepEqual(got, { pages: ["https://example.org/"], selected: "https://example.org/" });
 });
 
+test("a token upstream appends AFTER [selected] does not cost us the selection", () => {
+  // The tail is where upstream keeps adding things — isolatedContext arrived
+  // that way. Anchoring on "[selected] ends the line" would drop the selection
+  // the first time anything follows it, and a lost selection is the blindness
+  // this whole parse exists to prevent: navVerdict reads "unknown" forever and
+  // the watchdog never strikes while looking perfectly healthy.
+  const bare = reportedPages(navReply("## Pages\n0: https://x.example/ [selected] frobnicate=1\n"));
+  assert.deepEqual(bare, { pages: ["https://x.example/"], selected: "https://x.example/" });
+  assert.equal(navVerdict(bare, ["https://moved.example/"]), "wedge");
+
+  const titled = reportedPages(
+    navReply("## Pages\n0: Titled (https://y.example/) [selected] frobnicate=1 isolatedContext=w\n"),
+  );
+  assert.deepEqual(titled, { pages: ["https://y.example/"], selected: "https://y.example/" });
+});
+
+test("a hostile page title cannot stall the parse", () => {
+  // <title> is whatever page the browser was driven to says it is, and
+  // pagesFromText runs synchronously on the event loop the whole fleet shares.
+  // A backtracking parse over the title took ~13s on 200k characters here; the
+  // token walk is linear, so the budget below is ~2000x what it needs.
+  const title = `A${" ".repeat(200_000)}B`;
+  const started = Date.now();
+  const got = reportedPages(navReply(`## Pages\n0: ${title} (https://slow.example/) [selected]\n`));
+  assert.ok(Date.now() - started < 2000, `parse took ${Date.now() - started}ms`);
+  assert.deepEqual(got, { pages: ["https://slow.example/"], selected: "https://slow.example/" });
+});
+
 test("the text parse tolerates the isolatedContext label upstream appends", () => {
   // 1.1.1 emits "<id>: <url>[ [selected]][ isolatedContext=<name>]". An anchored
   // parse drops such a line entirely, which silently blinds the watchdog for any

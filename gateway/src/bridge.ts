@@ -55,7 +55,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // child is perfectly healthy. There is no pre-nav CDP snapshot: the request-time
 // /json/list was traded for this reply-time one, which is what makes the verdict
 // accurate (it is contemporaneous with the view the child reported).
-const NAV_TOOLS = new Set(["navigate_page", "new_page", "navigate_page_history"]);
+// Exported because these are exactly the replies reportedPages is run against:
+// a wire test that asks "could structuredContent ever reach us?" has to ask it
+// of this set, not of every tool the child happens to register.
+export const NAV_TOOLS = new Set(["navigate_page", "new_page", "navigate_page_history"]);
 const NAV_VERIFY_DELAY_MS = Number(process.env.NAV_VERIFY_DELAY_MS || 2500);
 const NAV_WEDGE_STRIKES = 2;
 // Consecutive superseded (therefore unjudged) nav verifications before the
@@ -144,25 +147,58 @@ const looksLikeUrl = (s: string) => /^[a-z][a-z0-9+.-]*:/i.test(s);
 // so navVerdict returned "unknown" forever and the watchdog silently never
 // struck (issue #75). Positional coupling to a human-readable string is the bug
 // class — keep new tolerance anchored to the machine-generated tail.
+//
+// The scan walks tokens instead of running one backtracking regex over the
+// line. `<title>` is the visited page's own document.title, so it is as hostile
+// as the page is, and pagesFromText runs synchronously on the event loop the
+// whole fleet shares — every step here has to stay linear in the line's length.
 function parsePageLine(line: string): { url: string; selected: boolean } | null {
-  const head = /^\s*\d+:\s+(.*?)\s*$/.exec(line);
+  // Greedy `.*` plus an explicit trim, never `(.*?)\s*$`: the lazy form retries
+  // at every offset and re-splits each whitespace run it crosses, which is
+  // quadratic in a title carrying one (26s on a 200k-space title, measured).
+  const head = /^\s*\d+:\s+(.*)$/.exec(line);
   if (!head) return null;
   // isolatedContext is always appended last, and its value is a caller-chosen
-  // name that may itself contain spaces, so strip it to end of line.
-  const rest = head[1].replace(/\s+isolatedContext=.*$/, "");
+  // name that may itself contain spaces, so strip it to end of line. Found by
+  // scanning from the RIGHT: that is where upstream puts it, so a title quoting
+  // the word loses to the real one, and unlike /\s+isolatedContext=/ the scan
+  // cannot backtrack over a whitespace run (12s on the same 200k title).
+  const iso = head[1].lastIndexOf("isolatedContext=");
+  const rest = (iso > 0 && /\s/.test(head[1][iso - 1]) ? head[1].slice(0, iso) : head[1]).trim();
+  if (!rest) return null;
 
-  // Titled form. The non-greedy title lets the URL keep its own parentheses
-  // (e.g. a Wikipedia "Foo_(bar)" URL) because the group must still end the line.
-  const titled = /^.*?\s+\((\S+)\)(\s+\[selected\])?$/.exec(rest);
-  if (titled && looksLikeUrl(titled[1])) return { url: titled[1], selected: Boolean(titled[2]) };
+  // Peel the machine-generated tail right to left: `[selected]`, plus whatever
+  // token a future version appends AFTER it. Losing the selection over one
+  // unrecognised trailing token is the same blindness this parse exists to
+  // prevent. Peeling stops at the label's own terminator — the titled form's
+  // closing paren, or the single remaining token of the bare form — so a
+  // title's words are never eaten and a "[selected]" sitting inside a title is
+  // not mistaken for the marker.
+  const tokens = rest.split(/\s+/);
+  let end = tokens.length;
+  let selected = false;
+  while (end > 1 && !tokens[end - 1].endsWith(")")) {
+    if (tokens[end - 1] === "[selected]") selected = true;
+    end--;
+  }
+  const label = end === tokens.length ? rest : tokens.slice(0, end).join(" ");
 
-  const bare = /^(\S+)(\s+\[selected\])?$/.exec(rest);
-  if (bare) return { url: bare[1], selected: Boolean(bare[2]) };
+  // Titled form. Anchoring on the LAST " (" lets the URL keep its own
+  // parentheses (e.g. a Wikipedia "Foo_(bar)" URL).
+  if (label.endsWith(")")) {
+    const open = label.lastIndexOf(" (");
+    const url = open < 0 ? "" : label.slice(open + 2, -1);
+    if (url && !/\s/.test(url) && looksLikeUrl(url)) return { url, selected };
+  }
+
+  // Bare form: the label is the URL itself. A label that had a tail peeled off
+  // it has to still look like a URL, or a title's first word would be promoted
+  // to a URL carrying a selection it never had.
+  if (end === 1 && (tokens.length === 1 || looksLikeUrl(label))) return { url: label, selected };
 
   // Unrecognised shape: take the first token rather than drop the line, since
   // dropping it blinds the watchdog instead of failing loudly.
-  const first = /^(\S+)/.exec(rest);
-  return first ? { url: first[1], selected: /\s\[selected\]$/.test(rest) } : null;
+  return { url: tokens[0], selected: /\s\[selected\]$/.test(rest) };
 }
 
 function pagesFromText(result: unknown): ReportedPages | null {
