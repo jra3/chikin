@@ -74,12 +74,15 @@ client bridge reconnecting through it (issue #57).
 `cdm-wire.mjs` asks what `chrome-devtools-mcp` actually puts **on the wire**
 (issue #75), which is the one thing the unit tests structurally cannot: they
 render replies through the vendored formatter, and the formatter returns a
-`structuredContent.pages` that the MCP SDK then strips, because the tool
-registers no `outputSchema`. So the human-readable `## Pages` block is the only
-channel the nav watchdog ever sees, and a suite can pass 154/154 while the
-watchdog is blind in production — which is exactly what happened. This harness
-provisions a real browser, drives the real binary against its CDP endpoint over
-stdio, and runs the gateway's own `reportedPages` over the bytes that crossed.
+`structuredContent.pages` that the child then never sends. Its `ToolHandler`
+copies that object onto a tool result only when `--experimentalStructuredContent`
+is set, and the `chrome-devtools-mcp` binary leaves the flag off (only the
+sibling `chrome-devtools` CLI turns it on; the MCP SDK strips nothing). So under
+the gateway's spawn flags the human-readable `## Pages` block is the only channel
+the nav watchdog ever sees, and a suite can pass 154/154 while the watchdog is
+blind in production — which is exactly what happened. This harness provisions a
+real browser, drives the real binary against its CDP endpoint over stdio, and
+runs the gateway's own `reportedPages` over the bytes that crossed.
 
 ```bash
 cd ../gateway && npm run build && cd ../itest        # it imports gateway/dist
@@ -99,6 +102,8 @@ CDM_BIN=/path/to/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js \
 
 That is how the #75 fix was verified: 1.1.1 renders `1: https://example.com/
 [selected]`, 1.6.0 renders `1: Example Domain (https://example.com/) [selected]`,
-and only the second reaches the parser through this harness. Its cause-side twin,
-`gateway/test/cdm-outputschema.test.ts`, pins the missing `outputSchema` and
-needs no browser.
+and only the second reaches the parser through this harness. The channel itself
+can only be asserted here: seeing whether `structuredContent` rides a reply takes
+a real tool call against a real browser. The browser-free CI twin,
+`gateway/test/cdm-outputschema.test.ts`, watches upstream's tool declarations
+instead, and names its own blind spot.

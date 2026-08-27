@@ -5,17 +5,20 @@
 // The nav watchdog judges a wedge from the child's own reply, so it depends on
 // that reply's shape. Every test that came before this one read the shape from
 // the vendored formatter — and the formatter LIES about the channel: it returns
-// `structuredContent.pages`, but the MCP SDK strips structuredContent from a
-// tool result whose tool registered no `outputSchema`, and chrome-devtools-mcp
-// registers none. So the gateway only ever sees `content[].text`, and the text
+// `structuredContent.pages`, but the child's ToolHandler copies that onto the
+// tool result only when `--experimentalStructuredContent` is set, and the
+// `chrome-devtools-mcp` binary leaves that flag off (only the sibling
+// `chrome-devtools` CLI turns it on; the MCP SDK strips nothing). So under the
+// flags the gateway spawns with, it only ever sees `content[].text` and the text
 // parse is the sole working channel. A whole suite passed 154/154 while the
 // watchdog was blind in production because of that gap.
 //
 // This closes it end to end: a REAL browser, the REAL binary over stdio, a REAL
 // navigation, and the gateway's own `reportedPages` run against the bytes that
-// actually crossed. `gateway/test/cdm-outputschema.test.ts` pins the cause
-// (no outputSchema is registered) without needing a browser; this pins the
-// consequence.
+// actually crossed. Only a live tool call can see whether structuredContent
+// rides the reply, which is why the channel is asserted HERE;
+// `gateway/test/cdm-outputschema.test.ts` is the browser-free CI tripwire on
+// upstream's tool declarations.
 //
 // Requires a built gateway (`cd ../gateway && npm run build`) and a running
 // fleet, like the other harnesses here.
@@ -99,11 +102,14 @@ try {
   const text = (result?.content ?? []).map((c) => c.text ?? "").join("\n");
   console.log("--- reply text ---\n" + text + "\n------------------");
 
-  // The #75 finding itself, asserted live rather than argued from source. If
-  // upstream registers an outputSchema this flips — promote the structured
-  // branch in bridge.ts back over the text parse, don't delete this check.
+  // The #75 finding itself, asserted live rather than argued from source. This
+  // spawns the child the way the gateway does, with no extra flags, so it reads
+  // the DEFAULT channel: pass --experimentalStructuredContent (as CDM_EXTRA_ARGS
+  // may) and the object arrives, which is the supported way to flip this. If it
+  // ever arrives unasked, promote the structured branch in bridge.ts back over
+  // the text parse — don't delete this check.
   check(
-    "structuredContent does NOT survive the wire (no outputSchema upstream)",
+    "structuredContent stays off the wire without --experimentalStructuredContent",
     result?.structuredContent === undefined,
     result?.structuredContent === undefined ? "" : JSON.stringify(result.structuredContent),
   );

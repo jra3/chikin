@@ -226,11 +226,12 @@ test("a multi-tab child is judged on its SELECTED page, not the whole set", () =
 });
 
 // structuredContent is the machine-readable twin of the "## Pages" block and is
-// what reportedPages reads first WHEN PRESENT — but it never is: the MCP SDK
-// strips it from a tool result whose tool registered no outputSchema, and
-// chrome-devtools-mcp registers none (issue #75, pinned on the wire by
-// cdm-outputschema.test.ts). The cases below therefore cover a branch that is
-// inert in production; the text parse above is the only channel that runs.
+// what reportedPages reads first WHEN PRESENT — which by default it is not: the
+// child copies it onto a tool result only when spawned with
+// --experimentalStructuredContent, and the chrome-devtools-mcp binary leaves
+// that flag off (issue #75; the MCP SDK never strips it). The cases below
+// therefore cover a branch that is dormant under the default flags and live
+// under CDM_EXTRA_ARGS=--experimentalStructuredContent — not dead code.
 
 test("reportedPages prefers structuredContent.pages over the text block", () => {
   const got = reportedPages({

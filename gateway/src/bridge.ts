@@ -102,19 +102,27 @@ export interface ReportedPages {
 // goes stale when it wedges. Returns null when the block is not parseable,
 // which must NOT be read as "healthy" (see navVerdict).
 //
-// THE TEXT BLOCK IS THE ONLY WORKING CHANNEL (issue #75). The child also builds
-// a machine-readable `structuredContent.pages`, but the MCP SDK strips
-// structuredContent from a tool result whose tool registered no `outputSchema`,
-// and chrome-devtools-mcp registers none — so it never reaches the gateway.
-// pagesFromStructuredContent below is therefore INERT in production; it is kept
-// because it costs ten lines and becomes live for free if upstream ever
-// registers a schema. `cdm-outputschema.test.ts` fails when that day comes.
+// THE TEXT BLOCK IS THE ONLY CHANNEL UNDER THE FLAGS WE SPAWN WITH (issue #75).
+// The child also builds a machine-readable `structuredContent.pages`, but its
+// ToolHandler copies that onto the tool result ONLY when
+// `--experimentalStructuredContent` is set, and the `chrome-devtools-mcp` binary
+// leaves that flag off — the same in 1.1.1 and 1.6.0, so a bump does not change
+// it. (Only the package's sibling `chrome-devtools` CLI puts the flag in its
+// defaults, and the gateway does not spawn that.) The MCP SDK is NOT the gate:
+// it validates structuredContent against an `outputSchema` when the tool
+// declares one, and never removes the field.
+//
+// So pagesFromStructuredContent below is inert by DEFAULT, not dead:
+// `CDM_EXTRA_ARGS=--experimentalStructuredContent` (spliced into the child argv
+// by startChild) turns the structured channel on today, and it is a supported
+// configuration — which is why the branch is preferred whenever the object is
+// actually present. `cdm-outputschema.test.ts` watches the upstream half.
 export function reportedPages(result: unknown): ReportedPages | null {
   return pagesFromStructuredContent(result) ?? pagesFromText(result);
 }
 
-// Inert against today's chrome-devtools-mcp — see reportedPages. Preferred when
-// present because it needs no parsing at all.
+// Only runs when the child was spawned with --experimentalStructuredContent —
+// see reportedPages. Preferred when present because it needs no parsing at all.
 function pagesFromStructuredContent(result: unknown): ReportedPages | null {
   const list = (result as { structuredContent?: { pages?: unknown } })?.structuredContent?.pages;
   if (!Array.isArray(list)) return null;

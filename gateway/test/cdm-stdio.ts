@@ -44,6 +44,11 @@ export interface CdmStdioOptions {
  * Absolute path to the binary, taken from the `bin` field of the package.json
  * being resolved rather than from a hardcoded `build/src/bin/...` subpath that
  * only the current release happens to use.
+ *
+ * It must be the `chrome-devtools-mcp` entry, the one the gateway spawns. The
+ * package also ships a `chrome-devtools` CLI, which starts the same server with
+ * `--experimentalStructuredContent` in its defaults — a different reply shape,
+ * so probing it would answer a question nobody here is asking.
  */
 export function resolveCdmBin(override?: string): string {
   if (override) return override;
