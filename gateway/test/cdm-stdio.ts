@@ -31,7 +31,11 @@ export interface CdmStdioOptions {
   browserUrl: string;
   /** `clientInfo.name` sent in initialize. */
   clientName: string;
-  /** Defaults to the pinned package's binary; pass CDM_BIN to override. */
+  /**
+   * Defaults to the pinned package's binary. `CDM_BIN` is not read here — only
+   * `itest/cdm-wire.mjs` forwards it — so `CDM_BIN=… npm test` still checks the
+   * PINNED build. Point the harness, not the unit suite, at a candidate.
+   */
   bin?: string;
   timeoutMs?: number;
 }
