@@ -226,7 +226,12 @@ test("a multi-tab child is judged on its SELECTED page, not the whole set", () =
 });
 
 // structuredContent is the machine-readable twin of the "## Pages" block and is
-// what reportedPages reads first; the text parse is only the fallback.
+// what reportedPages reads first WHEN PRESENT — which by default it is not: the
+// child copies it onto a tool result only when spawned with
+// --experimentalStructuredContent, and the chrome-devtools-mcp binary leaves
+// that flag off (issue #75; the MCP SDK never strips it). The cases below
+// therefore cover a branch that is dormant under the default flags and live
+// under CDM_EXTRA_ARGS=--experimentalStructuredContent — not dead code.
 
 test("reportedPages prefers structuredContent.pages over the text block", () => {
   const got = reportedPages({
@@ -259,6 +264,109 @@ test("a structuredContent page list with nothing selected leaves selected unset"
   });
   assert.deepEqual(got, { pages: ["https://example.com/"], selected: undefined });
   assert.equal(navVerdict(got, ["https://example.com/"]), "unknown");
+});
+
+// chrome-devtools-mcp 1.6.0 renders a page that HAS a title as
+// "<id>: <title> (<url>)" instead of "<id>: <url>" (McpResponse.js, pageLabel /
+// fetchPageTitle), which is nearly every real page. The parse this replaced took
+// the first token as the URL and required [selected] immediately after it, so a
+// titled line yielded a junk URL and marked nothing selected — navVerdict then
+// returned "unknown" forever and the watchdog silently never struck (issue #75).
+// A title is arbitrary text, so these pin the awkward shapes, not just the happy one.
+
+test("the text parse reads 1.6.0's '<title> (<url>)' page line", () => {
+  const got = reportedPages(
+    navReply(
+      "## Pages\n" +
+        "0: Example Domain (https://example.com/)\n" +
+        "1: Example Domains (https://www.iana.org/help/example-domains) [selected]\n",
+    ),
+  );
+  assert.deepEqual(got, {
+    pages: ["https://example.com/", "https://www.iana.org/help/example-domains"],
+    selected: "https://www.iana.org/help/example-domains",
+  });
+});
+
+test("a titled page line still yields a verdict, rather than blinding the watchdog", () => {
+  // The regression that mattered: not a wrong strike, a strike that never comes.
+  const reported = reportedPages(
+    navReply("## Pages\n0: Stale App (https://app.example/stale) [selected]\n"),
+  );
+  assert.equal(navVerdict(reported, ["https://app.example/moved"]), "wedge");
+  assert.equal(navVerdict(reported, ["https://app.example/stale"]), "ok");
+});
+
+test("titled and untitled page lines mix in one block", () => {
+  // about:blank and a page whose title fetch timed out both render bare, so both
+  // forms appear in the same list.
+  const got = reportedPages(
+    navReply("## Pages\n0: about:blank\n1: Titled (https://b.example/) [selected]\n"),
+  );
+  assert.deepEqual(got, { pages: ["about:blank", "https://b.example/"], selected: "https://b.example/" });
+});
+
+test("a URL carrying its own parentheses survives the titled form", () => {
+  const got = reportedPages(
+    navReply(
+      "## Pages\n0: Foo (bar) - Wikipedia (https://en.wikipedia.org/wiki/Foo_(bar)) [selected]\n",
+    ),
+  );
+  assert.deepEqual(got, {
+    pages: ["https://en.wikipedia.org/wiki/Foo_(bar)"],
+    selected: "https://en.wikipedia.org/wiki/Foo_(bar)",
+  });
+});
+
+test("a title containing '[selected]' does not steal the selection", () => {
+  // [selected] is located relative to the URL, not by scanning the line, so the
+  // page upstream really marked is the one that wins.
+  const got = reportedPages(
+    navReply(
+      "## Pages\n" +
+        "0: Foo [selected] (https://x.example/)\n" +
+        "1: Bar (https://y.example/) [selected]\n",
+    ),
+  );
+  assert.deepEqual(got, {
+    pages: ["https://x.example/", "https://y.example/"],
+    selected: "https://y.example/",
+  });
+});
+
+test("the titled form tolerates the isolatedContext label after [selected]", () => {
+  const got = reportedPages(
+    navReply("## Pages\n1: Work App (https://example.org/) [selected] isolatedContext=work\n"),
+  );
+  assert.deepEqual(got, { pages: ["https://example.org/"], selected: "https://example.org/" });
+});
+
+test("a token upstream appends AFTER [selected] does not cost us the selection", () => {
+  // The tail is where upstream keeps adding things — isolatedContext arrived
+  // that way. Anchoring on "[selected] ends the line" would drop the selection
+  // the first time anything follows it, and a lost selection is the blindness
+  // this whole parse exists to prevent: navVerdict reads "unknown" forever and
+  // the watchdog never strikes while looking perfectly healthy.
+  const bare = reportedPages(navReply("## Pages\n0: https://x.example/ [selected] frobnicate=1\n"));
+  assert.deepEqual(bare, { pages: ["https://x.example/"], selected: "https://x.example/" });
+  assert.equal(navVerdict(bare, ["https://moved.example/"]), "wedge");
+
+  const titled = reportedPages(
+    navReply("## Pages\n0: Titled (https://y.example/) [selected] frobnicate=1 isolatedContext=w\n"),
+  );
+  assert.deepEqual(titled, { pages: ["https://y.example/"], selected: "https://y.example/" });
+});
+
+test("a hostile page title cannot stall the parse", () => {
+  // <title> is whatever page the browser was driven to says it is, and
+  // pagesFromText runs synchronously on the event loop the whole fleet shares.
+  // A backtracking parse over the title took ~13s on 200k characters here; the
+  // token walk is linear, so the budget below is ~2000x what it needs.
+  const title = `A${" ".repeat(200_000)}B`;
+  const started = Date.now();
+  const got = reportedPages(navReply(`## Pages\n0: ${title} (https://slow.example/) [selected]\n`));
+  assert.ok(Date.now() - started < 2000, `parse took ${Date.now() - started}ms`);
+  assert.deepEqual(got, { pages: ["https://slow.example/"], selected: "https://slow.example/" });
 });
 
 test("the text parse tolerates the isolatedContext label upstream appends", () => {

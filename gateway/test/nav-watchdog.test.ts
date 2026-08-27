@@ -49,8 +49,10 @@ const realPages = async () => {
   return (await res.json()).filter((t) => t.type === "page").map((t) => t.url);
 };
 
-// Render through the REAL upstream formatter: same "## Pages" text block and
-// same structuredContent.pages the gateway sees in production. \`includePages\`
+// Render through the REAL upstream formatter: the same "## Pages" text block the
+// gateway parses in production. (The formatter's structuredContent.pages rides
+// along here; a real child only sends it when started with
+// --experimentalStructuredContent — see reportedPages.) \`includePages\`
 // off is how this fake stands in for an upstream version that stopped reporting
 // the page list at all — the case the watchdog must call BLIND, not healthy.
 const render = (line, includePages = true) => {

@@ -55,7 +55,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // child is perfectly healthy. There is no pre-nav CDP snapshot: the request-time
 // /json/list was traded for this reply-time one, which is what makes the verdict
 // accurate (it is contemporaneous with the view the child reported).
-const NAV_TOOLS = new Set(["navigate_page", "new_page", "navigate_page_history"]);
+// Exported because these are exactly the replies reportedPages is run against:
+// a wire test that asks "could structuredContent ever reach us?" has to ask it
+// of this set, not of every tool the child happens to register.
+export const NAV_TOOLS = new Set(["navigate_page", "new_page", "navigate_page_history"]);
 const NAV_VERIFY_DELAY_MS = Number(process.env.NAV_VERIFY_DELAY_MS || 2500);
 const NAV_WEDGE_STRIKES = 2;
 // Consecutive superseded (therefore unjudged) nav verifications before the
@@ -89,23 +92,37 @@ export interface ReportedPages {
 
 // The child's own view of the browser, taken from its own tool reply.
 //
-// chrome-devtools-mcp reports the page list twice: machine-readably as
-// `structuredContent.pages` ([{id, url, selected, isolatedContext?}]), and as
-// the human-readable "## Pages" block appended to every page-scoped reply:
+// chrome-devtools-mcp appends a "## Pages" block to every page-scoped reply:
 //
 //   ## Pages
 //   0: https://example.com/
-//   1: https://example.org/ [selected] isolatedContext=work
+//   1: Example Domain (https://example.org/) [selected] isolatedContext=work
 //
-// The structured form is authoritative; the text parse is only a fallback for a
-// reply that carries no structuredContent. `selected` is the page the child
-// believes its tools act on — the value that goes stale when it wedges.
-// Returns null when neither form is parseable, which must NOT be read as
-// "healthy" (see navVerdict).
+// `selected` is the page the child believes its tools act on — the value that
+// goes stale when it wedges. Returns null when the block is not parseable,
+// which must NOT be read as "healthy" (see navVerdict).
+//
+// THE TEXT BLOCK IS THE ONLY CHANNEL UNDER THE FLAGS WE SPAWN WITH (issue #75).
+// The child also builds a machine-readable `structuredContent.pages`, but its
+// ToolHandler copies that onto the tool result ONLY when
+// `--experimentalStructuredContent` is set, and the `chrome-devtools-mcp` binary
+// leaves that flag off — the same in 1.1.1 and 1.6.0, so a bump does not change
+// it. (Only the package's sibling `chrome-devtools` CLI puts the flag in its
+// defaults, and the gateway does not spawn that.) The MCP SDK is NOT the gate:
+// it validates structuredContent against an `outputSchema` when the tool
+// declares one, and never removes the field.
+//
+// So pagesFromStructuredContent below is inert by DEFAULT, not dead:
+// `CDM_EXTRA_ARGS=--experimentalStructuredContent` (spliced into the child argv
+// by startChild) turns the structured channel on today, and it is a supported
+// configuration — which is why the branch is preferred whenever the object is
+// actually present. `cdm-outputschema.test.ts` watches the upstream half.
 export function reportedPages(result: unknown): ReportedPages | null {
   return pagesFromStructuredContent(result) ?? pagesFromText(result);
 }
 
+// Only runs when the child was spawned with --experimentalStructuredContent —
+// see reportedPages. Preferred when present because it needs no parsing at all.
 function pagesFromStructuredContent(result: unknown): ReportedPages | null {
   const list = (result as { structuredContent?: { pages?: unknown } })?.structuredContent?.pages;
   if (!Array.isArray(list)) return null;
@@ -118,6 +135,78 @@ function pagesFromStructuredContent(result: unknown): ReportedPages | null {
     if ((entry as { selected?: unknown })?.selected === true) selected = url;
   }
   return pages.length ? { pages, selected } : null;
+}
+
+const looksLikeUrl = (s: string) => /^[a-z][a-z0-9+.-]*:/i.test(s);
+
+// One line of the "## Pages" block, which upstream renders as:
+//
+//   <id>: <label>[ [selected]][ isolatedContext=<name>]
+//
+// `<label>` is the bare URL on 1.1.1 — and on any untitled page in any version —
+// but 1.6.0 renders a titled page as `<title> (<url>)`, which is nearly every
+// real page. A title is arbitrary text: it can contain spaces, parentheses, and
+// the literal "[selected]".
+//
+// So the URL is located RELATIVE TO the parentheses, and `[selected]` relative
+// to the URL, rather than by counting tokens from the left. The old parse took
+// the first token as the URL and required `[selected]` immediately after it; on
+// a titled page that yielded "Example" as the URL and marked nothing selected,
+// so navVerdict returned "unknown" forever and the watchdog silently never
+// struck (issue #75). Positional coupling to a human-readable string is the bug
+// class — keep new tolerance anchored to the machine-generated tail.
+//
+// The scan walks tokens instead of running one backtracking regex over the
+// line. `<title>` is the visited page's own document.title, so it is as hostile
+// as the page is, and pagesFromText runs synchronously on the event loop the
+// whole fleet shares — every step here has to stay linear in the line's length.
+function parsePageLine(line: string): { url: string; selected: boolean } | null {
+  // Greedy `.*` plus an explicit trim, never `(.*?)\s*$`: the lazy form retries
+  // at every offset and re-splits each whitespace run it crosses, which is
+  // quadratic in a title carrying one (26s on a 200k-space title, measured).
+  const head = /^\s*\d+:\s+(.*)$/.exec(line);
+  if (!head) return null;
+  // isolatedContext is always appended last, and its value is a caller-chosen
+  // name that may itself contain spaces, so strip it to end of line. Found by
+  // scanning from the RIGHT: that is where upstream puts it, so a title quoting
+  // the word loses to the real one, and unlike /\s+isolatedContext=/ the scan
+  // cannot backtrack over a whitespace run (12s on the same 200k title).
+  const iso = head[1].lastIndexOf("isolatedContext=");
+  const rest = (iso > 0 && /\s/.test(head[1][iso - 1]) ? head[1].slice(0, iso) : head[1]).trim();
+  if (!rest) return null;
+
+  // Peel the machine-generated tail right to left: `[selected]`, plus whatever
+  // token a future version appends AFTER it. Losing the selection over one
+  // unrecognised trailing token is the same blindness this parse exists to
+  // prevent. Peeling stops at the label's own terminator — the titled form's
+  // closing paren, or the single remaining token of the bare form — so a
+  // title's words are never eaten and a "[selected]" sitting inside a title is
+  // not mistaken for the marker.
+  const tokens = rest.split(/\s+/);
+  let end = tokens.length;
+  let selected = false;
+  while (end > 1 && !tokens[end - 1].endsWith(")")) {
+    if (tokens[end - 1] === "[selected]") selected = true;
+    end--;
+  }
+  const label = end === tokens.length ? rest : tokens.slice(0, end).join(" ");
+
+  // Titled form. Anchoring on the LAST " (" lets the URL keep its own
+  // parentheses (e.g. a Wikipedia "Foo_(bar)" URL).
+  if (label.endsWith(")")) {
+    const open = label.lastIndexOf(" (");
+    const url = open < 0 ? "" : label.slice(open + 2, -1);
+    if (url && !/\s/.test(url) && looksLikeUrl(url)) return { url, selected };
+  }
+
+  // Bare form: the label is the URL itself. A label that had a tail peeled off
+  // it has to still look like a URL, or a title's first word would be promoted
+  // to a URL carrying a selection it never had.
+  if (end === 1 && (tokens.length === 1 || looksLikeUrl(label))) return { url: label, selected };
+
+  // Unrecognised shape: take the first token rather than drop the line, since
+  // dropping it blinds the watchdog instead of failing loudly.
+  return { url: tokens[0], selected: /\s\[selected\]$/.test(rest) };
 }
 
 function pagesFromText(result: unknown): ReportedPages | null {
@@ -138,13 +227,10 @@ function pagesFromText(result: unknown): ReportedPages | null {
       continue;
     }
     if (!inPages) continue;
-    // Anything after the URL (`[selected]`, `isolatedContext=<name>`, whatever
-    // upstream adds next) is tolerated: dropping the line entirely would blind
-    // the watchdog rather than fail loudly.
-    const m = /^\s*\d+:\s+(\S+)(\s+\[selected\])?(\s.*)?$/.exec(line);
-    if (!m) continue;
-    pages.push(m[1]);
-    if (m[2]) selected = m[1];
+    const parsed = parsePageLine(line);
+    if (!parsed) continue;
+    pages.push(parsed.url);
+    if (parsed.selected) selected = parsed.url;
   }
   return pages.length ? { pages, selected } : null;
 }
