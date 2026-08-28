@@ -25,3 +25,11 @@ The `[a-z0-9-]` identifier that picks a Browser. A stable Name (`giard`) is a st
 **Instance**:
 A running Claude Code process. Each Instance automatically gets its own Browser, so one person running many Instances is the reason the Fleet exists.
 _Avoid_: client, user (a single human runs many Instances)
+
+**Profile Volume**:
+The Docker volume holding one Browser's Chrome profile, named `chikin-profile-<name>`. Its disposability follows its Name: a `inst-*` Profile Volume is **disposable** and is destroyed with its Browser; every other one (`golden`, `hermes`, any sticky client name) is **sticky** and outlives the Browser so a reconnect restores cookies and logins. Only a disposable Profile Volume may ever be destroyed.
+_Avoid_: profile dir, data volume
+
+**Seed Volume**:
+An operator-authored snapshot that new Profile Volumes are cloned *from* so a Browser starts logged in (`SEED_VOLUME`, populated by `bin/chikin-snapshot`). Source material the Fleet reads and never manages: it is not a Profile Volume, and its name follows no Fleet convention. Its protection from the destructive paths comes from that name, so pointing `SEED_VOLUME` at a `chikin-profile-inst-*` volume is not supported.
+_Avoid_: golden (that's one particular sticky Profile Volume, and it is not the Seed Volume)

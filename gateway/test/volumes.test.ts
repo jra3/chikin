@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Provisioner } from "../src/provisioner.js";
 import { isInstanceName, isInstanceVolume, volumeLabels, volumeName } from "../src/config.js";
+import { startDockerStub } from "./docker-stub.js";
 
 // Profile-volume lifecycle: issues #58 (reaped browsers leaked their instance
 // volumes, 222 orphans / ~47 GB on one host) and #59 (chikin-profile-golden was
@@ -82,62 +83,92 @@ test("ensureVolume stamps the role label on the volume it creates", async () => 
 
 // --- Reaper-path volume removal (issue #58) ---------------------------------
 
-function fakeDocker(volumes: string[]) {
-  const removed: string[] = [];
-  const docker = {
-    getVolume: (name: string) => ({
-      inspect: async () => {
-        if (!volumes.includes(name)) throw new Error("no such volume");
-        return { Name: name };
-      },
-      remove: async () => {
-        if (!volumes.includes(name)) throw new Error("no such volume: " + name);
-        volumes.splice(volumes.indexOf(name), 1);
-        removed.push(name);
-      },
-    }),
-  };
-  return { docker, removed };
-}
+// These run against a stub Docker Engine API over real dockerode rather than a
+// hand-written object, because what they assert IS Docker's behaviour: a volume
+// a container mounts cannot be removed, and that refusal — not a container list
+// we compute ourselves — is the ownership rule (ADR 0004). A double that models
+// the refusal would be the safety property certifying itself.
 
-test("removeInstanceVolume removes a disposable instance profile", async () => {
-  const { docker, removed } = fakeDocker(["chikin-profile-inst-18051"]);
-  const p = new Provisioner(docker as never);
+test("removeInstanceVolume removes a disposable instance profile", async (t) => {
+  const stub = await startDockerStub({ volumes: ["chikin-profile-inst-18051"] });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
+
   assert.equal(await p.removeInstanceVolume("inst-18051"), true);
-  assert.deepEqual(removed, ["chikin-profile-inst-18051"]);
+  assert.deepEqual(stub.requests, ["DELETE /volumes/chikin-profile-inst-18051"]);
+  assert.equal(stub.volumes().includes("chikin-profile-inst-18051"), false);
 });
 
-test("removeInstanceVolume NEVER touches golden, hermes, or a named profile", async () => {
+test("removeInstanceVolume NEVER touches golden, hermes, or a named profile", async (t) => {
   const keepers = ["golden", "hermes", "alice"];
-  const { docker, removed } = fakeDocker(keepers.map(volumeName));
-  const p = new Provisioner(docker as never);
+  const stub = await startDockerStub({ volumes: keepers.map(volumeName) });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
 
   for (const name of keepers) {
     assert.equal(await p.removeInstanceVolume(name), false, `${name} must be refused`);
   }
-  assert.deepEqual(removed, [], "no named profile volume was removed");
+  // Stronger than "nothing was removed": no request reached Docker at all, so
+  // the rule short-circuits rather than relying on the daemon to say no.
+  assert.deepEqual(stub.requests, [], "no named profile was even asked about");
+  assert.deepEqual(stub.volumes().sort(), keepers.map(volumeName).sort());
 });
 
-test("removeInstanceVolume stands down when a provision is in flight (CHK-015)", async () => {
-  const { docker, removed } = fakeDocker(["chikin-profile-inst-7"]);
-  const p = new Provisioner(docker as never);
+test("removeInstanceVolume stands down when a provision is in flight (CHK-015)", async (t) => {
+  const stub = await startDockerStub({ volumes: ["chikin-profile-inst-7"] });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
 
   // The reaper passes () => !registry.isPending(name), re-evaluated inside the
   // provisioner's create gate: a volume must never be deleted out from under a
   // container that is still being created (issue #32).
   let pending = true;
   assert.equal(await p.removeInstanceVolume("inst-7", () => !pending), false);
-  assert.deepEqual(removed, [], "mid-provision volume preserved");
+  assert.deepEqual(stub.requests, [], "mid-provision volume never reached the wire");
 
   pending = false;
   assert.equal(await p.removeInstanceVolume("inst-7", () => !pending), true);
-  assert.deepEqual(removed, ["chikin-profile-inst-7"]);
+  assert.deepEqual(stub.volumes(), []);
 });
 
-test("removeInstanceVolume treats an already-gone volume as nothing to do", async () => {
-  const { docker } = fakeDocker([]);
-  const p = new Provisioner(docker as never);
-  assert.equal(await p.removeInstanceVolume("inst-404"), false);
+test("removeInstanceVolume treats an already-gone volume as nothing to do", async (t) => {
+  const stub = await startDockerStub({ volumes: [] });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
+
+  // Real dockerode surfacing a real 404 body, not an invented error string.
+  // The name deliberately does NOT contain "404": provisioner.ts decides
+  // "already gone" by matching /no such volume|404/i against the error MESSAGE,
+  // which embeds the volume name — so a fixture called inst-404 would satisfy
+  // that branch whatever Docker actually returned, and prove nothing. Switching
+  // this to a status-code check is ticket 2.
+  assert.equal(await p.removeInstanceVolume("inst-gone"), false);
+  assert.deepEqual(stub.requests, ["DELETE /volumes/chikin-profile-inst-gone"]);
+});
+
+test("removeInstanceVolume leaves a volume a container still mounts (Docker refuses)", async (t) => {
+  const stub = await startDockerStub({
+    volumes: ["chikin-profile-inst-9"],
+    containers: [
+      {
+        Id: "8f3c1d2e9a7b",
+        Names: ["/chikin-chrome-inst-9"],
+        State: "running",
+        Labels: { "chikin.fleet": "1", "chikin.name": "inst-9" },
+        Mounts: [{ Name: "chikin-profile-inst-9" }],
+      },
+    ],
+  });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
+
+  // Docker's 409 IS the ownership check — the single-volume path deliberately
+  // does not compute "is anything mounting this" for itself (ADR 0004).
+  assert.equal(await p.removeInstanceVolume("inst-9"), false);
+  // It must be Docker refusing, not the name rule declining: the request has to
+  // reach the wire and come back 409, or this passes for the wrong reason.
+  assert.deepEqual(stub.requests, ["DELETE /volumes/chikin-profile-inst-9"]);
+  assert.deepEqual(stub.volumes(), ["chikin-profile-inst-9"], "the mounted volume survives");
 });
 
 // --- Startup orphan sweep (issue #58, belt and braces) ----------------------
