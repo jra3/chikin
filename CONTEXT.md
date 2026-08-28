@@ -27,7 +27,7 @@ A running Claude Code process. Each Instance automatically gets its own Browser,
 _Avoid_: client, user (a single human runs many Instances)
 
 **Profile Volume**:
-The Docker volume holding one Browser's Chrome profile, named `chikin-profile-<name>`. Its disposability follows its Name: a `inst-*` Profile Volume is **disposable** and is destroyed with its Browser; every other one (`golden`, `hermes`, any sticky client name) is **sticky** and outlives the Browser so a reconnect restores cookies and logins. Only a disposable Profile Volume may ever be destroyed.
+The Docker volume holding one Browser's Chrome profile, named `chikin-profile-<name>`. Its disposability follows its Name: an `inst-*` Profile Volume is **disposable** and is destroyed with its Browser; every other one (`golden`, `hermes`, any sticky client name) is **sticky** and outlives the Browser so a reconnect restores cookies and logins. Only a disposable Profile Volume may ever be destroyed.
 _Avoid_: profile dir, data volume
 
 **Seed Volume**:
