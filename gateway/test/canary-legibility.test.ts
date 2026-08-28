@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tapLines } from "./log-tap.js";
 
 /**
  * The wedge watchdog is a CANARY on an unpinned dependency (#73), so what it
@@ -227,21 +228,12 @@ let server: Server;
 
 // The gateway splits its log across both streams (warn/error -> stderr, info ->
 // stdout), and the canary spans both: a strike is a warn, the respawn that
-// re-reads Chrome is an info. Tap both, or the evidence is half the story.
-const gatewayLog: string[] = [];
-const realErr = process.stderr.write.bind(process.stderr);
-const realOut = process.stdout.write.bind(process.stdout);
-const tap =
-  (real: (...a: unknown[]) => boolean) =>
-  (chunk: string | Uint8Array, ...rest: unknown[]) => {
-    const s = String(chunk);
-    if (/^\[(info|warn|error|debug)\] /.test(s)) gatewayLog.push(s);
-    return real(chunk, ...rest);
-  };
+// re-reads Chrome is an info. The tap rides log.ts's emit seam (log-tap.ts),
+// which sees every level whichever stream it lands on — or the evidence is
+// half the story.
+const { lines: gatewayLog, stop: stopLogTap } = await tapLines();
 
 test.before(async () => {
-  process.stderr.write = tap(realErr as (...a: unknown[]) => boolean) as typeof process.stderr.write;
-  process.stdout.write = tap(realOut as (...a: unknown[]) => boolean) as typeof process.stdout.write;
   server = app.listen(port, "127.0.0.1");
   await new Promise((r) => server.once("listening", r));
   cdp.listen(cdpPort, "127.0.0.1");
@@ -249,8 +241,7 @@ test.before(async () => {
 });
 
 test.after(async () => {
-  process.stderr.write = realErr;
-  process.stdout.write = realOut;
+  stopLogTap();
   await Promise.all(registry.all().map((s) => s.close("test teardown")));
   server.closeAllConnections?.();
   await new Promise((r) => server.close(r));
@@ -380,7 +371,7 @@ test("/healthz and the dashboard show the fleet canary", async () => {
     w(join(dir, "healthz-canary.json"), JSON.stringify(health, null, 2) + "\n");
     w(
       join(dir, "canary-gateway.log"),
-      gatewayLog.filter((l) => /nav verify failed|child gone|child respawned|browser attached|chikin_reset/.test(l)).join(""),
+      gatewayLog.filter((l) => /nav verify failed|child gone|child respawned|browser attached|chikin_reset/.test(l)).join("\n") + "\n",
     );
   }
 });

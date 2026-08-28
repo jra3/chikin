@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tapLines } from "./log-tap.js";
 
 /**
  * End-to-end proof of the nav watchdog's two halves (issue #15), run through
@@ -230,16 +231,12 @@ const registry = new Registry();
 const app = createApp({ registry, provisioner: provisioner as never });
 let server: Server;
 
-// The gateway logs strikes and respawns on stderr; that log IS the operator's
-// view of this watchdog, so assert on it rather than on internals.
-const gatewayLog: string[] = [];
-const realWrite = process.stderr.write.bind(process.stderr);
+// The gateway logs strikes and respawns; that log IS the operator's view of
+// this watchdog, so assert on it rather than on internals. Captured through
+// log.ts's tap seam (see log-tap.ts), not a stderr monkey-patch.
+const { lines: gatewayLog, stop: stopLogTap } = await tapLines();
 
 test.before(async () => {
-  process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
-    gatewayLog.push(String(chunk));
-    return (realWrite as (...a: unknown[]) => boolean)(chunk, ...rest);
-  }) as typeof process.stderr.write;
   server = app.listen(port, "127.0.0.1");
   await new Promise((r) => server.once("listening", r));
   cdp.listen(cdpPort, "127.0.0.1");
@@ -247,7 +244,7 @@ test.before(async () => {
 });
 
 test.after(async () => {
-  process.stderr.write = realWrite;
+  stopLogTap();
   await Promise.all(registry.all().map((s) => s.close("test teardown")));
   server.closeAllConnections?.();
   await new Promise((r) => server.close(r));
