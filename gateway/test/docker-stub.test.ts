@@ -6,11 +6,12 @@ import { startDockerStub, type StubContainer } from "./docker-stub.js";
 // contract is asserted here — through real dockerode, never by reading its
 // in-memory arrays, which would be the fake certifying itself.
 //
-// `all` is the reason this file exists. Real Docker lists ONLY running
-// containers without it, and listFleet, gcExited and the orphan sweep all pass
-// all:true because a STOPPED container still holds a fleet slot (the "fleet is
-// full" lockup). A stub that ignored the flag would keep passing a test whose
-// production code had dropped it.
+// `all` is the reason this file exists. Without it real Docker lists only
+// containers whose Running flag is true — State running, paused or restarting;
+// moby's List excludes exactly !Running — and listFleet, gcExited and the
+// orphan sweep all pass all:true because a STOPPED container still holds a
+// fleet slot (the "fleet is full" lockup). A stub that ignored the flag would
+// keep passing a test whose production code had dropped it.
 
 function fleet(): StubContainer[] {
   return [
@@ -46,6 +47,23 @@ test("`all: true` is what makes a stopped container visible", async (t) => {
   assert.deepEqual(ids(await stub.docker.listContainers({ all: true })), ["aaa", "bbb", "ccc"]);
 });
 
+test("paused and restarting containers are Running, so they list without `all`", async (t) => {
+  const stub = await startDockerStub({
+    containers: [
+      ...fleet(),
+      { Id: "ddd", Names: ["/chikin-chrome-inst-3"], State: "paused", Labels: {} },
+      { Id: "eee", Names: ["/chikin-chrome-inst-4"], State: "restarting", Labels: {} },
+    ],
+  });
+  t.after(() => stub.close());
+
+  // The daemon's no-`all` cut is the Running flag, which pause and restart
+  // both keep set (a crash-looping container shows in plain `docker ps` and
+  // still holds a fleet slot) — State === "running" would be a stub-side
+  // fiction the fleet has no counterpart for.
+  assert.deepEqual(ids(await stub.docker.listContainers()), ["aaa", "ccc", "ddd", "eee"]);
+});
+
 test("a label filter selects the fleet, by bare key and by key=value", async (t) => {
   const stub = await startDockerStub({ containers: fleet() });
   t.after(() => stub.close());
@@ -63,6 +81,44 @@ test("a label filter selects the fleet, by bare key and by key=value", async (t)
   // The filter composes with `all` rather than overriding it.
   const running = await stub.docker.listContainers({ filters: { label: ["chikin.fleet=1"] } });
   assert.deepEqual(ids(running), ["aaa"]);
+});
+
+test("the map-form filter encoding Docker also accepts is served, not crashed on", async (t) => {
+  const stub = await startDockerStub({ containers: fleet() });
+  t.after(() => stub.close());
+
+  // Docker's API takes filters as {"label":["k=v"]} AND as the map form
+  // {"label":{"k=v":true}}; a raw client may send either. The map form used to
+  // throw inside the server callback — an uncaught exception that killed the
+  // whole test run rather than failing the request.
+  const filters = encodeURIComponent(JSON.stringify({ label: { "chikin.fleet=1": true } }));
+  const r = await fetch(`${stub.url}/containers/json?all=1&filters=${filters}`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(ids((await r.json()) as { Id: string }[]), ["aaa", "bbb"]);
+});
+
+test("malformed filters and bodies are a 400, never an uncaught exception", async (t) => {
+  const stub = await startDockerStub({ containers: fleet() });
+  t.after(() => stub.close());
+
+  // JSON.parse accepts every one of these; dereferencing them is what used to
+  // kill the process.
+  for (const bad of ["null", "[]", '"label"']) {
+    const r = await fetch(`${stub.url}/containers/json?filters=${encodeURIComponent(bad)}`);
+    assert.equal(r.status, 400, `filters=${bad} must fail the request, not the process`);
+  }
+  const scalar = encodeURIComponent(JSON.stringify({ label: "chikin.fleet=1" }));
+  const r = await fetch(`${stub.url}/containers/json?filters=${scalar}`);
+  assert.equal(r.status, 400, "a scalar filter value is malformed, not a crash");
+
+  for (const body of ["null", "[]", "not json"]) {
+    const created = await fetch(`${stub.url}/volumes/create`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+    assert.equal(created.status, 400, `body=${body} must fail the request, not the process`);
+  }
 });
 
 test("an unmodelled query param is a 501 naming it, never a silent ignore", async (t) => {
@@ -116,6 +172,27 @@ test("volumes round-trip through create, inspect and list", async (t) => {
     listed.Volumes.map((v) => v.Name).sort(),
     ["chikin-profile-golden", "chikin-profile-inst-1"],
   );
+});
+
+test("create on an existing name returns the stored volume, labels untouched", async (t) => {
+  const stub = await startDockerStub();
+  t.after(() => stub.close());
+
+  await stub.docker.createVolume({
+    Name: "chikin-profile-alice",
+    Labels: { "chikin.role": "profile" },
+  });
+  // The daemon short-circuits on the name: a second create succeeds but its
+  // labels are never applied — volume labels are immutable after creation,
+  // which is the exact drift class issue #59 is about. A stub that overwrote
+  // here would certify a test that relies on relabelling-by-recreate.
+  await stub.docker.createVolume({
+    Name: "chikin-profile-alice",
+    Labels: { "chikin.role": "instance" },
+  });
+
+  const inspected = await stub.docker.getVolume("chikin-profile-alice").inspect();
+  assert.equal(inspected.Labels["chikin.role"], "profile", "the first create's labels stand");
 });
 
 test("an unhandled endpoint is a 501 naming it, so a test cannot wander off", async (t) => {

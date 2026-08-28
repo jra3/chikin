@@ -29,9 +29,9 @@ it is seeded and the moment its container mounts it (CHK-015 / issue #32). Carve
 the volume module out and the second one straddles the boundary, which is why
 "move the gate" has no correct answer.
 
-Splitting them gives each its right granularity. The cap genuinely needs a
-fleet-wide lock. The volume invariant never did, so per-name locking also stops
-every provision in the fleet serialising behind every other.
+Splitting them (SPY-164) gives each its right granularity. The cap genuinely
+needs a fleet-wide lock. The volume invariant never did, so per-name locking
+also stops every provision in the fleet serialising behind every other.
 
 Scale matters to the choice. The protected window is `createVolume` → seed copy →
 `createContainer`, and the seed copy runs a helper container to completion:
@@ -80,31 +80,33 @@ which failures warn).
   Shrinks exposure from seconds to microseconds and turns a silent wrong profile
   into a loud one, but knowingly keeps a race. CHK-015 exists because a race was
   once judged too small to matter.
-- **Per-name lock lent by the volume module (chosen).** `runExclusive(name, fn)`,
-  with the create path asserting the lock is held for that name. Scope-based, so
-  there is nothing to leak; the assertion closes the only gap a lent lock has, at
-  the cost of a set lookup, and a caller who forgets the scope fails on the first
-  test run rather than silently in production.
+- **Per-name lock lent by the volume module (chosen — SPY-164).**
+  `runExclusive(name, fn)`, with the create path asserting the lock is held for
+  that name. Scope-based, so there is nothing to leak; the assertion closes the
+  only gap a lent lock has, at the cost of a set lookup, and a caller who
+  forgets the scope fails on the first test run rather than silently in
+  production.
 
 ## Consequences
 
-- **The copier is its own module.** Copying between volumes needs a helper
-  container, making the Provisioner its natural implementor — but the Provisioner
-  also calls the volume module to reclaim, so constructing either first is
-  impossible (`ReferenceError: Cannot access 'containers' before initialization`).
-  Splitting the copier out yields a DAG: copier ← volumes ← containers.
-- **Two locks are held across Docker I/O**, cap gate outside, volume lock inside,
-  always in that order.
-- **`reclaim` returns the container and volume outcomes separately.** Collapsing
-  them loses the fact the Reaper needs to say what it threw away: reclaiming a
-  sticky Browser tears down its container while keeping its volume, and a single
-  return value cannot report both.
+- **The copier is its own module** (SPY-162). Copying between volumes needs a
+  helper container, making the Provisioner its natural implementor — but the
+  Provisioner also calls the volume module to reclaim, so constructing either
+  first is impossible (`ReferenceError: Cannot access 'containers' before
+  initialization`). Splitting the copier out yields a DAG: copier ← volumes ←
+  containers.
+- **Two locks are held across Docker I/O** (SPY-164), cap gate outside, volume
+  lock inside, always in that order.
+- **`reclaim` returns the container and volume outcomes separately** (SPY-166).
+  Collapsing them loses the fact the Reaper needs to say what it threw away:
+  reclaiming a sticky Browser tears down its container while keeping its
+  volume, and a single return value cannot report both.
 - **`isInstanceVolume` stops existing** (SPY-165). The sweep derives a Name by
   stripping `chikin-profile-` and applies the same rule as every other path,
   leaving one spelling of disposability.
-- **The sweep is safe whenever it runs.** It stays at startup, but `index.ts`
-  statement ordering stops being load-bearing, and exposing it as a control
-  becomes a product decision rather than a risk.
-- **Erasing inside a volume is authorised by freshness, not disposability.**
-  Sticky profiles are seeded too, so gating the erase on disposability would break
-  seeding for every sticky Browser.
+- **The sweep is safe whenever it runs** (SPY-165). It stays at startup, but
+  `index.ts` statement ordering stops being load-bearing, and exposing it as a
+  control becomes a product decision rather than a risk.
+- **Erasing inside a volume is authorised by freshness, not disposability**
+  (SPY-164). Sticky profiles are seeded too, so gating the erase on
+  disposability would break seeding for every sticky Browser.
