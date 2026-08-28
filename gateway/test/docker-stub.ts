@@ -161,7 +161,14 @@ function parseFilters(
       json(res, 501, { message: `docker-stub: unmodelled filter '${k}'` });
       return undefined;
     }
-    if (Array.isArray(v) && v.every((s) => typeof s === "string")) {
+    if (Array.isArray(v)) {
+      // Array form — but a non-string element must be the 400 here, not fall
+      // through to the map-form branch below (an array IS an object, and
+      // Object.keys would silently serve its indexes as filter values).
+      if (!v.every((s) => typeof s === "string")) {
+        json(res, 400, { message: `filters: malformed value for '${k}'` });
+        return undefined;
+      }
       out[k] = v as string[];
     } else if (typeof v === "object" && v !== null) {
       // Map form. moby's filters.Args.Get returns every key regardless of its
@@ -352,6 +359,11 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
     if (!route.body) return route.handle(ctx);
 
     let raw = "";
+    // A client abort mid-body emits 'error' on the request stream; with no
+    // listener that is an uncaught exception killing the test process — the
+    // same crash class as the JSON and listen hardening above. The response
+    // socket is gone with the client, so there is no one to answer: drop it.
+    req.on("error", () => res.destroy());
     req.on("data", (c) => {
       raw += c;
     });

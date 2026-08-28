@@ -111,6 +111,12 @@ test("malformed filters and bodies are a 400, never an uncaught exception", asyn
   const r = await fetch(`${stub.url}/containers/json?filters=${scalar}`);
   assert.equal(r.status, 400, "a scalar filter value is malformed, not a crash");
 
+  // An array with a non-string element must not slip into the map-form branch
+  // (an array is an object, and Object.keys would serve its indexes as values).
+  const mixed = encodeURIComponent(JSON.stringify({ label: ["chikin.fleet=1", 42] }));
+  const m = await fetch(`${stub.url}/containers/json?filters=${mixed}`);
+  assert.equal(m.status, 400, "a mixed-type array filter is malformed, not index junk");
+
   for (const body of ["null", "[]", "not json"]) {
     const created = await fetch(`${stub.url}/volumes/create`, {
       method: "POST",
