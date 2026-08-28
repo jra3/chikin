@@ -131,6 +131,28 @@ test("removeInstanceVolume stands down when a provision is in flight (CHK-015)",
   assert.deepEqual(stub.volumes(), []);
 });
 
+// removeInstanceVolume returns false for EVERY failure — 404, 409, 500,
+// transport — so "it returned false" cannot tell the already-gone branch apart
+// from any other. The one thing that branch does differently is stay quiet, and
+// log.ts writes straight to process.stderr with no injectable sink, so the tap
+// below is what makes the branch observable at all. Without the pair of
+// assertions it feeds, deleting the /no such volume|404/i guard in
+// provisioner.ts leaves this file green.
+async function withWarnings<T>(fn: () => Promise<T>): Promise<[T, string[]]> {
+  const warnings: string[] = [];
+  const real = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    const s = String(chunk);
+    if (s.startsWith("[warn] ")) warnings.push(s);
+    return (real as (...a: unknown[]) => boolean)(chunk, ...rest);
+  }) as typeof process.stderr.write;
+  try {
+    return [await fn(), warnings];
+  } finally {
+    process.stderr.write = real;
+  }
+}
+
 test("removeInstanceVolume treats an already-gone volume as nothing to do", async (t) => {
   const stub = await startDockerStub({ volumes: [] });
   t.after(() => stub.close());
@@ -142,8 +164,33 @@ test("removeInstanceVolume treats an already-gone volume as nothing to do", asyn
   // which embeds the volume name — so a fixture called inst-404 would satisfy
   // that branch whatever Docker actually returned, and prove nothing. Switching
   // this to a status-code check is ticket 2.
-  assert.equal(await p.removeInstanceVolume("inst-gone"), false);
+  const [removed, warnings] = await withWarnings(() => p.removeInstanceVolume("inst-gone"));
+
+  assert.equal(removed, false);
   assert.deepEqual(stub.requests, ["DELETE /volumes/chikin-profile-inst-gone"]);
+  // Silence is the whole behaviour: a volume that is already gone is nothing to
+  // do, not something an operator needs to see.
+  assert.deepEqual(warnings, [], "already-gone must not read as a failure");
+});
+
+test("removeInstanceVolume reports a failure that is NOT already-gone", async (t) => {
+  const vol = "chikin-profile-inst-wedged";
+  const stub = await startDockerStub({
+    // The volume exists and nothing mounts it, so the only reason this fails is
+    // the injected one — neither the 404 nor the 409 path can be reached here.
+    volumes: [vol],
+    removeFailures: { [vol]: { status: 500, message: `remove ${vol}: driver "local" failed` } },
+  });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
+
+  const [removed, warnings] = await withWarnings(() => p.removeInstanceVolume("inst-wedged"));
+
+  assert.equal(removed, false);
+  assert.deepEqual(stub.requests, [`DELETE /volumes/${vol}`]);
+  assert.equal(warnings.length, 1, "a real failure is operator-visible");
+  assert.match(warnings[0] ?? "", new RegExp(vol), "the warning names the volume");
+  assert.deepEqual(stub.volumes(), [vol], "a failed remove leaves the volume alone");
 });
 
 test("removeInstanceVolume leaves a volume a container still mounts (Docker refuses)", async (t) => {

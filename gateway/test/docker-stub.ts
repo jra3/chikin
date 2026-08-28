@@ -21,7 +21,8 @@ import Docker from "dockerode";
  * Scope is deliberately the volume endpoints plus the container list they
  * depend on. Container creation, exec, networks and images are not modelled —
  * a request for anything unhandled fails loudly with a 501 naming it, so a test
- * that wanders outside this surface says so instead of silently passing.
+ * that wanders outside this surface says so instead of silently passing. That
+ * applies to query params and filters too, not just paths: see `guardParams`.
  */
 
 export interface StubVolume {
@@ -38,22 +39,44 @@ export interface StubContainer {
   Mounts?: { Name?: string }[];
 }
 
+/** A response the stub is told to give instead of serving the request. */
+export interface StubFailure {
+  status: number;
+  /** The body's `message`; dockerode folds it into the Error it throws. */
+  message: string;
+}
+
 export interface DockerStubInit {
   /** Volumes present at start. A bare string is a volume with no labels. */
   volumes?: (string | StubVolume)[];
   /** Containers present at start. Their `Mounts` decide what is removable. */
   containers?: StubContainer[];
+  /**
+   * Failures to inject into `DELETE /volumes/<name>`, keyed by full volume name
+   * and taking precedence over the volume's real state. This is the seam for
+   * driving "Docker failed some other way" — a 500, a driver error — which the
+   * gateway must treat differently from an already-gone 404, without a test
+   * reaching into the server's internals to arrange it.
+   */
+  removeFailures?: Record<string, StubFailure>;
 }
 
 export interface DockerStub {
   /** A real dockerode client pointed at this stub. */
   docker: Docker;
+  /** Base URL of the stub, for asserting on raw requests dockerode cannot send. */
+  url: string;
   /** Every request received, as `METHOD /path`, in order. */
   requests: string[];
   /** Volume names currently present. */
   volumes(): string[];
-  /** Containers currently present, mutable so a test can change the fleet. */
-  containers: StubContainer[];
+  /**
+   * Containers currently present. Mutate it IN PLACE (`push`, `splice`) to
+   * change the fleet mid-test — the server closes over this exact array.
+   * `readonly` because reassigning it would leave the server on the old one,
+   * which is silent rather than a type error.
+   */
+  readonly containers: StubContainer[];
   close(): Promise<void>;
 }
 
@@ -62,13 +85,32 @@ function json(res: ServerResponse, code: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+/**
+ * Answers 501 if the request carries a query param this stub does not model,
+ * and reports whether it did. Silently ignoring one is how a stub drifts from
+ * the daemon: `DELETE /volumes/<name>?force=true` makes real Docker answer 204
+ * where it otherwise answers 404, so a test that starts sending `force` must be
+ * told the stub does not implement it rather than quietly getting the old
+ * behaviour.
+ */
+function guardParams(res: ServerResponse, url: URL, modelled: readonly string[]): boolean {
+  for (const [k] of url.searchParams) {
+    if (!modelled.includes(k)) {
+      json(res, 501, { message: `docker-stub: unmodelled query param '${k}'` });
+      return true;
+    }
+  }
+  return false;
+}
+
 export async function startDockerStub(init: DockerStubInit = {}): Promise<DockerStub> {
   const volumes = new Map<string, StubVolume>(
     (init.volumes ?? [])
       .map((v) => (typeof v === "string" ? { Name: v } : v))
       .map((v) => [v.Name, v] as const),
   );
-  const containers: StubContainer[] = init.containers ?? [];
+  const containers: StubContainer[] = [...(init.containers ?? [])];
+  const removeFailures = new Map(Object.entries(init.removeFailures ?? {}));
   const requests: string[] = [];
 
   const server: Server = createServer((req, res) => {
@@ -90,6 +132,10 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
     }
 
     if (req.method === "DELETE" && name !== undefined) {
+      // Nothing is modelled here — notably not `force`.
+      if (guardParams(res, url, [])) return;
+      const injected = removeFailures.get(name);
+      if (injected) return json(res, injected.status, { message: injected.message });
       if (!volumes.has(name)) {
         return json(res, 404, { message: `remove ${name}: no such volume` });
       }
@@ -108,12 +154,17 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
     }
 
     if (req.method === "GET" && name !== undefined) {
+      if (guardParams(res, url, [])) return;
       const v = volumes.get(name);
       if (!v) return json(res, 404, { message: `get ${name}: no such volume` });
       return json(res, 200, { Name: v.Name, Labels: v.Labels ?? {}, Driver: "local" });
     }
 
     if (req.method === "POST" && path === "/volumes/create") {
+      // docker-modem mirrors a POST's whole config into the query string as
+      // well as the body (the createContainer sharp edge in CLAUDE.md), so the
+      // modelled params here are exactly the body fields, not an empty set.
+      if (guardParams(res, url, ["Name", "Labels", "Driver", "DriverOpts"])) return;
       let body = "";
       req.on("data", (c) => {
         body += c;
@@ -135,6 +186,10 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
     }
 
     if (req.method === "GET" && path === "/volumes") {
+      // `filters` is deliberately NOT modelled: the sweep selects by name from
+      // the full list, and a stub that accepted `dangling` without implementing
+      // it would hand back every volume as though the filter had matched.
+      if (guardParams(res, url, [])) return;
       return json(res, 200, { Volumes: [...volumes.values()], Warnings: [] });
     }
 
@@ -144,11 +199,7 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
       // depend on seeing stopped ones (a stopped container still holds a fleet
       // slot — that is the "fleet is full" lockup). A stub that ignored it would
       // pass a test whose production code had dropped the flag.
-      for (const [k] of url.searchParams) {
-        if (k !== "all" && k !== "filters") {
-          return json(res, 501, { message: `docker-stub: unmodelled query param '${k}'` });
-        }
-      }
+      if (guardParams(res, url, ["all", "filters"])) return;
       const allRaw = url.searchParams.get("all");
       const all = allRaw === "1" || allRaw === "true";
       const raw = url.searchParams.get("filters");
@@ -186,6 +237,7 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
 
   return {
     docker: new Docker({ host: "127.0.0.1", port, protocol: "http" }),
+    url: `http://127.0.0.1:${port}`,
     requests,
     volumes: () => [...volumes.keys()],
     containers,

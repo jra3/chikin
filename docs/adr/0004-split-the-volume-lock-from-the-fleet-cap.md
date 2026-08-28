@@ -8,6 +8,14 @@ a volume applies the name rule and the unconditional Seed Volume exclusion, then
 asks Docker — Docker's refusal to remove a mounted volume *is* the ownership
 check, and no path re-implements one.
 
+**This record runs ahead of the code.** The decision is made and lands across
+SPY-160 – SPY-166; `gateway/src` does not implement all of it yet. Where a
+paragraph below describes something that has not landed, it names the ticket
+that lands it, so this file is never read as a description of today's
+`provisioner.ts`. The Seed Volume exclusion above is one such: today
+`removeInstanceVolume` gates on the name rule alone, and the unconditional
+exclusion is SPY-164.
+
 ## Why one mutex could not simply move
 
 `createGate` carried two unrelated invariants, and only ever looked like one
@@ -47,7 +55,9 @@ stub Engine API rather than against a hand-written double that models it. The
 same exercise found the 404 branch string-matching `/no such volume|404/i` on an
 error message that carries the volume's own name — so for a Browser whose pid
 contains `404`, every removal failure is silently swallowed. Dockerode exposes
-`statusCode` as a number; the branches switch on it.
+`statusCode` as a number; the branches switch on it (SPY-161 — until then they
+still match the message, and `volumes.test.ts` pins the distinction by asserting
+which failures warn).
 
 ## Considered options
 
@@ -89,9 +99,9 @@ contains `404`, every removal failure is silently swallowed. Dockerode exposes
   them loses the fact the Reaper needs to say what it threw away: reclaiming a
   sticky Browser tears down its container while keeping its volume, and a single
   return value cannot report both.
-- **`isInstanceVolume` stops existing.** The sweep derives a Name by stripping
-  `chikin-profile-` and applies the same rule as every other path, leaving one
-  spelling of disposability.
+- **`isInstanceVolume` stops existing** (SPY-165). The sweep derives a Name by
+  stripping `chikin-profile-` and applies the same rule as every other path,
+  leaving one spelling of disposability.
 - **The sweep is safe whenever it runs.** It stays at startup, but `index.ts`
   statement ordering stops being load-bearing, and exposing it as a control
   becomes a product decision rather than a risk.
