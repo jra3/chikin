@@ -62,6 +62,12 @@ export interface DockerStubInit {
    */
   removeFailures?: Record<string, StubFailure>;
   /**
+   * Failures to inject into `DELETE /containers/<id>`, keyed by the id or name
+   * the gateway addresses the container by, and taking precedence over its
+   * real state. The volume seam's counterpart for the container path.
+   */
+  removeContainerFailures?: Record<string, StubFailure>;
+  /**
    * Failure to inject into `GET /containers/json`, for driving "container
    * ownership cannot be read" paths — the orphan sweep must fail closed —
    * without the test hand-rolling a Docker double for one throw.
@@ -196,6 +202,7 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
   );
   const containers: StubContainer[] = [...(init.containers ?? [])];
   const removeFailures = new Map(Object.entries(init.removeFailures ?? {}));
+  const removeContainerFailures = new Map(Object.entries(init.removeContainerFailures ?? {}));
   const requests: string[] = [];
 
   const routes: Route[] = [
@@ -276,6 +283,34 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
       params: [],
       handle({ res }) {
         json(res, 200, { Volumes: [...volumes.values()], Warnings: [] });
+      },
+    },
+    {
+      method: "DELETE",
+      pattern: /^\/containers\/([^/]+)$/,
+      // `force` is modelled because the gateway sends it: real Docker answers
+      // 409 for a RUNNING container without it, and removes it with it. The
+      // other documented params (`v`, `link`) are not modelled — a caller that
+      // starts sending one gets a 501 naming it rather than silence.
+      params: ["force"],
+      handle({ res, match, query }) {
+        const ref = match[1] ?? "";
+        const injected = removeContainerFailures.get(ref);
+        if (injected) return json(res, injected.status, { message: injected.message });
+        // Docker addresses a container by id OR name; the gateway uses the name.
+        const i = containers.findIndex((c) => c.Id === ref || c.Names.includes(`/${ref}`));
+        if (i === -1) return json(res, 404, { message: `remove ${ref}: no such container` });
+        const force = query.get("force") === "1" || query.get("force") === "true";
+        const target = containers[i] as StubContainer;
+        if (!force && RUNNING_STATES.has(target.State)) {
+          return json(res, 409, {
+            message: `remove ${ref}: You cannot remove a running container ${target.Id}. ` +
+              `Stop the container before attempting removal or force remove`,
+          });
+        }
+        containers.splice(i, 1);
+        res.writeHead(204);
+        res.end();
       },
     },
     {

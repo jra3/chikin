@@ -40,6 +40,28 @@ export function securityOpt(): string[] {
   return opt;
 }
 
+/**
+ * The HTTP status behind a dockerode failure, or undefined when it carries
+ * none.
+ *
+ * Dockerode attaches `statusCode` as a NUMBER to every error it builds from a
+ * daemon response, and attaches nothing at all to a transport failure
+ * (ECONNREFUSED, a dead socket-proxy). Absence therefore means "this may never
+ * have reached Docker" — never a benign outcome — so callers must treat it as
+ * a real failure rather than folding it in with an already-gone 404.
+ *
+ * Reading the status is what replaces matching the error TEXT (SPY-161). The
+ * daemon echoes the volume or container name back in its message, so a browser
+ * named `inst-404` matched the old /404/i guard on EVERY failure and had all of
+ * them silently swallowed: no warn, a leaked volume, nothing in the logs. It
+ * was deterministic for that subset of names, not intermittent.
+ */
+export function dockerStatus(e: unknown): number | undefined {
+  if (typeof e !== "object" || e === null) return undefined;
+  const status = (e as { statusCode?: unknown }).statusCode;
+  return typeof status === "number" ? status : undefined;
+}
+
 export class FleetFullError extends Error {
   constructor(max: number) {
     super(`fleet is full (MAX_FLEET=${max}); reclaim an idle browser or raise the cap`);
@@ -616,11 +638,16 @@ export class Provisioner {
       await this.docker.getContainer(containerName(name)).remove({ force: true });
       log.info(`provisioner: removed ${containerName(name)}`);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      // 404 = already gone; treat as success.
-      if (!/no such container|404/i.test(msg)) {
-        log.warn(`provisioner: remove ${containerName(name)} failed`, msg);
+      // Already gone is success-shaped: the caller wanted it absent, it is.
+      // Decided by status, not by message — the daemon echoes the container's
+      // own name and id back, so a browser named inst-404 (or a container id
+      // that merely contains 404) hid every real failure here (SPY-161).
+      if (dockerStatus(e) === 404) {
+        log.debug(`provisioner: ${containerName(name)} was already gone`);
+        return;
       }
+      const msg = e instanceof Error ? e.message : String(e);
+      log.warn(`provisioner: remove ${containerName(name)} failed`, msg);
     }
   }
 
@@ -661,11 +688,25 @@ export class Provisioner {
         log.info(`provisioner: removed instance profile volume ${vol}`);
         return true;
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        // 404 = already gone; treat as success-shaped (nothing removed by us).
-        if (!/no such volume|404/i.test(msg)) {
-          log.warn(`provisioner: remove volume ${vol} failed`, msg);
+        const status = dockerStatus(e);
+        // 404: already gone. Nothing was removed by us and nothing is left
+        // behind, so there is nothing for an operator to act on.
+        if (status === 404) {
+          log.debug(`provisioner: instance profile volume ${vol} was already gone`);
+          return false;
         }
+        const msg = e instanceof Error ? e.message : String(e);
+        // 409: a container still mounts it. Docker's refusal IS the ownership
+        // rule (ADR 0004), so this is the system working — but it still leaves
+        // a volume behind, so it stays operator-visible.
+        if (status === 409) {
+          log.warn(`provisioner: not removing ${vol} — a container still mounts it`, msg);
+          return false;
+        }
+        // Everything else, INCLUDING a failure carrying no status at all: a
+        // transport error may never have reached Docker, so it can never be
+        // read as an already-gone volume.
+        log.warn(`provisioner: remove volume ${vol} failed`, msg);
         return false;
       }
     });

@@ -2,7 +2,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { resourceLimits, buildCreateOptions, securityOpt, Provisioner } from "../src/provisioner.js";
+import {
+  resourceLimits,
+  buildCreateOptions,
+  securityOpt,
+  dockerStatus,
+  Provisioner,
+} from "../src/provisioner.js";
+import { startDockerStub } from "./docker-stub.js";
+import { withWarnings } from "./log-tap.js";
 import { config, volumeName } from "../src/config.js";
 
 test("resourceLimits maps the default env config onto HostConfig caps (M3)", () => {
@@ -190,4 +198,65 @@ test("findSeedVolumes picks seed-looking volumes and ignores per-name profiles",
 test("findSeedVolumes tolerates a null volume list", async () => {
   const p = new Provisioner({ listVolumes: async () => ({ Volumes: null }) } as never);
   assert.deepEqual(await p.findSeedVolumes(), []);
+});
+
+// --- Container removal: failures stop being swallowed (SPY-161) -------------
+
+// removeContainer carried the identical defect to removeInstanceVolume: it
+// decided "already gone" by matching /no such container|404/i against an error
+// message the daemon fills with the container's own name and id. So for a
+// browser named inst-404 — or merely a container id containing 404, which is
+// one hex digit's luck — every real removal failure went unlogged. Same fix,
+// same wire, one function apart.
+
+test("dockerStatus reads dockerode's numeric status and nothing else", () => {
+  assert.equal(dockerStatus({ statusCode: 404 }), 404);
+  assert.equal(dockerStatus({ statusCode: 0 }), 0, "0 is a status, not absence");
+  // A transport error has none, and neither has anything that is not an error
+  // object. Absence must stay distinguishable from a real code, because the
+  // caller treats it as "may never have reached Docker".
+  assert.equal(dockerStatus(new Error("ECONNREFUSED")), undefined);
+  assert.equal(dockerStatus({ statusCode: "404" }), undefined, "a string is not a status");
+  for (const junk of [null, undefined, "404", 404]) {
+    assert.equal(dockerStatus(junk), undefined);
+  }
+});
+
+test("a real failure removing a 404-NAMED container is reported, not swallowed", async (t) => {
+  const name = "chikin-chrome-inst-404";
+  const stub = await startDockerStub({
+    containers: [{ Id: "a404bc", Names: [`/${name}`], State: "exited", Labels: {} }],
+    removeContainerFailures: {
+      [name]: { status: 500, message: `remove ${name}: driver "overlay2" failed` },
+    },
+  });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
+
+  const [, warnings] = await withWarnings(() => p.removeContainer("inst-404"));
+
+  assert.equal(warnings.length, 1, "a 500 on inst-404 is a failure like any other");
+  assert.match(warnings[0] ?? "", new RegExp(`remove ${name} failed`));
+  assert.equal(stub.containers.length, 1, "and the container really did survive");
+});
+
+test("an already-gone container is quiet, and a live one is really removed", async (t) => {
+  const stub = await startDockerStub({
+    containers: [
+      { Id: "a404bc", Names: ["/chikin-chrome-inst-404"], State: "running", Labels: {} },
+    ],
+  });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
+
+  // force: true is what lets the gateway remove a still-running container —
+  // real Docker answers 409 without it, which the stub models.
+  const [, removedWarnings] = await withWarnings(() => p.removeContainer("inst-404"));
+  assert.deepEqual(removedWarnings, [], "a successful force-remove says nothing");
+  assert.deepEqual(stub.containers, [], "the running container was removed");
+  assert.deepEqual(stub.requests, ["DELETE /containers/chikin-chrome-inst-404?force=true"]);
+
+  // Now it is genuinely gone: a real 404, same 404-containing name.
+  const [, goneWarnings] = await withWarnings(() => p.removeContainer("inst-404"));
+  assert.deepEqual(goneWarnings, [], "already gone is nothing to do, whatever the name");
 });
