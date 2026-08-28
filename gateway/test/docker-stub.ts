@@ -3,28 +3,32 @@ import type { AddressInfo } from "node:net";
 import Docker from "dockerode";
 
 /**
- * A stub Docker Engine API, served over HTTP, for exercising destructive volume
- * paths without a daemon (CLAUDE.md: never against the live fleet — a bug here
- * would delete an operator's `chikin-profile-golden`).
+ * A stub Docker Engine API, served over HTTP, for exercising destructive
+ * volume and container-removal paths without a daemon (CLAUDE.md: never
+ * against the live fleet — a bug here would delete an operator's
+ * `chikin-profile-golden`).
  *
  * Why a real server rather than a hand-written dockerode-shaped object: since
  * ADR 0004, Docker's own refusal to remove a mounted volume IS the ownership
  * rule — the single-volume destroy path deliberately does not compute
  * "is anything mounting this" for itself. A double that models that refusal is
  * the safety property asserted against a copy of itself. Here the 409 is
- * emergent from container state, and the 404/409 error text the gateway parses
- * is produced by real dockerode from a real response, not invented by the test.
+ * emergent from container state, and the numeric `statusCode` the gateway
+ * branches on — plus the name-echoing error text it must NOT branch on
+ * (SPY-161) — is produced by real dockerode from a real response, not invented
+ * by the test.
  *
  * The gateway talks to a socket-proxy over `{ host, port, protocol: "http" }`
  * (see provisioner.ts), so this is a drop-in for the transport it really uses.
  *
- * Scope is deliberately the volume endpoints plus the container list they
- * depend on. Container creation, exec, networks and images are not modelled —
- * a request for anything unhandled fails loudly with a 501 naming it, so a test
- * that wanders outside this surface says so instead of silently passing. The
- * same contract covers query params and filters, and it is enforced by the
- * dispatcher from each route's declaration (see `Route`) rather than by each
- * handler remembering to check: a new route models nothing until it says so.
+ * Scope is deliberately the volume endpoints, container removal, and the
+ * container list they depend on. Container creation, exec, networks and images
+ * are not modelled — a request for anything unhandled fails loudly with a 501
+ * naming it, so a test that wanders outside this surface says so instead of
+ * silently passing. The same contract covers query params and filters, and it
+ * is enforced by the dispatcher from each route's declaration (see `Route`)
+ * rather than by each handler remembering to check: a new route models nothing
+ * until it says so.
  */
 
 export interface StubVolume {
