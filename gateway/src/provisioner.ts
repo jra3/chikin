@@ -619,11 +619,19 @@ export class Provisioner {
       await this.docker.getContainer(containerName(name)).stop({ t: 5 });
       log.info(`provisioner: stopped ${containerName(name)}`);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      // 304 = already stopped; treat as success.
-      if (!/already stopped|304|not running/i.test(msg)) {
-        log.warn(`provisioner: stop ${containerName(name)} failed`, msg);
+      // 304 = already stopped, 404 = no longer exists. Both mean the container
+      // is not running, which is what was asked for — and removeContainer,
+      // which every caller runs next, treats 404 the same way. Decided by
+      // status, never by message: a browser named inst-304 used to match the
+      // old prose guard on every failure (SPY-161, same defect as the removal
+      // paths one function down).
+      const status = dockerStatus(e);
+      if (status === 304 || status === 404) {
+        log.debug(`provisioner: ${containerName(name)} was already stopped`);
+        return;
       }
+      const msg = e instanceof Error ? e.message : String(e);
+      log.warn(`provisioner: stop ${containerName(name)} failed`, msg);
     }
   }
 

@@ -72,6 +72,11 @@ export interface DockerStubInit {
    */
   removeContainerFailures?: Record<string, StubFailure>;
   /**
+   * Failures to inject into `POST /containers/<id>/stop`, keyed the same way
+   * as `removeContainerFailures`.
+   */
+  stopContainerFailures?: Record<string, StubFailure>;
+  /**
    * Failure to inject into `GET /containers/json`, for driving "container
    * ownership cannot be read" paths — the orphan sweep must fail closed —
    * without the test hand-rolling a Docker double for one throw.
@@ -207,6 +212,7 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
   const containers: StubContainer[] = [...(init.containers ?? [])];
   const removeFailures = new Map(Object.entries(init.removeFailures ?? {}));
   const removeContainerFailures = new Map(Object.entries(init.removeContainerFailures ?? {}));
+  const stopContainerFailures = new Map(Object.entries(init.stopContainerFailures ?? {}));
   const requests: string[] = [];
 
   const routes: Route[] = [
@@ -287,6 +293,31 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
       params: [],
       handle({ res }) {
         json(res, 200, { Volumes: [...volumes.values()], Warnings: [] });
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/containers\/([^/]+)\/stop$/,
+      // `t` is the graceful-stop timeout. This stub stops instantly, which
+      // satisfies any timeout, so accepting it is honest rather than a stub
+      // that ignores a param that changes the outcome.
+      params: ["t"],
+      handle({ res, match }) {
+        const ref = match[1] ?? "";
+        const injected = stopContainerFailures.get(ref);
+        if (injected) return json(res, injected.status, { message: injected.message });
+        const target = containers.find((c) => c.Id === ref || c.Names.includes(`/${ref}`));
+        if (!target) return json(res, 404, { message: `stop ${ref}: no such container` });
+        if (!RUNNING_STATES.has(target.State)) {
+          // Real Docker answers 304 Not Modified for an already-stopped
+          // container — which dockerode raises as an error carrying that
+          // status, and which must therefore have no body.
+          res.writeHead(304);
+          return res.end();
+        }
+        target.State = "exited";
+        res.writeHead(204);
+        res.end();
       },
     },
     {

@@ -260,3 +260,46 @@ test("an already-gone container is quiet, and a live one is really removed", asy
   const [, goneWarnings] = await withWarnings(() => p.removeContainer("inst-404"));
   assert.deepEqual(goneWarnings, [], "already gone is nothing to do, whatever the name");
 });
+
+test("a stop failure on a 304-NAMED browser is reported, not swallowed", async (t) => {
+  const name = "chikin-chrome-inst-304";
+  const stub = await startDockerStub({
+    containers: [{ Id: "c304ab", Names: [`/${name}`], State: "running", Labels: {} }],
+    stopContainerFailures: {
+      [name]: { status: 500, message: `stop ${name}: daemon failed` },
+    },
+  });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
+
+  const [, warnings] = await withWarnings(() => p.stopContainer("inst-304"));
+
+  assert.equal(warnings.length, 1, "a 500 on inst-304 is a failure like any other");
+  assert.match(warnings[0] ?? "", new RegExp(`stop ${name} failed`));
+});
+
+test("stopping an already-stopped or absent container is quiet", async (t) => {
+  const stub = await startDockerStub({
+    containers: [
+      { Id: "c304ab", Names: ["/chikin-chrome-inst-304"], State: "running", Labels: {} },
+    ],
+  });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
+
+  // Running -> stopped: the real thing, no warning.
+  const [, first] = await withWarnings(() => p.stopContainer("inst-304"));
+  assert.deepEqual(first, [], "a successful stop says nothing");
+  assert.equal(stub.containers[0]?.State, "exited", "the container really stopped");
+
+  // Already stopped: real Docker answers 304, which dockerode raises as an
+  // error. It is the desired state, so it stays quiet — whatever the name.
+  const [, again] = await withWarnings(() => p.stopContainer("inst-304"));
+  assert.deepEqual(again, [], "304 already-stopped is nothing to do");
+
+  // Gone entirely: 404. Not running is not running, and removeContainer —
+  // which every caller runs next — already treats 404 the same way.
+  stub.containers.splice(0, 1);
+  const [, gone] = await withWarnings(() => p.stopContainer("inst-304"));
+  assert.deepEqual(gone, [], "404 on a stop is the desired state too");
+});
