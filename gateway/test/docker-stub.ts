@@ -21,8 +21,8 @@ import Docker from "dockerode";
  * The gateway talks to a socket-proxy over `{ host, port, protocol: "http" }`
  * (see provisioner.ts), so this is a drop-in for the transport it really uses.
  *
- * Scope is deliberately the volume endpoints, container removal, and the
- * container list they depend on. Container creation, exec, networks and images
+ * Scope is deliberately the volume endpoints, container stop and removal, and
+ * the container list they depend on. Container creation, exec, networks and images
  * are not modelled — a request for anything unhandled fails loudly with a 501
  * naming it, so a test that wanders outside this surface says so instead of
  * silently passing. The same contract covers query params and filters, and it
