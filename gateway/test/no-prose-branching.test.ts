@@ -38,7 +38,10 @@ const PREDICATE = /\.(test|includes|match|startsWith|endsWith|indexOf)\s*\(/;
 test("no source file branches on the prose of an error (SPY-161)", () => {
   const offenders: string[] = [];
 
-  for (const file of readdirSync(SRC).filter((f) => f.endsWith(".ts"))) {
+  // Recursive: a guard that silently stops covering a new subdirectory is the
+  // same failure mode it exists to prevent.
+  const files = readdirSync(SRC, { recursive: true, encoding: "utf8" });
+  for (const file of files.filter((f) => f.endsWith(".ts"))) {
     const lines = readFileSync(join(SRC, file), "utf8").split("\n");
     lines.forEach((line, i) => {
       const code = line.trim();
