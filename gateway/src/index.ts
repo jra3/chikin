@@ -7,6 +7,7 @@ import { Reaper } from "./reaper.js";
 import { addRuntimeWarning, reportRuntimeConfig } from "./runtime.js";
 import { createApp, makeUpgradeHandler } from "./server.js";
 import { planBind } from "./bind.js";
+import { hostReachWarning, probeHostReach } from "./hostreach.js";
 
 async function main(): Promise<void> {
   // Backstop: a rejected promise outside any request handler (background reaper
@@ -105,6 +106,19 @@ async function main(): Promise<void> {
   });
   log.info(`  MCP:       POST http://<listen-addr>:${config.port}/b/<name>/`);
   log.info(`  dashboard: http://127.0.0.1:${config.port}/`);
+
+  // Can a browser reach a dev server on THIS host? On a host that denies
+  // inbound by default it cannot, at any address, and the symptom a client
+  // sees is an ordinary-looking navigation timeout. The gateway shares
+  // chikin-egress with every browser, so its own probe is the fleet's answer.
+  // Costs the probe timeout only when the path is actually blocked; a
+  // reachable host answers with an RST immediately. See hostreach.ts.
+  const hostAddr = await provisioner.selfEgressGateway();
+  if (hostAddr && (await probeHostReach(hostAddr)) === "blocked") {
+    const warning = hostReachWarning(hostAddr);
+    log.warn(warning);
+    addRuntimeWarning(warning);
+  }
 
   const shutdown = (sig: string) => {
     log.info(`received ${sig}, shutting down`);
