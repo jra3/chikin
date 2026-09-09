@@ -54,10 +54,11 @@ That makes Docker's 409 load-bearing, so it is asserted at the wire against a
 stub Engine API rather than against a hand-written double that models it. The
 same exercise found the 404 branch string-matching `/no such volume|404/i` on an
 error message that carries the volume's own name — so for a Browser whose pid
-contains `404`, every removal failure is silently swallowed. Dockerode exposes
-`statusCode` as a number; the branches switch on it (SPY-161 — until then they
-still match the message, and `volumes.test.ts` pins the distinction by asserting
-which failures warn).
+contains `404`, every removal failure was silently swallowed. The branches now
+switch on the numeric `statusCode` dockerode attaches (SPY-161, landed, and
+applied to container removal too, which carried the same defect). A failure
+carrying NO status is a transport failure that may never have reached Docker,
+so it is never folded into the already-gone branch.
 
 ## Considered options
 

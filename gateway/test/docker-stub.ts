@@ -3,28 +3,32 @@ import type { AddressInfo } from "node:net";
 import Docker from "dockerode";
 
 /**
- * A stub Docker Engine API, served over HTTP, for exercising destructive volume
- * paths without a daemon (CLAUDE.md: never against the live fleet — a bug here
- * would delete an operator's `chikin-profile-golden`).
+ * A stub Docker Engine API, served over HTTP, for exercising destructive
+ * volume and container-removal paths without a daemon (CLAUDE.md: never
+ * against the live fleet — a bug here would delete an operator's
+ * `chikin-profile-golden`).
  *
  * Why a real server rather than a hand-written dockerode-shaped object: since
  * ADR 0004, Docker's own refusal to remove a mounted volume IS the ownership
  * rule — the single-volume destroy path deliberately does not compute
  * "is anything mounting this" for itself. A double that models that refusal is
  * the safety property asserted against a copy of itself. Here the 409 is
- * emergent from container state, and the 404/409 error text the gateway parses
- * is produced by real dockerode from a real response, not invented by the test.
+ * emergent from container state, and the numeric `statusCode` the gateway
+ * branches on — plus the name-echoing error text it must NOT branch on
+ * (SPY-161) — is produced by real dockerode from a real response, not invented
+ * by the test.
  *
  * The gateway talks to a socket-proxy over `{ host, port, protocol: "http" }`
  * (see provisioner.ts), so this is a drop-in for the transport it really uses.
  *
- * Scope is deliberately the volume endpoints plus the container list they
- * depend on. Container creation, exec, networks and images are not modelled —
- * a request for anything unhandled fails loudly with a 501 naming it, so a test
- * that wanders outside this surface says so instead of silently passing. The
- * same contract covers query params and filters, and it is enforced by the
- * dispatcher from each route's declaration (see `Route`) rather than by each
- * handler remembering to check: a new route models nothing until it says so.
+ * Scope is deliberately the volume endpoints, container stop and removal, and
+ * the container list they depend on. Container creation, exec, networks and images
+ * are not modelled — a request for anything unhandled fails loudly with a 501
+ * naming it, so a test that wanders outside this surface says so instead of
+ * silently passing. The same contract covers query params and filters, and it
+ * is enforced by the dispatcher from each route's declaration (see `Route`)
+ * rather than by each handler remembering to check: a new route models nothing
+ * until it says so.
  */
 
 export interface StubVolume {
@@ -61,6 +65,17 @@ export interface DockerStubInit {
    * reaching into the server's internals to arrange it.
    */
   removeFailures?: Record<string, StubFailure>;
+  /**
+   * Failures to inject into `DELETE /containers/<id>`, keyed by the id or name
+   * the gateway addresses the container by, and taking precedence over its
+   * real state. The volume seam's counterpart for the container path.
+   */
+  removeContainerFailures?: Record<string, StubFailure>;
+  /**
+   * Failures to inject into `POST /containers/<id>/stop`, keyed the same way
+   * as `removeContainerFailures`.
+   */
+  stopContainerFailures?: Record<string, StubFailure>;
   /**
    * Failure to inject into `GET /containers/json`, for driving "container
    * ownership cannot be read" paths — the orphan sweep must fail closed —
@@ -196,6 +211,8 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
   );
   const containers: StubContainer[] = [...(init.containers ?? [])];
   const removeFailures = new Map(Object.entries(init.removeFailures ?? {}));
+  const removeContainerFailures = new Map(Object.entries(init.removeContainerFailures ?? {}));
+  const stopContainerFailures = new Map(Object.entries(init.stopContainerFailures ?? {}));
   const requests: string[] = [];
 
   const routes: Route[] = [
@@ -276,6 +293,59 @@ export async function startDockerStub(init: DockerStubInit = {}): Promise<Docker
       params: [],
       handle({ res }) {
         json(res, 200, { Volumes: [...volumes.values()], Warnings: [] });
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/containers\/([^/]+)\/stop$/,
+      // `t` is the graceful-stop timeout. This stub stops instantly, which
+      // satisfies any timeout, so accepting it is honest rather than a stub
+      // that ignores a param that changes the outcome.
+      params: ["t"],
+      handle({ res, match }) {
+        const ref = match[1] ?? "";
+        const injected = stopContainerFailures.get(ref);
+        if (injected) return json(res, injected.status, { message: injected.message });
+        const target = containers.find((c) => c.Id === ref || c.Names.includes(`/${ref}`));
+        if (!target) return json(res, 404, { message: `stop ${ref}: no such container` });
+        if (!RUNNING_STATES.has(target.State)) {
+          // Real Docker answers 304 Not Modified for an already-stopped
+          // container — which dockerode raises as an error carrying that
+          // status, and which must therefore have no body.
+          res.writeHead(304);
+          return res.end();
+        }
+        target.State = "exited";
+        res.writeHead(204);
+        res.end();
+      },
+    },
+    {
+      method: "DELETE",
+      pattern: /^\/containers\/([^/]+)$/,
+      // `force` is modelled because the gateway sends it: real Docker answers
+      // 409 for a RUNNING container without it, and removes it with it. The
+      // other documented params (`v`, `link`) are not modelled — a caller that
+      // starts sending one gets a 501 naming it rather than silence.
+      params: ["force"],
+      handle({ res, match, query }) {
+        const ref = match[1] ?? "";
+        const injected = removeContainerFailures.get(ref);
+        if (injected) return json(res, injected.status, { message: injected.message });
+        // Docker addresses a container by id OR name; the gateway uses the name.
+        const i = containers.findIndex((c) => c.Id === ref || c.Names.includes(`/${ref}`));
+        if (i === -1) return json(res, 404, { message: `remove ${ref}: no such container` });
+        const force = query.get("force") === "1" || query.get("force") === "true";
+        const target = containers[i] as StubContainer;
+        if (!force && RUNNING_STATES.has(target.State)) {
+          return json(res, 409, {
+            message: `remove ${ref}: You cannot remove a running container ${target.Id}. ` +
+              `Stop the container before attempting removal or force remove`,
+          });
+        }
+        containers.splice(i, 1);
+        res.writeHead(204);
+        res.end();
       },
     },
     {

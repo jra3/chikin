@@ -137,8 +137,8 @@ test("removeInstanceVolume stands down when a provision is in flight (CHK-015)",
 // from any other. The one thing that branch does differently is stay quiet, so
 // the warn-or-silence split below (captured through log.ts's tap seam — see
 // log-tap.ts) is what makes the branch observable at all. Without these
-// assertions, deleting the /no such volume|404/i guard in provisioner.ts
-// leaves this file green.
+// assertions, deleting the status branches in provisioner.ts leaves this file
+// green.
 
 test("removeInstanceVolume treats an already-gone volume as nothing to do", async (t) => {
   const stub = await startDockerStub({ volumes: [] });
@@ -146,11 +146,6 @@ test("removeInstanceVolume treats an already-gone volume as nothing to do", asyn
   const p = new Provisioner(stub.docker);
 
   // Real dockerode surfacing a real 404 body, not an invented error string.
-  // The name deliberately does NOT contain "404": provisioner.ts decides
-  // "already gone" by matching /no such volume|404/i against the error MESSAGE,
-  // which embeds the volume name — so a fixture called inst-404 would satisfy
-  // that branch whatever Docker actually returned, and prove nothing. Switching
-  // this to a status-code check is SPY-161.
   const [removed, warnings] = await withWarnings(() => p.removeInstanceVolume("inst-gone"));
 
   assert.equal(removed, false);
@@ -205,10 +200,69 @@ test("removeInstanceVolume leaves a volume a container still mounts (Docker refu
   // reach the wire and come back 409, or this passes for the wrong reason.
   assert.deepEqual(stub.requests, ["DELETE /volumes/chikin-profile-inst-9"]);
   assert.deepEqual(stub.volumes(), ["chikin-profile-inst-9"], "the mounted volume survives");
-  // And the refusal is operator-visible — one of the behaviours SPY-161's
-  // status-code switch must preserve when it replaces the message match.
+  // And the refusal is operator-visible, on its own branch: Docker refusing a
+  // mounted volume is the ownership rule working, not a daemon fault, but it
+  // still leaves a volume behind so an operator has to be able to find it.
   assert.equal(warnings.length, 1, "Docker's refusal must not be swallowed");
+  assert.match(warnings[0] ?? "", /a container still mounts it/, "named as the in-use case");
   assert.match(warnings[0] ?? "", /chikin-profile-inst-9/, "the warning names the volume");
+});
+
+// --- A browser whose NAME contains a status code (SPY-161) ------------------
+
+// The defect this pins: the branches used to be decided by matching the error
+// MESSAGE against /no such volume|404/i, and Docker echoes the volume's own
+// name back inside that message. So for `inst-404` every failure looked like
+// an already-gone 404 — no warn, a leaked volume, nothing in the logs, and
+// deterministic for that name rather than intermittent. The pair below is the
+// same name driven to opposite outcomes, so only a real status can pass both.
+
+test("a real failure on a 404-NAMED browser is reported, not swallowed", async (t) => {
+  const vol = "chikin-profile-inst-404";
+  const stub = await startDockerStub({
+    volumes: [vol],
+    removeFailures: { [vol]: { status: 500, message: `remove ${vol}: driver "local" failed` } },
+  });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
+
+  const [removed, warnings] = await withWarnings(() => p.removeInstanceVolume("inst-404"));
+
+  assert.equal(removed, false);
+  // The 500's message contains "404" only because it names the volume — which
+  // is exactly what used to route it into the silent branch.
+  assert.equal(warnings.length, 1, "a 500 on inst-404 is a failure like any other");
+  assert.match(warnings[0] ?? "", /remove volume .*inst-404 failed/, "reported as a failure");
+  assert.deepEqual(stub.volumes(), [vol], "and the volume really did leak, so it must be said");
+});
+
+test("an already-gone 404-NAMED browser is still quiet", async (t) => {
+  const stub = await startDockerStub({ volumes: [] });
+  t.after(() => stub.close());
+  const p = new Provisioner(stub.docker);
+
+  // The other half of the pair: same name, genuine 404 from the daemon. A fix
+  // that simply always warned would pass the test above and fail this one.
+  const [removed, warnings] = await withWarnings(() => p.removeInstanceVolume("inst-404"));
+
+  assert.equal(removed, false);
+  assert.deepEqual(stub.requests, ["DELETE /volumes/chikin-profile-inst-404"]);
+  assert.deepEqual(warnings, [], "a real 404 is nothing to do, whatever the name");
+});
+
+test("a transport failure is never read as an already-gone volume", async (t) => {
+  // Nothing is listening: dockerode throws with NO statusCode at all. The
+  // request may never have reached Docker, so the one thing this must not do
+  // is fold into the silent already-gone branch.
+  const dead = await startDockerStub();
+  await dead.close();
+  const p = new Provisioner(dead.docker);
+
+  const [removed, warnings] = await withWarnings(() => p.removeInstanceVolume("inst-1"));
+
+  assert.equal(removed, false);
+  assert.equal(warnings.length, 1, "a failure with no status is still a failure");
+  assert.match(warnings[0] ?? "", /remove volume .*inst-1 failed/);
 });
 
 // --- Startup orphan sweep (issue #58, belt and braces) ----------------------
