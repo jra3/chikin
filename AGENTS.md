@@ -4,6 +4,17 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - Add durable project-specific notes here as they are discovered through real work.
 
+## How we work
+
+- **Track first, then branch.** A defect or feature is a GitHub issue on `jra3/chikin`. Architecture work is a ticket in the Linear project [Deepen the chikin gateway](https://linear.app/congress-command-glue-twin/project/deepen-the-chikin-gateway-46a1dfebbc79) (team SPY); nothing else in this repo points at Linear, so check that project before proposing a refactor. A title is a **claim** about the mechanism, not a symptom.
+- **Branch names.** Linear work uses the branch Linear generates (`branch:` in the ticket's `issue.meta`), so the PR auto-links. GitHub-issue work uses `<type>/<issue>-<slug>` (`fix/75-nav-text-parser`).
+- **Commits.** `type(scope): claim` subject; the body says why and cites the ticket (`Refs SPY-156`, `(#20)`). A PR names the issues it closes and is squash-merged. Scope widened past the ticket is called out in the PR and on the ticket, with the reason.
+- **Gate.** Every PR goes through `/no-mistakes`, which writes the PR body (Intent / What Changed / Risk / Testing / Evidence) and pushes. CI must be green on both arches. The human reviews and merges.
+- **A rule becomes a test.** When real work uncovers a convention, prefer a test that fails the build over a sentence here: `gateway/test/compose-env.test.ts` and `no-prose-branching.test.ts` are the pattern. The sentence here then carries only the why.
+- **Three doc tiers.** This file holds sharp edges. `CONTEXT.md` is the vocabulary (Fleet, Browser, Name, Instance, Profile Volume); use its terms in tickets, code and PRs. `docs/adr/` records decisions, and an ADR may run ahead of the code when every ahead-of-code paragraph names the ticket that lands it (ADR 0004).
+- **Linear ticket shape.** "What to build", acceptance criteria as checkboxes, "Blocked by" plus a `blocks` relation, a parent for sub-work. `ready-for-agent` means the spec needs no further triage. Attach the PR to the ticket. When work is finished but unmerged, leave a **hand-off** comment: what landed, the one decision worth a second look, what was left alone on purpose.
+- **The live fleet on this host is production.** It holds the golden profile. Anything that needs a real gateway runs its own on an isolated port with reaping and `CHIKIN_VOLUME_GC` off and `MAX_FLEET` at most 3 (see `itest/README.md`), and never provisions under a sticky Name.
+
 ## Sharp edges
 
 - **Docker `createContainer` config must NOT ride the URL.** dockerode/docker-modem mirrors the entire create config into the request *query string* as well as the body. A large `HostConfig` (e.g. the ~10 KB inlined seccomp profile) URL-encodes past the socket-proxy's (haproxy) request-line buffer → a bare `400 Bad request`. In `gateway/src/provisioner.ts` the create goes through a wrapper that uses docker-modem's `_query`/`_body` split (name in the query, config in the body). Keep new large `HostConfig` fields going through that path.
