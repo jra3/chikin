@@ -144,6 +144,16 @@ export function buildCreateOptions(name: string): Docker.ContainerCreateOptions 
       ],
       ShmSize: 2 * 1024 * 1024 * 1024,
       NetworkMode: config.network,
+      // One stable name for the host, so a browser told to open a dev server
+      // has a single address to try instead of a guess among five (bridge
+      // gateway, docker0, LAN, tailnet, loopback-which-is-the-container).
+      // Docker resolves `host-gateway` to the DEFAULT bridge's gateway
+      // (172.17.0.1), NOT chikin-egress's — which is why the firewall rule
+      // bin/chikin-allow-host writes is scoped by SOURCE subnet and left open
+      // on destination. On a host that denies inbound by default this name
+      // resolves and still times out; it is a companion to that rule, not a
+      // substitute for it. See hostreach.ts.
+      ExtraHosts: ["host.docker.internal:host-gateway"],
       RestartPolicy: { Name: "unless-stopped" },
       // Least-privilege hardening (CHK-005). Drop all Linux capabilities, then
       // add back only what the entrypoint's root bootstrap needs before it
@@ -322,14 +332,32 @@ export class Provisioner {
    * lookup failure degrades to a warning rather than taking the fleet down.
    */
   async selfEgressIp(): Promise<string | null> {
+    const ip = (await this.selfEgressNetwork())?.IPAddress;
+    return ip ? ip : null;
+  }
+
+  /**
+   * The HOST's address on the egress network (the bridge gateway, `.1` of the
+   * subnet in practice, but read rather than assumed).
+   *
+   * This is the address a browser would use to reach a dev server on the host,
+   * and the one the startup reachability probe aims at. See hostreach.ts for
+   * why that probe exists. Null on the same terms as selfEgressIp.
+   */
+  async selfEgressGateway(): Promise<string | null> {
+    const gw = (await this.selfEgressNetwork())?.Gateway;
+    return gw ? gw : null;
+  }
+
+  /** The one inspect both of the above read. Returns undefined, never throws. */
+  private async selfEgressNetwork(): Promise<Docker.NetworkInfo | undefined> {
     try {
       const info = (await this.docker
         .getContainer(hostname())
         .inspect()) as Docker.ContainerInspectInfo;
-      const ip = info.NetworkSettings?.Networks?.[config.egressNetwork]?.IPAddress;
-      return ip ? ip : null;
+      return info.NetworkSettings?.Networks?.[config.egressNetwork];
     } catch {
-      return null;
+      return undefined;
     }
   }
 

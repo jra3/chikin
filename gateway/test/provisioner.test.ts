@@ -143,6 +143,15 @@ test("buildCreateOptions wires the sandbox: CHIKIN_SANDBOX env down + SecurityOp
   assert.ok(opts.HostConfig?.SecurityOpt?.includes("no-new-privileges"));
 });
 
+test("buildCreateOptions gives every browser one stable name for the host", () => {
+  // Without it a browser told to open a dev server on the host has five
+  // candidate addresses and no way to pick. The name resolves whether or not
+  // the host firewall lets the packet through — it is a companion to
+  // bin/chikin-allow-host, not a substitute. See hostreach.ts.
+  const opts = buildCreateOptions("bob");
+  assert.deepEqual(opts.HostConfig?.ExtraHosts, ["host.docker.internal:host-gateway"]);
+});
+
 // --- Per-name Downloads isolation (M2 / CHK-007 / issue #24) ----------------
 // Each browser must mount only its own ${SHARED_DIR}/<name> subdir, never the
 // bare shared root. Structural isolation: peers can't name each other's dirs.

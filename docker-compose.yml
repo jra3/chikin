@@ -174,5 +174,22 @@ networks:
   # rides that bridge. Cross-browser isolation there needs per-name networks.
   chikin-egress:
     name: chikin-egress
+    # Pinned so a host-firewall rule written against this subnet survives a
+    # recreate. A browser reaching a service on the HOST is INPUT traffic, which
+    # a default-deny host firewall drops (see bin/chikin-allow-host); the rule
+    # that allows it names this range, and an unpinned network lets Docker move
+    # the range on a `down && up`, stranding the rule with nothing to say so.
+    #
+    # ADOPTING the pin costs a recreate, even at the value Docker already
+    # assigned: compose removes and recreates the network on `up`, and with it
+    # every container attached (verified — an identical subnet still recreates).
+    # Worse, if the range is not free it removes the old network and then FAILS
+    # to create the new one ("Pool overlaps with other one on this address
+    # space"), leaving the stack with no egress network at all. Check the range
+    # is unused before the first `up` on this change, and set
+    # CHIKIN_EGRESS_SUBNET in .env if it collides.
+    ipam:
+      config:
+        - subnet: "${CHIKIN_EGRESS_SUBNET:-172.28.0.0/16}"
     driver_opts:
       com.docker.network.bridge.enable_icc: "false"

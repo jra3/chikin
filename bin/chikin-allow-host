@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# chikin-allow-host <port> [--proto tcp|udp] [--remove] [--print]
+# chikin-allow-host --status
+#
+# Let chikin browsers reach ONE port on this host — typically the dev server you
+# just started and want a browser to open.
+#
+# Why this is needed. A browser reaching a service on its own host is INPUT
+# traffic as far as the host's firewall is concerned, and Docker installs no
+# rules there: published-port ingress and container->internet egress ride
+# FORWARD/NAT through Docker's own chains and keep working, but INPUT is left to
+# the host's default policy. On a host that denies inbound by default — Omarchy
+# ships ufw enabled with DEFAULT_INPUT_POLICY="DROP" — every host address a
+# browser might try is silently dropped: the bridge gateway, docker0, the LAN
+# address, the tailnet address. Binding the server to 0.0.0.0 changes nothing.
+# What the browser reports is `Navigation timeout of 10000 ms exceeded`, which
+# reads like a slow server, so the usual next hour goes into bind addresses.
+#
+# Why one port at a time. `ufw allow from <subnet>` with no port opens every
+# service on this machine, sshd included, to the least-trusted process on it. A
+# browser executes hostile pages for a living; that it cannot reach host
+# services is chikin's posture working. This is the narrow opt-in.
+#
+# The subnet is read from Docker, never typed: the range belongs to the network,
+# and a rule that names a stale one fails open-looking and closed-behaving. It
+# is pinned in docker-compose.yml (CHIKIN_EGRESS_SUBNET) so a rule written today
+# survives a recreate.
+#
+#   chikin-allow-host 5173             # allow tcp/5173 from the fleet
+#   chikin-allow-host 5173 --remove    # take it back
+#   chikin-allow-host 5173 --print     # show the command, run nothing
+#   chikin-allow-host --status         # every rule this script has written
+#
+# Exit: 0 done · 1 could not (no ufw, no network, ufw refused) · 2 bad usage.
+set -euo pipefail
+
+NETWORK="${CHIKIN_EGRESS_NETWORK:-chikin-egress}"
+DOCKER="${DOCKER:-docker}"
+# The audit handle. `ufw status numbered` shows it against every rule we wrote,
+# which is what makes these removable later by someone who did not write them.
+COMMENT="chikin-egress"
+
+port=""
+proto="tcp"
+action="allow"
+print_only=0
+
+die() { echo "chikin-allow-host: $*" >&2; exit "${2:-1}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --remove|--delete) action="remove"; shift ;;
+    --status) action="status"; shift ;;
+    --print|--dry-run) print_only=1; shift ;;
+    --proto) proto="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -*) die "unknown argument '$1'" 2 ;;
+    *) [ -z "$port" ] || die "unexpected argument '$1'" 2; port="$1"; shift ;;
+  esac
+done
+
+command -v ufw >/dev/null 2>&1 ||
+  die "this host has no ufw. The rule still has to exist for browsers to reach host
+  ports — write the equivalent for whatever firewall this host runs, allowing the
+  chikin egress subnet as a SOURCE, one destination port at a time."
+
+if [ "$action" = "status" ]; then
+  sudo ufw status numbered | grep -i "$COMMENT" ||
+    echo "no chikin-egress rules — browsers cannot reach any port on this host."
+  exit 0
+fi
+
+[ -n "$port" ] || die "which port? usage: chikin-allow-host <port> [--remove]" 2
+case "$port" in *[!0-9]*|"") die "port must be a number, got '$port'" 2 ;; esac
+[ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "port out of range: $port" 2
+case "$proto" in tcp|udp) ;; *) die "proto must be tcp or udp, got '$proto'" 2 ;; esac
+
+# Read the range off the network rather than trusting the default: an operator
+# who set CHIKIN_EGRESS_SUBNET, or a network created before it was pinned, has a
+# different one, and a rule for the wrong subnet looks present and allows nothing.
+SUBNET="$("$DOCKER" network inspect "$NETWORK" -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null | awk '{print $1}')"
+# The host's own address on that network — what a browser dials to reach it.
+BRIDGE_GW="$("$DOCKER" network inspect "$NETWORK" -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>/dev/null | awk '{print $1}')"
+[ -n "$SUBNET" ] ||
+  die "could not read a subnet from the '$NETWORK' docker network. Is the fleet up?
+  Bring it up first (make dev-up, or docker compose up -d) — the network has to
+  exist before its range can be allowed."
+
+if [ "$action" = "remove" ]; then
+  set -- delete allow from "$SUBNET" to any port "$port" proto "$proto"
+else
+  set -- allow from "$SUBNET" to any port "$port" proto "$proto" comment "$COMMENT"
+fi
+
+if [ "$print_only" = 1 ]; then
+  printf 'sudo ufw'; printf ' %q' "$@"; printf '\n'
+  exit 0
+fi
+
+if [ "$action" = "allow" ]; then
+  echo "Allowing $proto/$port from $SUBNET (the chikin fleet)."
+  echo "  Every browser in the fleet can reach it, including one running a hostile page."
+fi
+
+sudo ufw "$@" || die "ufw refused the rule (see its output above)"
+
+if [ "$action" = "allow" ]; then
+  echo
+  echo "The host is ${BRIDGE_GW:-the gateway address of $SUBNET} from inside a browser."
+  echo "Verify from a browser's own perspective (with something listening on $port):"
+  echo "  ${DOCKER} exec \$(${DOCKER} ps --format '{{.Names}}' | grep chikin-chrome | head -1) \\"
+  echo "    node -e 'require(\"net\").connect($port,\"${BRIDGE_GW:-172.28.0.1}\").on(\"connect\",()=>console.log(\"reachable\"))'"
+  echo "The gateway re-probes the path at startup and reports it on /healthz."
+fi
