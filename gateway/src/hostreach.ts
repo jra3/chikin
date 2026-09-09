@@ -58,9 +58,15 @@ export const PROBE_PORT = 1;
 export const PROBE_TIMEOUT_MS = 1500;
 
 /**
- * An answer of any kind means the packet reached the host's TCP stack, so the
- * path is open; silence is the default-deny signature. Anything else — no
- * route, a REJECT that surfaces as something other than a refusal — is a
+ * An answer of any kind means the packet reached the host, so the path is
+ * open; silence is the default-deny signature. "Answer" is broader than an
+ * RST: the ICMP port-unreachable a REJECT-mode firewall sends also surfaces
+ * as ECONNREFUSED, and Node cannot tell the two apart, so a host with
+ * DEFAULT_INPUT_POLICY="REJECT" reads as "reachable" and fires no warning
+ * even though browsers cannot reach its services. That is acceptable, not
+ * papered over: in that mode the browser fails fast with
+ * ERR_CONNECTION_REFUSED instead of the misleading timeout this warning
+ * exists for. Anything else — no route, an error that is not a refusal — is a
  * different fault, and is reported as "unknown" rather than dressed up as a
  * firewall diagnosis we cannot support.
  */
@@ -124,8 +130,8 @@ export function hostReachWarning(hostAddr: string): string {
     `dropped (silently, not refused), which is what a host firewall denying inbound by default ` +
     `does — ufw with DEFAULT_INPUT_POLICY="DROP" is Omarchy's default. So no port on this host ` +
     `is reachable from a browser unless it was explicitly allowed: a browser asked to open a dev ` +
-    `server on the host at a port that was not will report a navigation timeout, at every host ` +
-    `address (bridge gateway, LAN, tailnet) — binding the server to 0.0.0.0 does not help, ` +
+    `server on the host at a port that was not allowed will report a navigation timeout, at every ` +
+    `host address (bridge gateway, LAN, tailnet) — binding the server to 0.0.0.0 does not help, ` +
     `because the packets are dropped on arrival. Allow the ports you actually want reachable, ` +
     `one at a time: bin/chikin-allow-host <port>. The probe reads the default policy, not ` +
     `per-port rules, so this warning is expected once the ports you need are allowed — ` +

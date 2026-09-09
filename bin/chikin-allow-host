@@ -22,9 +22,11 @@
 # services is chikin's posture working. This is the narrow opt-in.
 #
 # The subnet is read from Docker, never typed: the range belongs to the network,
-# and a rule that names a stale one fails open-looking and closed-behaving. It
-# is pinned in docker-compose.yml (CHIKIN_EGRESS_SUBNET) so a rule written today
-# survives a recreate.
+# Docker may move it when the network is recreated, and a rule that names a
+# stale one fails open-looking and closed-behaving. The range is deliberately
+# not pinned in compose (that would force a fleet-down migration on every
+# install); instead the gateway's startup probe notices a stranded rule and
+# warns on /healthz, and the fix is re-running this script.
 #
 #   chikin-allow-host 5173             # allow tcp/5173 from the fleet
 #   chikin-allow-host 5173 --remove    # take it back
@@ -85,9 +87,9 @@ case "$port" in *[!0-9]*|"") die "port must be a number, got '$port'" 2 ;; esac
 [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "port out of range: $port" 2
 case "$proto" in tcp|udp) ;; *) die "proto must be tcp or udp, got '$proto'" 2 ;; esac
 
-# Read the range off the network rather than trusting the default: an operator
-# who set CHIKIN_EGRESS_SUBNET, or a network created before it was pinned, has a
-# different one, and a rule for the wrong subnet looks present and allows nothing.
+# Read the range off the live network every time: Docker assigns it and may
+# reassign it on a recreate, and a rule for the wrong subnet looks present and
+# allows nothing.
 SUBNET="$("$DOCKER" network inspect "$NETWORK" -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null | awk '{print $1}')"
 # The host's own address on that network — what a browser dials to reach it.
 BRIDGE_GW="$("$DOCKER" network inspect "$NETWORK" -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>/dev/null | awk '{print $1}')"

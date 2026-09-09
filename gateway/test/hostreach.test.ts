@@ -17,9 +17,13 @@ import { Provisioner } from "../src/provisioner.js";
  * slow server and sends a session hunting through bind addresses. The gateway
  * says so instead. See hostreach.ts for the mechanism.
  *
- * The load-bearing distinction is refused vs. dropped: an RST proves the packet
- * reached the host's TCP stack, silence is the default-deny signature. That is
- * the classifier, and it is pure. The socket half is tested where the answer is
+ * The load-bearing distinction is refused vs. dropped: any answer — an RST, or
+ * the ICMP port-unreachable a REJECT-mode firewall sends, which Linux also
+ * surfaces as ECONNREFUSED — proves the packet reached the host; silence is
+ * the default-deny signature. (So a REJECT-mode host reads as reachable and
+ * gets no warning, which is fine: there the browser fails fast with
+ * ERR_CONNECTION_REFUSED rather than the misleading timeout.) That is the
+ * classifier, and it is pure. The socket half is tested where the answer is
  * deterministic on any machine — loopback.
  */
 

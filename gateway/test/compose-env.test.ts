@@ -23,11 +23,10 @@ const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, repoRoot))
 
 /**
  * Vars that are deliberately NOT container env: compose substitutes them into
- * the file itself (image tags, the egress network's pinned subnet), so they
- * belong in `.env` but must never appear under `environment:`. Anything else
- * documented has to be plumbed.
+ * the file itself (image tags etc.), so they belong in `.env` but must never
+ * appear under `environment:`. Anything else documented has to be plumbed.
  */
-const SUBSTITUTION_ONLY = new Set(["CHIKIN_VERSION", "CHIKIN_EGRESS_SUBNET"]);
+const SUBSTITUTION_ONLY = new Set(["CHIKIN_VERSION"]);
 
 /** Keys of the gateway service's `environment:` mapping in docker-compose.yml. */
 function composeGatewayEnv(): Map<string, string> {
