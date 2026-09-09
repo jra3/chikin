@@ -220,6 +220,18 @@ export function volumeLabels(name: string): Record<string, string> {
   };
 }
 
+/**
+ * VNC target for the /vnc proxy, PINNED to the browser data plane by name.
+ *
+ * A fleet browser sits on two networks the gateway also joins, and Docker's
+ * embedded DNS answers a bare container name with an address on one of them
+ * with no ordering guarantee. Picking `chikin-egress` is fatal rather than
+ * merely slow: that bridge runs `enable_icc=false` (CHK-002), so the SYN is
+ * DROPPED, not refused — the proxy hangs for the full connect timeout instead
+ * of failing over (#79). The `<container>.<network>` form resolves to the
+ * address on that network only, which is the same `chikin-net` plane CDP
+ * already dials by IP in `provisioner.resolveIp`.
+ */
 export function vncUrl(name: string): string {
-  return `http://${containerName(name)}:${config.vncPort}`;
+  return `http://${containerName(name)}.${config.network}:${config.vncPort}`;
 }

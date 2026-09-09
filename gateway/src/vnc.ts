@@ -29,8 +29,21 @@ export function rewriteVncTitle(html: string, handle: string): string {
 // shared proxyRes handler below buffers and rewrites only those responses.
 type TaggedReq = IncomingMessage & { __chikinHandle?: string };
 
+// An unreachable upstream must fail FAST, not hang. A refused port trips
+// proxy.on("error") in milliseconds, but a DROPPED SYN (what a wrong-network
+// target used to produce — #79) has no such signal, and the default connect
+// timeout is the OS's ~2 minutes with the browser tab spinning the whole time.
+// http-proxy applies proxyTimeout in the WEB pass only (it aborts the outgoing
+// request, which lands in the 502 below), so long-lived VNC websockets are
+// untouched by it.
+export const VNC_PROXY_TIMEOUT_MS = 10_000;
+
 // Single shared proxy for all /vnc/<name>/ traffic, websocket upgrades included.
-const proxy = httpProxy.createProxyServer({ ws: true, changeOrigin: true });
+const proxy = httpProxy.createProxyServer({
+  ws: true,
+  changeOrigin: true,
+  proxyTimeout: VNC_PROXY_TIMEOUT_MS,
+});
 
 // Host:port values we consider "ourselves" for the loopback-trusted surfaces.
 // The gateway is published on 127.0.0.1:<port>; a browser reaching it uses one

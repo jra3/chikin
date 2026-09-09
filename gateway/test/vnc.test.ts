@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { IncomingMessage } from "node:http";
-import { vncUpgradeAllowed, hostOk, buildSelfHosts, rewriteVncTitle } from "../src/vnc.js";
+import { vncUpgradeAllowed, hostOk, buildSelfHosts, rewriteVncTitle, VNC_PROXY_TIMEOUT_MS } from "../src/vnc.js";
+import { config, containerName, vncUrl } from "../src/config.js";
 
 // config.port defaults to 8080 in tests (no PORT env), so the trusted set is
 // {127.0.0.1:8080, localhost:8080, [::1]:8080}.
@@ -86,4 +87,33 @@ test("buildSelfHosts: GATEWAY_EXTRA_ORIGINS extends the set; garbage is ignored"
   assert.ok(hosts.has("box.lan:8080"), "second extra origin trusted");
   assert.ok(hosts.has("127.0.0.1:8080"), "loopback set retained");
   assert.equal(hosts.size, 5, "unparseable and empty entries dropped");
+});
+
+// #79: the /vnc proxy dialed the browser by BARE container name. A fleet member
+// shares two networks with the gateway, Docker's embedded DNS picks between them
+// with no ordering guarantee, and the chikin-egress answer is a black hole —
+// enable_icc=false (CHK-002) DROPS the SYN rather than refusing it, so every
+// noVNC request hung for the OS connect timeout. Pin the lookup to the data
+// plane, the same network provisioner.resolveIp dials CDP on.
+test("vncUrl: pins the lookup to the browser data-plane network", () => {
+  assert.equal(vncUrl("inst-772912"), `http://chikin-chrome-inst-772912.${config.network}:6080`);
+  assert.notEqual(
+    vncUrl("inst-772912"),
+    `http://${containerName("inst-772912")}:6080`,
+    "a bare container name can resolve to the egress address, whose SYN is dropped (#79)",
+  );
+});
+
+test("vncUrl: never targets the egress network", () => {
+  assert.ok(
+    !vncUrl("inst-1").includes(config.egressNetwork),
+    "the egress bridge has inter-container forwarding off; VNC there is a black hole",
+  );
+});
+
+test("vnc proxy: bounds the upstream connect so a dropped SYN 502s instead of hanging", () => {
+  assert.ok(
+    VNC_PROXY_TIMEOUT_MS > 0 && VNC_PROXY_TIMEOUT_MS <= 30_000,
+    "an unreachable upstream must fail fast, well inside the OS's ~2min connect timeout",
+  );
 });
