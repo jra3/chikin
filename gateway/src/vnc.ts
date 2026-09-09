@@ -29,8 +29,88 @@ export function rewriteVncTitle(html: string, handle: string): string {
 // shared proxyRes handler below buffers and rewrites only those responses.
 type TaggedReq = IncomingMessage & { __chikinHandle?: string };
 
+// An unreachable upstream must fail FAST, not hang. A refused port trips
+// proxy.on("error") in milliseconds, but a DROPPED SYN (what a wrong-network
+// target used to produce — #79) has no such signal, and the default connect
+// timeout is the OS's ~2 minutes with the browser tab spinning the whole time.
+export const VNC_PROXY_TIMEOUT_MS = 10_000;
+
+/**
+ * Build the /vnc proxy with all of its wiring: the upstream bound, the noVNC
+ * <title> injection, and the 502 for a dead upstream. Production runs the one
+ * shared instance created below; tests build their own so they can drive it at
+ * a target of their choosing.
+ */
+export function createVncProxy(): httpProxy {
+  const proxy = httpProxy.createProxyServer({
+    ws: true,
+    changeOrigin: true,
+    proxyTimeout: VNC_PROXY_TIMEOUT_MS,
+  });
+
+  // The bound has to be armed on the SOCKET to cover the connect phase.
+  // http-proxy applies proxyTimeout with ClientRequest.setTimeout, which Node
+  // DEFERS to a "connect" event while the socket is still connecting — and a
+  // dropped SYN never delivers one, so that alone bounds only an upstream that
+  // connected and then went quiet. A net.Socket idle timer starts ticking at
+  // once and keeps ticking through the connect. Destroying the request with an
+  // error surfaces on proxyReq's "error", which is the 502 below.
+  //
+  // "proxyReq" is a WEB-pass event (the ws pass emits "proxyReqWs" and applies
+  // no timeout at all), and that asymmetry is deliberate: a VNC websocket is
+  // legitimately silent for as long as nobody touches the mouse, so an idle
+  // bound on the upgrade path would kill live sessions. Never arm one there.
+  proxy.on("proxyReq", (proxyReq, _req, _res, options) => {
+    const ms = options.proxyTimeout ?? VNC_PROXY_TIMEOUT_MS;
+    proxyReq.socket?.setTimeout(ms, () => {
+      proxyReq.destroy(new Error(`vnc: upstream unreachable after ${ms}ms`));
+    });
+  });
+
+  // Title injection for the noVNC document. Fires for every proxied response but
+  // only acts on requests we tagged with a handle AND flagged selfHandleResponse
+  // for (so http-proxy leaves the write to us). We can only safely rewrite an
+  // uncompressed HTML body — if it's content-encoded, pipe it through untouched.
+  proxy.on("proxyRes", (proxyRes, req, res) => {
+    const handle = (req as TaggedReq).__chikinHandle;
+    if (handle === undefined) return; // not tagged: http-proxy handled it normally
+    const encoding = proxyRes.headers["content-encoding"];
+    const headers = { ...proxyRes.headers };
+    if (encoding) {
+      (res as ServerResponse).writeHead(proxyRes.statusCode ?? 200, headers);
+      proxyRes.pipe(res as ServerResponse);
+      return;
+    }
+    const chunks: Buffer[] = [];
+    proxyRes.on("data", (c: Buffer) => chunks.push(c));
+    proxyRes.on("end", () => {
+      const body = rewriteVncTitle(Buffer.concat(chunks).toString("utf8"), handle);
+      const buf = Buffer.from(body, "utf8");
+      delete headers["content-length"];
+      headers["content-length"] = String(buf.byteLength);
+      const sres = res as ServerResponse;
+      sres.writeHead(proxyRes.statusCode ?? 200, headers);
+      sres.end(buf);
+    });
+    proxyRes.on("error", () => (res as ServerResponse).destroy());
+  });
+
+  proxy.on("error", (err, _req, target) => {
+    log.warn("vnc: upstream error", String(err));
+    const res = target as ServerResponse | Duplex | undefined;
+    if (res && "writeHead" in res && !(res as ServerResponse).headersSent) {
+      (res as ServerResponse).writeHead(502, { "content-type": "text/plain" });
+      (res as ServerResponse).end("vnc upstream unavailable");
+    } else if (res && "destroy" in res) {
+      (res as Duplex).destroy();
+    }
+  });
+
+  return proxy;
+}
+
 // Single shared proxy for all /vnc/<name>/ traffic, websocket upgrades included.
-const proxy = httpProxy.createProxyServer({ ws: true, changeOrigin: true });
+const proxy = createVncProxy();
 
 // Host:port values we consider "ourselves" for the loopback-trusted surfaces.
 // The gateway is published on 127.0.0.1:<port>; a browser reaching it uses one
@@ -78,45 +158,6 @@ function originOk(req: IncomingMessage): boolean {
 export function vncUpgradeAllowed(req: IncomingMessage): boolean {
   return originOk(req) && hostOk(req);
 }
-
-// Title injection for the noVNC document. Fires for every proxied response but
-// only acts on requests we tagged with a handle AND flagged selfHandleResponse
-// for (so http-proxy leaves the write to us). We can only safely rewrite an
-// uncompressed HTML body — if it's content-encoded, pipe it through untouched.
-proxy.on("proxyRes", (proxyRes, req, res) => {
-  const handle = (req as TaggedReq).__chikinHandle;
-  if (handle === undefined) return; // not tagged: http-proxy handled it normally
-  const encoding = proxyRes.headers["content-encoding"];
-  const headers = { ...proxyRes.headers };
-  if (encoding) {
-    (res as ServerResponse).writeHead(proxyRes.statusCode ?? 200, headers);
-    proxyRes.pipe(res as ServerResponse);
-    return;
-  }
-  const chunks: Buffer[] = [];
-  proxyRes.on("data", (c: Buffer) => chunks.push(c));
-  proxyRes.on("end", () => {
-    const body = rewriteVncTitle(Buffer.concat(chunks).toString("utf8"), handle);
-    const buf = Buffer.from(body, "utf8");
-    delete headers["content-length"];
-    headers["content-length"] = String(buf.byteLength);
-    const sres = res as ServerResponse;
-    sres.writeHead(proxyRes.statusCode ?? 200, headers);
-    sres.end(buf);
-  });
-  proxyRes.on("error", () => (res as ServerResponse).destroy());
-});
-
-proxy.on("error", (err, _req, target) => {
-  log.warn("vnc: upstream error", String(err));
-  const res = target as ServerResponse | Duplex | undefined;
-  if (res && "writeHead" in res && !(res as ServerResponse).headersSent) {
-    (res as ServerResponse).writeHead(502, { "content-type": "text/plain" });
-    (res as ServerResponse).end("vnc upstream unavailable");
-  } else if (res && "destroy" in res) {
-    (res as Duplex).destroy();
-  }
-});
 
 /**
  * Express handler mounted at `/vnc/:name`. Express strips the mount prefix from
