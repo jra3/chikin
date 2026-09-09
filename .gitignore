@@ -8,3 +8,4 @@ node_modules
 .claude/
 .env
 dist/
+.agent-worktrees
