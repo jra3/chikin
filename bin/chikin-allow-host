@@ -24,16 +24,22 @@
 # The rule is scoped by SOURCE (the egress subnet) and left open on destination
 # address: the host answers on several addresses (the egress bridge gateway,
 # LAN, tailnet) and a dev server may be bound to any of them, so only the port
-# is narrowed. Every browser also gets the name host.docker.internal, which the
-# gateway points at the egress bridge gateway — the same host address this
-# script prints — so the one rule covers the name and the address alike.
+# is narrowed. Every browser this gateway provisions also gets the name
+# host.docker.internal, pointed at the egress bridge gateway — the same host
+# address this script prints — so the one rule covers the name and the address
+# alike. A browser from before that gateway keeps running without the name
+# until it is reaped or rotated; reach the host by the address there.
 #
 # The subnet is read from Docker, never typed: the range belongs to the network,
 # Docker may move it when the network is recreated, and a rule that names a
 # stale one fails open-looking and closed-behaving. The range is deliberately
 # not pinned in compose (that would force a fleet-down migration on every
 # install); instead the gateway's startup probe notices a stranded rule and
-# warns on /healthz, and the fix is re-running this script.
+# warns on /healthz, and the fix is re-running this script. The rule left
+# behind for the OLD range is stranded too: --remove builds its match from the
+# live subnet and cannot see it, so delete it by number from --status (sudo ufw
+# delete <n>) rather than leave an allow that the range's next, less-trusted
+# tenant network would inherit.
 #
 #   chikin-allow-host 5173             # allow tcp/5173 from the fleet
 #   chikin-allow-host 5173 --remove    # take it back
@@ -73,6 +79,14 @@ command -v ufw >/dev/null 2>&1 ||
   ports — write the equivalent for whatever firewall this host runs, allowing the
   chikin egress subnet as a SOURCE, one destination port at a time."
 
+# Read the range off the live network every time: Docker assigns it and may
+# reassign it on a recreate, and a rule for the wrong subnet looks present and
+# allows nothing. Both reads are guarded so a missing network or a down daemon
+# leaves them empty instead of ending the script silently.
+SUBNET="$("$DOCKER" network inspect "$NETWORK" -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null | awk '{print $1}' || true)"
+# The host's own address on that network — what a browser dials to reach it.
+BRIDGE_GW="$("$DOCKER" network inspect "$NETWORK" -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>/dev/null | awk '{print $1}' || true)"
+
 if [ "$action" = "status" ]; then
   ufw_status="$(sudo ufw status verbose)"
   case "$ufw_status" in
@@ -80,7 +94,15 @@ if [ "$action" = "status" ]; then
     *) echo "ufw is inactive: it stops nothing, so browsers reach every host port (unless another firewall is in the way)."
        exit 0 ;;
   esac
-  sudo ufw status numbered | grep -i "$COMMENT" && exit 0
+  if rules="$(sudo ufw status numbered | grep -i "$COMMENT")"; then
+    echo "$rules"
+    echo
+    echo "Live $NETWORK subnet: ${SUBNET:-unknown (is the fleet up?)}. A rule above naming any other"
+    echo "range was stranded by a network recreate: --remove cannot match it, so delete it by"
+    echo "number (sudo ufw delete <n>) — the old range can be handed to another, less-trusted"
+    echo "Docker network later, so do not leave it."
+    exit 0
+  fi
   case "$ufw_status" in
     *"deny (incoming)"*|*"reject (incoming)"*)
       echo "no chikin-egress rules — ufw denies inbound by default, so browsers cannot reach any port on this host." ;;
@@ -94,12 +116,6 @@ case "$port" in *[!0-9]*|"") die "port must be a number, got '$port'" 2 ;; esac
 [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "port out of range: $port" 2
 case "$proto" in tcp|udp) ;; *) die "proto must be tcp or udp, got '$proto'" 2 ;; esac
 
-# Read the range off the live network every time: Docker assigns it and may
-# reassign it on a recreate, and a rule for the wrong subnet looks present and
-# allows nothing.
-SUBNET="$("$DOCKER" network inspect "$NETWORK" -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null | awk '{print $1}')"
-# The host's own address on that network — what a browser dials to reach it.
-BRIDGE_GW="$("$DOCKER" network inspect "$NETWORK" -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>/dev/null | awk '{print $1}')"
 [ -n "$SUBNET" ] ||
   die "could not read a subnet from the '$NETWORK' docker network. Is the fleet up?
   Bring it up first (make dev-up, or docker compose up -d) — the network has to
@@ -125,8 +141,9 @@ sudo ufw "$@" || die "ufw refused the rule (see its output above)"
 
 if [ "$action" = "allow" ]; then
   echo
-  echo "The host is ${BRIDGE_GW:-the gateway address of $SUBNET} from inside a browser"
-  echo "(host.docker.internal resolves to it there)."
+  echo "The host is ${BRIDGE_GW:-the gateway address of $SUBNET} from inside a browser."
+  echo "host.docker.internal resolves to it in every browser this gateway provisioned; one"
+  echo "from before the upgrade keeps running without the name until reaped or rotated."
   if [ "$proto" = tcp ]; then
     echo "Verify from a browser's own perspective, with something listening on $port on a"
     echo "non-loopback address (a server bound to localhost is refused, not dropped):"

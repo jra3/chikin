@@ -8,6 +8,7 @@ import {
   probeHostReach,
 } from "../src/hostreach.js";
 import { Provisioner } from "../src/provisioner.js";
+import { withWarnings } from "./log-tap.js";
 
 /**
  * Can a browser reach a service on its own host?
@@ -161,6 +162,37 @@ test("browserHostAddr degrades to null when Docker cannot answer, and asks again
   fail = false;
   assert.equal(await p.browserHostAddr(), "172.28.0.1");
   assert.equal(inspects, 2);
+});
+
+test("browserHostAddr says once, not per provision, that browsers are losing the alias", async () => {
+  // The README sends the operator to host.docker.internal; a browser created
+  // without it fails with ERR_NAME_NOT_RESOLVED and nothing gateway-side
+  // would say why. One warning names the loss and the workaround; a
+  // persistent failure does not repeat it on every provision, and a recovery
+  // re-arms it so a later regression is reported again.
+  let fail = true;
+  const docker = {
+    getContainer: () => ({
+      inspect: async () => {
+        if (fail) throw new Error("connect ECONNREFUSED docker-socket-proxy:2375");
+        return { NetworkSettings: { Networks: { "chikin-egress": { Gateway: "172.28.0.1" } } } };
+      },
+    }),
+  };
+  const p = new Provisioner(docker as never);
+  const [, first] = await withWarnings(async () => {
+    await p.browserHostAddr();
+    await p.browserHostAddr();
+  });
+  assert.equal(first.length, 1);
+  assert.match(first[0] ?? "", /host\.docker\.internal/);
+  fail = false;
+  const [, recovered] = await withWarnings(() => p.browserHostAddr());
+  assert.deepEqual(recovered, []);
+  fail = true;
+  const q = new Provisioner(docker as never);
+  const [, again] = await withWarnings(() => q.browserHostAddr());
+  assert.equal(again.length, 1);
 });
 
 test("selfEgressGateway returns null when the egress network carries no gateway", async () => {

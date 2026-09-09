@@ -223,6 +223,7 @@ export class Provisioner {
   // concurrent cold-starts still warm up in parallel.
   private createGate: Promise<unknown> = Promise.resolve();
   private hostAddr: string | null = null;
+  private hostAddrWarned = false;
 
   constructor(docker?: Docker) {
     this.docker =
@@ -364,10 +365,21 @@ export class Provisioner {
    * network recreate recreates the gateway too, so it cannot move underneath
    * us). A lookup that fails is not kept, so the next provision asks again;
    * until one succeeds browsers are created without the alias, never blocked
-   * on it. Null on the same terms as selfEgressGateway.
+   * on it. Null on the same terms as selfEgressGateway — said once in the
+   * log when it starts costing browsers the name, not once per provision.
    */
   async browserHostAddr(): Promise<string | null> {
     this.hostAddr ??= await this.selfEgressGateway();
+    if (this.hostAddr) {
+      this.hostAddrWarned = false;
+    } else if (!this.hostAddrWarned) {
+      this.hostAddrWarned = true;
+      log.warn(
+        `provisioner: could not resolve the host's ${config.egressNetwork} gateway address from Docker; ` +
+          `browsers provisioned until it resolves get no host.docker.internal — reach the host by its ` +
+          `${config.egressNetwork} bridge address instead`,
+      );
+    }
     return this.hostAddr;
   }
 
