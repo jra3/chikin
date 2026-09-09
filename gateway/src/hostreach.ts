@@ -44,6 +44,13 @@ export type ProbeOutcome =
  * A port nothing listens on, so the expected answer is an RST. Any listener
  * that happens to be there is equally good evidence — "something answered" is
  * the whole question — so the choice cannot produce a false "blocked".
+ *
+ * What the probe measures is the host's DEFAULT inbound policy, not any
+ * particular service: the cure is per-port (`bin/chikin-allow-host 5173`),
+ * and a host with exactly the ports the operator needs allowed still drops
+ * port 1, so the probe still reads "blocked" there. The warning therefore
+ * describes the policy and points at `--status` for the per-port record,
+ * rather than claiming nothing on the host is reachable.
  */
 export const PROBE_PORT = 1;
 
@@ -113,12 +120,15 @@ export async function probeHostReach(
  */
 export function hostReachWarning(hostAddr: string): string {
   return (
-    `Browsers cannot reach services on THIS HOST: a TCP probe to ${hostAddr} was dropped ` +
-    `(silently, not refused), which is what a host firewall denying inbound by default does — ` +
-    `ufw with DEFAULT_INPUT_POLICY="DROP" is Omarchy's default. A browser asked to open a dev ` +
-    `server running on the host will report a navigation timeout, at every host address ` +
-    `(bridge gateway, LAN, tailnet) — binding the server to 0.0.0.0 does not help, because the ` +
-    `packets are dropped on arrival. Allow the ports you actually want reachable, one at a ` +
-    `time: bin/chikin-allow-host <port>. Internet access and published ports are unaffected.`
+    `This host drops inbound traffic from browsers by default: a TCP probe to ${hostAddr} was ` +
+    `dropped (silently, not refused), which is what a host firewall denying inbound by default ` +
+    `does — ufw with DEFAULT_INPUT_POLICY="DROP" is Omarchy's default. So no port on this host ` +
+    `is reachable from a browser unless it was explicitly allowed: a browser asked to open a dev ` +
+    `server on the host at a port that was not will report a navigation timeout, at every host ` +
+    `address (bridge gateway, LAN, tailnet) — binding the server to 0.0.0.0 does not help, ` +
+    `because the packets are dropped on arrival. Allow the ports you actually want reachable, ` +
+    `one at a time: bin/chikin-allow-host <port>. The probe reads the default policy, not ` +
+    `per-port rules, so this warning is expected once the ports you need are allowed — ` +
+    `bin/chikin-allow-host --status lists them. Internet access and published ports are unaffected.`
   );
 }

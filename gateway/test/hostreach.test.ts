@@ -70,12 +70,19 @@ test("a blackholed address never comes back as reachable", async () => {
   assert.notEqual(await probeHostReach("192.0.2.1", 1, 250), "reachable");
 });
 
-test("the warning names the symptom, the address, and one command", () => {
+test("the warning names the symptom, the address, the cure, and what it cannot see", () => {
   const w = hostReachWarning("172.28.0.1");
   assert.match(w, /172\.28\.0\.1/);
-  assert.match(w, /bin\/chikin-allow-host/);
+  assert.match(w, /bin\/chikin-allow-host <port>/);
   // The operator meets the timeout before they meet this text.
   assert.match(w, /timeout/i);
+  // The probe reads the host's DEFAULT policy. The cure it prescribes is
+  // per-port, which leaves the probe port dropped, so on a correctly
+  // configured host the warning still fires — it has to say it is expected
+  // once the needed ports are allowed and name the record of which those
+  // are, or it can never clear and gets ignored.
+  assert.match(w, /default/i);
+  assert.match(w, /bin\/chikin-allow-host --status/);
   // Never advertise the blanket rule: it hands every host service, sshd
   // included, to the least-trusted process on the machine.
   assert.doesNotMatch(w, /ufw allow from/);
