@@ -104,3 +104,55 @@ test("the runtime-config panel surfaces the attached TTL knob", async () => {
     "with its effective value from THIS process",
   );
 });
+
+// --- the #81 redesign's invariants ------------------------------------------
+
+// Browserless sessions used to be rows in the fleet table, described almost
+// entirely in em-dashes. On a real host they outnumber the browsers several to
+// one, so the rows that actually hold a slot — the reason the page exists — were
+// pushed off the top of it. They now have their own table; what must stay true
+// is that a name with no container never appears among the browsers.
+test("a session with no container is not listed among the browsers", async () => {
+  const reg = new Registry();
+  reg.add({ name: "inst-justconnected", handle: undefined } as never);
+  reg.streamOpened("inst-justconnected");
+
+  const html = await renderDashboard(fakeProvisioner(["inst-real"]) as never, reg);
+  const browsers = html.slice(html.indexOf("<h2>browsers"), html.indexOf("<h2>connected"));
+
+  assert.ok(browsers.includes("inst-real"), "the container is in the browsers table");
+  assert.ok(!browsers.includes("inst-justconnected"), "the browserless session is not");
+  assert.match(html, /inst-justconnected/, "but it is still on the page");
+});
+
+// The live view re-renders by fetching this same URL and swapping `#live` for the
+// fresh one. Two things make that work, and neither is visible from reading a
+// single element: exactly one `#live` must exist (or the swap targets the wrong
+// node), and the control the script binds its listeners to must live OUTSIDE it
+// (or the first swap orphans them and the page silently stops updating).
+test("the live-refresh region is unique, and the control it rebinds sits outside it", async () => {
+  const html = await renderDashboard(fakeProvisioner(["inst-1"]) as never, new Registry());
+
+  assert.equal(html.match(/id="live"/g)?.length, 1, "exactly one swap target");
+  const live = html.slice(html.indexOf('id="live"'), html.indexOf("</main>"));
+  for (const id of ["refresh", "refresh-toggle", "refresh-status"]) {
+    assert.match(html, new RegExp(`id="${id}"`), `the control has #${id}`);
+    assert.ok(!live.includes(`id="${id}"`), `#${id} survives a swap of #live`);
+  }
+});
+
+// A duration column that reads `28800s` does not make an eight-hour gap obvious,
+// which is the whole point of `browser idle`. It humanizes — but the seconds are
+// the unit ATTACHED_IDLE_TTL_SEC is set in, so they must stay somewhere exact.
+test("long durations humanize without losing the exact seconds", async () => {
+  const reg = new Registry();
+  const now = Date.now();
+  reg.streamOpened("inst-old", now - 8 * 3600_000);
+  reg.touch("inst-old", now - 20_000);
+
+  const html = await renderDashboard(fakeProvisioner(["inst-old"]) as never, reg);
+
+  assert.match(html, />8h \d+m</, "eight hours reads as eight hours");
+  assert.match(html, /title="288\d\ds"/, "with the exact seconds still on the cell");
+  assert.match(html, />2\ds<\/td>/, "and a fresh clock stays in raw seconds");
+});
