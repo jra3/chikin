@@ -38,6 +38,23 @@ function ageCell(ms: number | null, flagged = false): string {
 }
 
 /**
+ * The driving instance's self-chosen chikin_identify label, with whatever it
+ * said it was doing as the tooltip. Per session, and independent of the sticky
+ * browser name.
+ */
+function handleCell(session: { handle?: string; handleDescription?: string } | undefined): string {
+  return session?.handle
+    ? `<td><code title="${esc(session.handleDescription ?? "")}">${esc(session.handle)}</code></td>`
+    : `<td class="dash">—</td>`;
+}
+
+/** Whether a client currently holds an open SSE stream for this name. */
+function attachedCell(streams: number | undefined): string {
+  if (streams === undefined) return `<td class="dash">—</td>`;
+  return streams > 0 ? `<td>yes</td>` : `<td class="soft">no</td>`;
+}
+
+/**
  * A canary counter (strikes, respawns). Zero is the resting state and is muted;
  * anything above it is the reason to read the row, so it is tinted. Both are
  * gauges on the activity record, not monotonic totals — a reaped browser takes
@@ -155,25 +172,20 @@ function browserRow(
     `vnc/${m.name}/websockify`,
   )}`;
   const running = m.state === "running";
-  // The handle is the driving instance's self-chosen label (chikin_identify),
-  // set per session and independent of the sticky browser name above.
-  const handle = session?.handle
-    ? `<code title="${esc(session.handleDescription ?? "")}">${esc(session.handle)}</code>`
-    : `<span class="dash">—</span>`;
   return `<tr>
-    <td><code class="nm">${name}</code></td>
-    <td>${handle}</td>
+    <td class="pin-l"><code class="nm">${name}</code></td>
+    ${handleCell(session)}
     <td class="grp"><span class="pill ${running ? "ok" : "bad"}">${esc(m.state)}</span></td>
     <td class="soft status" title="${esc(m.status)}">${esc(m.status)}</td>
     ${sandboxCell(sandbox)}
     <td class="grp">${session ? `<span class="pill ok nodot">live</span>` : `<span class="dash">—</span>`}</td>
-    <td>${act ? (act.streams > 0 ? "yes" : `<span class="soft">no</span>`) : `<span class="dash">—</span>`}</td>
+    ${attachedCell(act?.streams)}
     ${ageCell(act ? now - act.last : null)}
     ${ageCell(act ? workIdleMs : null, overAttachedTtl)}
     ${countCell(act?.navStrikes, "grp")}
     ${countCell(act?.childRespawns)}
     <td>${act?.chromeVersion ? `<code>${esc(act.chromeVersion)}</code>` : `<span class="dash">—</span>`}</td>
-    <td class="grp">${running ? `<a class="btn" href="${vncHref}">open noVNC ↗</a>` : `<span class="dash">—</span>`}</td>
+    <td class="pin-r">${running ? `<a class="btn" href="${vncHref}">open noVNC ↗</a>` : `<span class="dash">—</span>`}</td>
   </tr>`;
 }
 
@@ -194,13 +206,10 @@ function browserRow(
 function sessionRow(name: string, registry: Registry, now: number): string {
   const session = registry.getByName(name);
   const act = registry.getActivity(name);
-  const handle = session?.handle
-    ? `<code title="${esc(session.handleDescription ?? "")}">${esc(session.handle)}</code>`
-    : `<span class="dash">—</span>`;
   return `<tr class="noslot">
     <td><code class="nm">${esc(name)}</code></td>
-    <td>${handle}</td>
-    <td>${act ? (act.streams > 0 ? "yes" : `<span class="soft">no</span>`) : `<span class="dash">—</span>`}</td>
+    ${handleCell(session)}
+    ${attachedCell(act?.streams)}
     ${ageCell(act ? now - act.last : null)}
     ${countCell(act?.navStrikes)}
     ${countCell(act?.childRespawns)}
@@ -309,6 +318,11 @@ const STYLE = `
   td.status { max-width: 9.5rem; overflow: hidden; text-overflow: ellipsis; }
   table.sessions { max-width: 54rem; }
   td.grp, th.grp { border-left: 1px solid var(--soft); }
+  td.pin-l, th.pin-l, td.pin-r, th.pin-r { position: sticky; background: var(--panel); z-index: 1; }
+  td.pin-l, th.pin-l { left: 0; border-right: 1px solid var(--line); }
+  td.pin-r, th.pin-r { right: 0; border-left: 1px solid var(--line); }
+  thead th.pin-l, thead th.pin-r { z-index: 3; }
+  tbody tr:hover td.pin-l, tbody tr:hover td.pin-r { background: var(--panel-2); }
   code.nm { font-weight: 600; }
   tr.noslot code.nm { font-weight: 500; color: var(--dim); }
   td.hot { color: var(--warn); font-weight: 650; }
@@ -332,6 +346,9 @@ const STYLE = `
     color: var(--accent); font-size: .76rem; font-weight: 600; text-decoration: none;
   }
   a.btn:hover { border-color: var(--accent); background: var(--panel-2); }
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px;
+  }
 
   /* ---- banners ---- */
   .banner {
@@ -352,6 +369,9 @@ const STYLE = `
     display: grid; grid-template-columns: max-content minmax(0, 1fr);
     gap: .28rem 1.2rem; margin: 0; padding: .85rem 1rem; font-size: .84rem;
   }
+  @media (min-width: 76rem) {
+    .cfg { grid-template-columns: max-content minmax(0, 1fr) max-content minmax(0, 1fr); }
+  }
   .cfg dt { margin: 0; }
   .cfg dd { margin: 0; color: var(--dim); overflow-wrap: anywhere; }
 
@@ -363,6 +383,7 @@ const STYLE = `
     background: var(--panel); border: 1px solid var(--line); box-shadow: var(--shadow);
     font-size: .75rem; color: var(--dim);
   }
+  .refresh[hidden] { display: none; }
   .refresh.stale { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
   .refresh button {
     font: inherit; font-weight: 600; color: var(--accent); cursor: pointer;
@@ -370,7 +391,11 @@ const STYLE = `
   }
   .refresh button:hover { border-color: var(--accent); }
   footer { color: var(--dim); font-size: .8rem; margin-top: 1.5rem; line-height: 1.7; }
-  @media (max-width: 40rem) { main { padding: 1.25rem 1rem 2rem; } .refresh { display: none; } }
+  @media (max-width: 40rem) {
+    main { padding: 1.25rem 1rem 2rem; }
+    .refresh { top: .4rem; right: .5rem; font-size: .7rem; padding: .2rem .25rem .2rem .45rem; }
+    .refresh #refresh-status { max-width: 7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  }
 `;
 
 /**
@@ -568,7 +593,7 @@ ${browserless.map((n) => sessionRow(n, registry, now)).join("\n")}
     </header>
     <div class="scroll"><table>
       <thead>
-        <tr><th>name</th><th>handle</th><th class="grp">state</th><th>status</th><th>sandbox</th><th class="grp">session</th><th>attached</th><th title="since any MCP frame — a client heartbeat ping keeps this near zero">idle</th><th title="since a real browser tool call — what the attached reap TTL measures">browser idle</th><th class="num grp" title="nav verifications that disagreed with the browser (suspicion). Many strikes with no respawns = the detector is firing on something that is not a wedge">strikes</th><th class="num" title="children torn down and replaced, any cause (action)">respawns</th><th title="Chrome reported by the running browser. It floats unpinned, and it governs whether the wedge reproduces at all — see #73">chrome</th><th class="grp">view</th></tr>
+        <tr><th class="pin-l">name</th><th>handle</th><th class="grp">state</th><th>status</th><th>sandbox</th><th class="grp">session</th><th>attached</th><th title="since any MCP frame — a client heartbeat ping keeps this near zero">idle</th><th title="since a real browser tool call — what the attached reap TTL measures">browser idle</th><th class="num grp" title="nav verifications that disagreed with the browser (suspicion). Many strikes with no respawns = the detector is firing on something that is not a wedge">strikes</th><th class="num" title="children torn down and replaced, any cause (action)">respawns</th><th title="Chrome reported by the running browser. It floats unpinned, and it governs whether the wedge reproduces at all — see #73">chrome</th><th class="pin-r">view</th></tr>
       </thead>
       <tbody>
 ${browserRows}
