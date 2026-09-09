@@ -143,13 +143,25 @@ test("buildCreateOptions wires the sandbox: CHIKIN_SANDBOX env down + SecurityOp
   assert.ok(opts.HostConfig?.SecurityOpt?.includes("no-new-privileges"));
 });
 
-test("buildCreateOptions gives every browser one stable name for the host", () => {
+test("buildCreateOptions gives every browser one stable name for the host, at the address it is given", () => {
   // Without it a browser told to open a dev server on the host has five
-  // candidate addresses and no way to pick. The name resolves whether or not
-  // the host firewall lets the packet through — it is a companion to
+  // candidate addresses and no way to pick. The alias points at the egress
+  // bridge gateway — the host as a browser sees it — never at Docker's
+  // `host-gateway` token, which names the DEFAULT bridge and fails the create
+  // outright on a daemon run with "bridge": "none". The name resolves whether
+  // or not the host firewall lets the packet through — it is a companion to
   // bin/chikin-allow-host, not a substitute. See hostreach.ts.
-  const opts = buildCreateOptions("bob");
-  assert.deepEqual(opts.HostConfig?.ExtraHosts, ["host.docker.internal:host-gateway"]);
+  const opts = buildCreateOptions("bob", "172.28.0.1");
+  assert.deepEqual(opts.HostConfig?.ExtraHosts, ["host.docker.internal:172.28.0.1"]);
+});
+
+test("buildCreateOptions omits ExtraHosts entirely when the host address is unknown", () => {
+  // No address means no alias and no key at all — the create is exactly what
+  // it was before the alias existed, never a token the daemon may refuse.
+  for (const none of [undefined, null, ""]) {
+    const opts = buildCreateOptions("bob", none);
+    assert.equal("ExtraHosts" in (opts.HostConfig ?? {}), false, `hostAddr=${String(none)}`);
+  }
 });
 
 // --- Per-name Downloads isolation (M2 / CHK-007 / issue #24) ----------------

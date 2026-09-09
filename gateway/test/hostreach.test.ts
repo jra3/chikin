@@ -123,6 +123,46 @@ test("selfEgressGateway returns null rather than throwing when Docker is unreach
   assert.equal(await p.selfEgressGateway(), null);
 });
 
+test("browserHostAddr resolves the egress gateway once and reuses it for every browser", async () => {
+  // The bridge gateway is stable for this process's lifetime (a network
+  // recreate recreates the gateway too), so one inspect serves the fleet.
+  let inspects = 0;
+  const docker = {
+    getContainer: () => ({
+      inspect: async () => {
+        inspects++;
+        return { NetworkSettings: { Networks: { "chikin-egress": { Gateway: "172.28.0.1" } } } };
+      },
+    }),
+  };
+  const p = new Provisioner(docker as never);
+  assert.equal(await p.browserHostAddr(), "172.28.0.1");
+  assert.equal(await p.browserHostAddr(), "172.28.0.1");
+  assert.equal(inspects, 1);
+});
+
+test("browserHostAddr degrades to null when Docker cannot answer, and asks again next time", async () => {
+  // A provision must never block on the alias; a failed lookup is not kept,
+  // so a Docker hiccup at the first provision does not strip the alias from
+  // every browser after it.
+  let fail = true;
+  let inspects = 0;
+  const docker = {
+    getContainer: () => ({
+      inspect: async () => {
+        inspects++;
+        if (fail) throw new Error("connect ECONNREFUSED docker-socket-proxy:2375");
+        return { NetworkSettings: { Networks: { "chikin-egress": { Gateway: "172.28.0.1" } } } };
+      },
+    }),
+  };
+  const p = new Provisioner(docker as never);
+  assert.equal(await p.browserHostAddr(), null);
+  fail = false;
+  assert.equal(await p.browserHostAddr(), "172.28.0.1");
+  assert.equal(inspects, 2);
+});
+
 test("selfEgressGateway returns null when the egress network carries no gateway", async () => {
   const p = new Provisioner(fakeDocker({ "chikin-egress": { Gateway: "" } }) as never);
   assert.equal(await p.selfEgressGateway(), null);

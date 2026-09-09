@@ -21,6 +21,13 @@
 # browser executes hostile pages for a living; that it cannot reach host
 # services is chikin's posture working. This is the narrow opt-in.
 #
+# The rule is scoped by SOURCE (the egress subnet) and left open on destination
+# address: the host answers on several addresses (the egress bridge gateway,
+# LAN, tailnet) and a dev server may be bound to any of them, so only the port
+# is narrowed. Every browser also gets the name host.docker.internal, which the
+# gateway points at the egress bridge gateway — the same host address this
+# script prints — so the one rule covers the name and the address alike.
+#
 # The subnet is read from Docker, never typed: the range belongs to the network,
 # Docker may move it when the network is recreated, and a rule that names a
 # stale one fails open-looking and closed-behaving. The range is deliberately
@@ -118,7 +125,8 @@ sudo ufw "$@" || die "ufw refused the rule (see its output above)"
 
 if [ "$action" = "allow" ]; then
   echo
-  echo "The host is ${BRIDGE_GW:-the gateway address of $SUBNET} from inside a browser."
+  echo "The host is ${BRIDGE_GW:-the gateway address of $SUBNET} from inside a browser"
+  echo "(host.docker.internal resolves to it there)."
   if [ "$proto" = tcp ]; then
     echo "Verify from a browser's own perspective, with something listening on $port on a"
     echo "non-loopback address (a server bound to localhost is refused, not dropped):"

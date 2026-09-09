@@ -116,7 +116,10 @@ export function resourceLimits(): Partial<Docker.HostConfig> {
  * build it only from the validated name. Docker auto-creates the per-name host
  * dir as root:0755 on first mount; the entrypoint chowns ~/Downloads to chrome.
  */
-export function buildCreateOptions(name: string): Docker.ContainerCreateOptions {
+export function buildCreateOptions(
+  name: string,
+  hostAddr?: string | null,
+): Docker.ContainerCreateOptions {
   const shared = config.sharedDir;
   const scratch = `${shared}/${name}`;
   return {
@@ -147,13 +150,18 @@ export function buildCreateOptions(name: string): Docker.ContainerCreateOptions 
       // One stable name for the host, so a browser told to open a dev server
       // has a single address to try instead of a guess among five (bridge
       // gateway, docker0, LAN, tailnet, loopback-which-is-the-container).
-      // Docker resolves `host-gateway` to the DEFAULT bridge's gateway
-      // (172.17.0.1), NOT chikin-egress's — which is why the firewall rule
-      // bin/chikin-allow-host writes is scoped by SOURCE subnet and left open
-      // on destination. On a host that denies inbound by default this name
-      // resolves and still times out; it is a companion to that rule, not a
-      // substitute for it. See hostreach.ts.
-      ExtraHosts: ["host.docker.internal:host-gateway"],
+      // The alias points at the egress bridge gateway the Provisioner already
+      // resolves — the host as a browser on chikin-egress sees it, and the
+      // address the startup reachability probe aims at — never at Docker's
+      // `host-gateway` token. That token names the DEFAULT bridge's gateway,
+      // a different address from where a browser sits, and on a daemon run
+      // with `"bridge": "none"` it cannot be derived at all: the create fails
+      // and a convenience alias becomes a provisioning outage. When the
+      // address is unknown the key is omitted and the create is exactly what
+      // it was before the alias existed. On a host that denies inbound by
+      // default the name resolves and still times out; it is a companion to
+      // bin/chikin-allow-host, not a substitute for it. See hostreach.ts.
+      ...(hostAddr ? { ExtraHosts: [`host.docker.internal:${hostAddr}`] } : {}),
       RestartPolicy: { Name: "unless-stopped" },
       // Least-privilege hardening (CHK-005). Drop all Linux capabilities, then
       // add back only what the entrypoint's root bootstrap needs before it
@@ -214,6 +222,7 @@ export class Provisioner {
   // docker calls run under the lock; the slow waitHealthy poll stays outside, so
   // concurrent cold-starts still warm up in parallel.
   private createGate: Promise<unknown> = Promise.resolve();
+  private hostAddr: string | null = null;
 
   constructor(docker?: Docker) {
     this.docker =
@@ -349,6 +358,19 @@ export class Provisioner {
     return gw ? gw : null;
   }
 
+  /**
+   * The host address every browser is given as `host.docker.internal`: the
+   * egress bridge gateway, read once and kept for the life of this process (a
+   * network recreate recreates the gateway too, so it cannot move underneath
+   * us). A lookup that fails is not kept, so the next provision asks again;
+   * until one succeeds browsers are created without the alias, never blocked
+   * on it. Null on the same terms as selfEgressGateway.
+   */
+  async browserHostAddr(): Promise<string | null> {
+    this.hostAddr ??= await this.selfEgressGateway();
+    return this.hostAddr;
+  }
+
   /** The one inspect both of the above read. Returns undefined, never throws. */
   private async selfEgressNetwork(): Promise<Docker.NetworkInfo | undefined> {
     try {
@@ -477,7 +499,9 @@ export class Provisioner {
     const cname = containerName(name);
     await this.ensureVolume(name);
     log.info(`provisioner: creating container ${cname}`);
-    const created = await this.createContainer(buildCreateOptions(name));
+    const created = await this.createContainer(
+      buildCreateOptions(name, await this.browserHostAddr()),
+    );
     // Attach the egress network so the browser can reach the internet; the
     // primary chikin-net is internal-only (CDP isolated from the host).
     try {
