@@ -121,9 +121,11 @@ services:
       # The CDP lane (#87): /cdp/<name>/, where Playwright, puppeteer and any
       # other DevTools-protocol client drive a browser directly, with no MCP in
       # the path. On by default — it is Host-guarded, bearer-gated (a CDP client
-      # can attach headers, unlike a noVNC navigation) and refuses any request
-      # carrying an Origin. 0 serves 404 there, leaving the browsers' CDP
-      # reachable only through the MCP endpoint.
+      # can attach headers, unlike a noVNC navigation) and refuses anything a
+      # web browser sent: any request carrying an Origin OR any Sec-Fetch-*
+      # header, since a no-cors GET or a navigation carries no Origin at all.
+      # 0 serves 404 there, leaving the browsers' CDP reachable only through
+      # the MCP endpoint.
       CHIKIN_CDP_LANE: "${CHIKIN_CDP_LANE:-1}"
       CHROME_IMAGE: "ghcr.io/jra3/chikin:${CHIKIN_VERSION:-sha-e1b3e92}"
       # Golden-profile seed volume. Empty = off; set to chikin-seed and populate

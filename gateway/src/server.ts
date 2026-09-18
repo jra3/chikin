@@ -225,10 +225,10 @@ export function createApp(deps: ServerDeps): express.Express {
     // stale session to reclaim — it is a live process on another protocol, and
     // handing the same Chrome to chrome-devtools-mcp as well produces a browser
     // that moves for reasons neither driver can account for.
+    const cdpRefusal = () =>
+      rpcError(RPC.BUSY, `browser '${name}' is being driven over the CDP lane`);
     if (deps.registry.hasCdp(name)) {
-      res
-        .status(409)
-        .json(rpcError(RPC.BUSY, `browser '${name}' is being driven over the CDP lane`));
+      res.status(409).json(cdpRefusal());
       return;
     }
 
@@ -243,6 +243,18 @@ export function createApp(deps: ServerDeps): express.Express {
       const act = deps.registry.getActivity(name);
       if (existing && (!act || act.streams === 0)) {
         await existing.close("reclaimed by new client (stale session)");
+      }
+      // The gate above is only atomic with the reserve it sits beside. This
+      // reserve is on the far side of an await, and `Session.close` frees the
+      // name SYNCHRONOUSLY at its top (onClose -> registry.remove) before
+      // awaiting the child's teardown — so for those tens to hundreds of
+      // milliseconds the name reads as free to the CDP lane too, and a driver
+      // holding its websocket URL from an earlier handshake can take it. The
+      // exclusion has to be re-asserted here; `reserve` itself knows only about
+      // MCP sessions.
+      if (deps.registry.hasCdp(name)) {
+        res.status(409).json(cdpRefusal());
+        return;
       }
       if (!deps.registry.reserve(name)) {
         res.status(409).json(rpcError(RPC.BUSY, `browser '${name}' already has an active session`));

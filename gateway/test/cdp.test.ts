@@ -174,6 +174,43 @@ function get(path: string, headers: Record<string, string> = {}): Promise<{ stat
   });
 }
 
+/** POST the MCP initialize frame for `name` — the only frame that opens a session. */
+function initialize(name: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "test", version: "0" },
+      },
+    });
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port: gatewayPort,
+        path: `/b/${name}/`,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          "content-length": Buffer.byteLength(payload),
+        },
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => (body += c));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+      },
+    );
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
 // --- the handshake ----------------------------------------------------------
 
 test("the /json handshake points the driver back at the gateway, not at chikin-net", async () => {
@@ -267,39 +304,7 @@ test("a browser already driven over one lane refuses the other", async () => {
 
     // ...and so is an MCP session, which is the direction that would otherwise
     // hand chrome-devtools-mcp a browser somebody else is already moving.
-    const init = await new Promise<{ status: number; body: string }>((resolve, reject) => {
-      const payload = JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: {
-          protocolVersion: "2025-03-26",
-          capabilities: {},
-          clientInfo: { name: "test", version: "0" },
-        },
-      });
-      const req = http.request(
-        {
-          host: "127.0.0.1",
-          port: gatewayPort,
-          path: "/b/pw-busy/",
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            accept: "application/json, text/event-stream",
-            "content-length": Buffer.byteLength(payload),
-          },
-        },
-        (res) => {
-          let body = "";
-          res.setEncoding("utf8");
-          res.on("data", (c) => (body += c));
-          res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
-        },
-      );
-      req.on("error", reject);
-      req.end(payload);
-    });
+    const init = await initialize("pw-busy");
     assert.equal(init.status, 409, "MCP must not attach to a CDP-driven browser");
   } finally {
     registry.cdpClosed("pw-busy");
@@ -331,6 +336,7 @@ test("a Name MCP has claimed but not yet promoted is already taken from this lan
     registry.release("pw-pending");
   }
 });
+
 
 // --- the websocket ----------------------------------------------------------
 
@@ -446,6 +452,43 @@ test("the lane is held by the DRIVER, so the holder is not locked out of its own
   }
   await waitFor(() => !registry.hasCdp("pw-solo"));
   assert.equal(registry.hasCdp("pw-solo"), false);
+});
+
+test("reclaiming a stale MCP session must not hand over a Name a driver took meanwhile", async () => {
+  // The stale-session reclaim is the one place the MCP lane claims a Name on
+  // the far side of an await. `Session.close` frees it SYNCHRONOUSLY at its top
+  // (onClose -> registry.remove, session.ts/bridge.ts) and only then awaits the
+  // child's teardown — tens to hundreds of ms in which the Name reads as free
+  // to the CDP lane as well. A driver still holding the websocket URL an
+  // earlier handshake gave it (`bin/chikin-pw giard`, then connect) takes the
+  // lane inside that window, and `reserve` knows nothing about the other lane.
+  await get("/cdp/pw-reclaim/json/version");
+  const drivers: net.Socket[] = [];
+  const stale = {
+    name: "pw-reclaim",
+    isClosed: false,
+    close: async (_reason: string): Promise<void> => {
+      registry.remove(stale as never);
+      const up = await upgrade("/cdp/pw-reclaim/devtools/browser/8f2c-abc");
+      if (up.socket) drivers.push(up.socket);
+    },
+  };
+  registry.add(stale as never);
+  try {
+    const init = await initialize("pw-reclaim");
+    assert.equal(drivers.length, 1, "the driver has to win that window for this to be the race at all");
+    assert.equal(registry.hasCdp("pw-reclaim"), true);
+    assert.equal(init.status, 409, "the browser is being driven; a reclaim does not change that");
+    assert.match(init.body, /CDP lane/);
+    assert.equal(
+      registry.has("pw-reclaim"),
+      false,
+      "and no session may be left reserved on a Name the other lane holds",
+    );
+  } finally {
+    for (const s of drivers) s.destroy();
+  }
+  await waitFor(() => !registry.hasCdp("pw-reclaim"));
 });
 
 test("a holder's follow-up /json request never re-provisions the browser it is driving", async () => {
