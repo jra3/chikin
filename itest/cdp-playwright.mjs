@@ -127,10 +127,11 @@ try {
 // gateway learns this from the socket, so give it a beat.
 await new Promise((r) => setTimeout(r, 1000));
 const dashAfter = await fetch(`${BASE}/`).then((r) => r.text());
+const stillHeld = dashAfter.includes("yes (cdp)");
 check(
   "closing the driver releases the browser",
-  !dashAfter.includes("yes (cdp)"),
-  "dashboard still shows a CDP driver attached",
+  !stillHeld,
+  stillHeld ? "the dashboard still shows a CDP driver attached" : "no CDP driver on the dashboard",
 );
 
 // Leave the fleet as we found it — which means removing what this run created

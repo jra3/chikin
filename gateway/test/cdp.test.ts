@@ -114,6 +114,9 @@ function fakeChrome(): {
 function stubProvisioner() {
   const ensured: string[] = [];
   const slow = new Map<string, number>();
+  // Names whose container has vanished from under a driver — the wedge/reap
+  // case the lane has to answer honestly instead of quietly rebuilding.
+  const gone = new Set<string>();
   const wait = async (name: string): Promise<void> => {
     const ms = slow.get(name);
     if (ms) await new Promise((r) => setTimeout(r, ms));
@@ -126,16 +129,17 @@ function stubProvisioner() {
     },
     resolveIp: async (name: string) => {
       await wait(name);
+      if (gone.has(name)) throw new Error(`no such container: chikin-chrome-${name}`);
       return "127.0.0.1";
     },
     recreateContainer: async () => {},
     listFleet: async () => [],
   };
-  return { provisioner, ensured, slow };
+  return { provisioner, ensured, slow, gone };
 }
 
 const registry = new Registry();
-const { provisioner, ensured, slow } = stubProvisioner();
+const { provisioner, ensured, slow, gone } = stubProvisioner();
 const chrome = fakeChrome();
 const deps = { registry, provisioner: provisioner as never };
 const gateway = http.createServer(createApp(deps));
@@ -302,6 +306,32 @@ test("a browser already driven over one lane refuses the other", async () => {
   }
 });
 
+test("a Name MCP has claimed but not yet promoted is already taken from this lane", async () => {
+  // The initialize path claims a Name synchronously with reserve() and only
+  // calls registry.add once the chrome-devtools-mcp child is up — tens to
+  // hundreds of ms later (server.ts, bridge.ts). A lane that asks only
+  // getByName reads that window as free, and a driver arriving inside it takes
+  // the very Chrome the MCP session is about to attach to: both lanes on one
+  // browser, which is the state that must be impossible.
+  assert.equal(registry.reserve("pw-pending"), true);
+  const before = ensured.length;
+  try {
+    const res = await get("/cdp/pw-pending/json/version");
+    assert.equal(res.status, 409);
+    assert.match(res.body, /MCP lane/);
+
+    // The upgrade is the hop that would actually take the lane, so it has to
+    // refuse on the same reading.
+    const up = await upgrade("/cdp/pw-pending/devtools/browser/x");
+    assert.equal(up.socket, null, "a reserved Name must not be spliced to a CDP driver");
+    assert.equal(up.status, 409);
+    assert.equal(registry.hasCdp("pw-pending"), false, "and the lane must not be marked held");
+    assert.equal(ensured.length, before, "nor a browser built for a Name the other lane claimed");
+  } finally {
+    registry.release("pw-pending");
+  }
+});
+
 // --- the websocket ----------------------------------------------------------
 
 /** Open a raw upgrade against the gateway and resolve with what came back. */
@@ -416,6 +446,58 @@ test("the lane is held by the DRIVER, so the holder is not locked out of its own
   }
   await waitFor(() => !registry.hasCdp("pw-solo"));
   assert.equal(registry.hasCdp("pw-solo"), false);
+});
+
+test("a holder's follow-up /json request never re-provisions the browser it is driving", async () => {
+  // Every provision ends in waitHealthy, and a browser that fails it is stopped
+  // and removed (provisionOnce -> recreateContainer). On a Name whose websocket
+  // is open that tears down the container the driver's own live socket is
+  // spliced to — the #73 wedge turned into a killed session. Enumerating
+  // targets mid-session is ordinary CDP, so this is a normal request, not an
+  // exotic one.
+  await get("/cdp/pw-held/json/version");
+  const up = await upgrade("/cdp/pw-held/devtools/browser/8f2c-abc");
+  assert.ok(up.socket, "the driver has to be holding the lane for this to be about a holder");
+  try {
+    const before = ensured.filter((n) => n === "pw-held").length;
+    const again = await get("/cdp/pw-held/json/version");
+    assert.equal(again.status, 200, "the holder is still served — from the container that exists");
+    assert.equal(
+      ensured.filter((n) => n === "pw-held").length,
+      before,
+      "a held browser must be resolved, never re-ensured behind its own driver's back",
+    );
+  } finally {
+    up.socket.destroy();
+  }
+  await waitFor(() => !registry.hasCdp("pw-held"));
+});
+
+test("a holder whose browser has vanished gets an honest error, not a silent new one", async () => {
+  await get("/cdp/pw-gone/json/version");
+  const up = await upgrade("/cdp/pw-gone/devtools/browser/8f2c-abc");
+  assert.ok(up.socket);
+  try {
+    gone.add("pw-gone");
+    const before = ensured.filter((n) => n === "pw-gone").length;
+    const res = await get("/cdp/pw-gone/json/version");
+    assert.equal(res.status, 502);
+    assert.match(res.body, /no browser named 'pw-gone'/);
+    assert.equal(
+      res.body.trimStart().startsWith("{"),
+      false,
+      "a CDP client shows a human the status line of a failed fetch, not a JSON-RPC envelope",
+    );
+    assert.equal(
+      ensured.filter((n) => n === "pw-gone").length,
+      before,
+      "building a second browser under a driver attached to the first is worse than failing",
+    );
+  } finally {
+    gone.delete("pw-gone");
+    up.socket.destroy();
+  }
+  await waitFor(() => !registry.hasCdp("pw-gone"));
 });
 
 test("a driver that gives up DURING the provision still releases the browser", async () => {

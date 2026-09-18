@@ -291,9 +291,18 @@ function onDriverGone(socket: Duplex, release: () => void): void {
  * other never asked for — is a failure nobody can read from either side. A
  * caller who wants a second browser asks for a second Name, and gets its own
  * clone of the golden profile.
+ *
+ * `registry.has` (byName ∪ pending), not `getByName`: the MCP initialize path
+ * claims a Name synchronously with `reserve()` and only promotes it to a live
+ * session once the child process is up (server.ts), so for the tens to hundreds
+ * of milliseconds in between, a Name that is already spoken for reads as free —
+ * long enough for a driver's handshake AND its upgrade to take the lane, and
+ * the MCP session then attaches chrome-devtools-mcp to the same Chrome. Not
+ * `isPending`, which also counts the `provisioning` bumps this lane's own
+ * provision makes, and would therefore conflict with itself.
  */
 export function busyWith(registry: Registry, name: string): "mcp" | "cdp" | null {
-  if (registry.getByName(name)) return "mcp";
+  if (registry.has(name)) return "mcp";
   if (registry.hasCdp(name)) return "cdp";
   return null;
 }
@@ -329,6 +338,18 @@ export function conflictFor(registry: Registry, name: string, driver: string): "
   const busy = busyWith(registry, name);
   if (busy === "cdp" && cdpHolders.get(name) === driver) return null;
   return busy;
+}
+
+/**
+ * Is this driver the one holding the lane on `name` right now?
+ *
+ * Not the same question as `conflictFor` answering null, which is also true of
+ * a Name nobody holds at all. This one asks whether a websocket of OURS is
+ * already spliced to a running browser — which is what decides whether a
+ * request may provision one.
+ */
+function holdsLane(registry: Registry, name: string, driver: string): boolean {
+  return registry.hasCdp(name) && cdpHolders.get(name) === driver;
 }
 
 /** Take the lane for `driver`, or add a second socket to the one it holds. */
@@ -419,7 +440,8 @@ export function makeCdpHttpHandler(deps: CdpDeps) {
       res.status(403).type("text/plain").send("forbidden");
       return;
     }
-    const busy = conflictFor(deps.registry, name, driverKey(req));
+    const driver = driverKey(req);
+    const busy = conflictFor(deps.registry, name, driver);
     if (busy) {
       res
         .status(409)
@@ -427,7 +449,16 @@ export function makeCdpHttpHandler(deps: CdpDeps) {
         .send(`browser '${name}' is already being driven over the ${busy.toUpperCase()} lane`);
       return;
     }
-    provisionForCdp(deps, name)
+    // Laziness is for the FIRST request on an unheld Name (#63) — that is what
+    // it is for. Once this driver holds the lane it has a websocket spliced to
+    // a running container, and every provision ends in `waitHealthy`: a browser
+    // whose DevTools endpoint has wedged (#73) would be stopped and removed out
+    // from under the very socket its own driver is holding, killing a live
+    // session to "recover" it. So a holder's follow-up resolves the container
+    // that exists and says so plainly when there is none — the rule the upgrade
+    // handler already applies, for the same reason.
+    const held = holdsLane(deps.registry, name, driver);
+    (held ? deps.provisioner.resolveIp(name) : provisionForCdp(deps, name))
       .then((ip) => {
         // The handshake IS browser work: it is the moment a driver takes the
         // browser, and until its websocket opens there is nothing else to stamp.
@@ -438,6 +469,16 @@ export function makeCdpHttpHandler(deps: CdpDeps) {
         proxy.web(req, res, { target: cdpTarget(ip), selfHandleResponse: true });
       })
       .catch((e: unknown) => {
+        if (held) {
+          log.warn(`cdp[${name}]: the browser this lane is holding is gone`, String(e));
+          if (!res.headersSent) {
+            res
+              .status(502)
+              .type("text/plain")
+              .send(`no browser named '${name}' to reach`);
+          }
+          return;
+        }
         if (e instanceof FleetFullError) {
           res.status(429).type("text/plain").send(e.message);
           return;
