@@ -48,8 +48,11 @@ BASE=http://localhost:8081 node cdp-playwright.mjs inst-pw1 # a scratch gateway 
 
 It provisions one browser, drives `example.com` in the profile's default context,
 asserts the browser is real headful Chrome (a bundled Chromium would say
-`HeadlessChrome`), asserts MCP is refused while the driver holds the browser, and
-removes the container and volume it made. Use a disposable `inst-*` name.
+`HeadlessChrome`), and asserts MCP is refused while the driver holds the browser.
+It then removes the container and volume **it** created, leaving anything that
+was already there alone, and it refuses outright to run against a name that is
+not `inst-*` — the cleanup is a `docker volume rm`, and a sticky profile is not
+something a test may put at risk.
 
 `reaper-helper.mjs` drives the live reaper test. Every mode calls
 `chikin_identify` before touching a browser tool (the gate added in #54) and

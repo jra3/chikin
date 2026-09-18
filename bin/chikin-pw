@@ -91,7 +91,11 @@ case "$code" in
     ;;
 esac
 
-chrome="$(printf '%s' "$payload" | sed -n 's/.*"Browser":"\([^"]*\)".*/\1/p')"
+# Chrome pretty-prints its DevTools JSON — `  "Browser": "Chrome/153.0.8010.36",`,
+# one key per line, space after the colon — and the gateway's rewrite is a string
+# replace that preserves that formatting. Tolerate the space, or this silently
+# reports no version at all.
+chrome="$(printf '%s' "$payload" | sed -n 's/.*"Browser": *"\([^"]*\)".*/\1/p')"
 
 if [ "$JSON" = "1" ]; then
   printf '{"endpoint":"%s","browser":"%s","chrome":"%s","vnc":"%s"}\n' \

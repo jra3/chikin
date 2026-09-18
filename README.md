@@ -218,9 +218,9 @@ The first request provisions `chikin-chrome-giard-scrape` from `SEED_VOLUME`, ex
 Things worth knowing before your first run:
 
 - **`browser.contexts()[0]`, never `browser.newContext()`.** The logins live in the browser's persistent profile, which Playwright sees as the *default* context. A fresh context is a fresh, logged-out one.
-- **One driver at a time.** A browser being driven over CDP refuses an MCP session and vice versa, both with a 409. Want two? Use two names — each gets its own clone of the seed.
+- **One driver at a time.** A browser being driven over CDP refuses an MCP session and vice versa, both with a 409. The lane is held by the *driver*, not by the connection, so your own follow-up `/json/*` requests and any further sockets you open are fine; a driver at another address is turned away. Want two? Use two names — each gets its own clone of the seed.
 - **These browsers are headful**, under Xvfb, which is the whole anti-detection point. So noVNC works while your script runs: open `http://localhost:8080/vnc/<name>/` to watch it, or to clear a CAPTCHA by hand mid-run.
-- **The lane is guarded** by the same Host check as everything else, by `GATEWAY_TOKEN` when you set one, and by refusing any request that carries an `Origin` header — a driver never sends one and a web page always does.
+- **The lane is guarded** by the same Host check as everything else, by `GATEWAY_TOKEN` when you set one, and by refusing anything that looks like it came from a web browser: an `Origin` header, or any `Sec-Fetch-*` header. No CDP driver sends either; a browser sends `Sec-Fetch-*` on every request it makes, including the `no-cors` fetches and navigations that carry no Origin at all.
 - **Downloads land in the container**, at `/tmp/chikin-shared/<name>` on the host (see below); `download.path()` is not available over CDP. For uploads, pass `setInputFiles` a `{name, mimeType, buffer}` rather than a host path.
 - An idle driver is still reaped: an open CDP socket counts as attached, and the attached tier is measured against traffic your driver actually sends (`ATTACHED_IDLE_TTL_SEC`).
 

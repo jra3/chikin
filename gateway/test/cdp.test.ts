@@ -3,8 +3,13 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
+
+const run = promisify(execFile);
 
 /**
  * The CDP lane (#87), proven on the wire rather than in pieces.
@@ -47,11 +52,22 @@ const SELF = `127.0.0.1:${gatewayPort}`;
 // What a real Chrome answers /json/version with: a websocket URL on the
 // container's own chikin-net address, which is exactly the address no host
 // process can reach.
-const CHROME_JSON = JSON.stringify({
-  Browser: "Chrome/153.0.8010.36",
-  webSocketDebuggerUrl: "ws://172.29.0.9:9222/devtools/browser/8f2c-abc",
-  "V8-Version": "15.3",
-});
+//
+// PRETTY-PRINTED, three spaces, one key per line — because that is what Chrome
+// sends, and the gateway's rewrite is a string replace that preserves it. A
+// compact `JSON.stringify` here is a fake that is easier to parse than the real
+// thing, and anything downstream reading `"Browser": "..."` off the wire (see
+// the bin/chikin-pw test below) then passes against the fake and fails against
+// Chrome.
+const CHROME_JSON = JSON.stringify(
+  {
+    Browser: "Chrome/153.0.8010.36",
+    webSocketDebuggerUrl: "ws://172.29.0.9:9222/devtools/browser/8f2c-abc",
+    "V8-Version": "15.3",
+  },
+  null,
+  3,
+);
 
 /** A stand-in for Chrome's DevTools endpoint: the JSON handshake and an upgrade. */
 function fakeChrome(): {
@@ -88,23 +104,38 @@ function fakeChrome(): {
   return { server, upgrades, hostHeaders, sockets };
 }
 
-/** Docker, stubbed: every browser is "already running" on loopback. */
+/**
+ * Docker, stubbed: every browser is "already running" on loopback.
+ *
+ * `slow` makes one name's Docker calls take a while, which is the only way to
+ * test what happens DURING a provision — the window a second handshake races
+ * in, and the window a driver can abort in.
+ */
 function stubProvisioner() {
   const ensured: string[] = [];
+  const slow = new Map<string, number>();
+  const wait = async (name: string): Promise<void> => {
+    const ms = slow.get(name);
+    if (ms) await new Promise((r) => setTimeout(r, ms));
+  };
   const provisioner = {
     ensureContainer: async (name: string) => {
       ensured.push(name);
+      await wait(name);
       return "127.0.0.1";
     },
-    resolveIp: async () => "127.0.0.1",
+    resolveIp: async (name: string) => {
+      await wait(name);
+      return "127.0.0.1";
+    },
     recreateContainer: async () => {},
     listFleet: async () => [],
   };
-  return { provisioner, ensured };
+  return { provisioner, ensured, slow };
 }
 
 const registry = new Registry();
-const { provisioner, ensured } = stubProvisioner();
+const { provisioner, ensured, slow } = stubProvisioner();
 const chrome = fakeChrome();
 const deps = { registry, provisioner: provisioner as never };
 const gateway = http.createServer(createApp(deps));
@@ -191,6 +222,31 @@ test("an Origin — any Origin, including our own — is refused", async () => {
   assert.equal(ours.status, 403, "our own dashboard origin has no business on this lane either");
 });
 
+test("a request carrying Fetch Metadata is refused, Origin or no Origin", async () => {
+  // The Origin check alone is not "is this a web page": Fetch attaches an
+  // Origin only to CORS-tainted requests, non-GET methods and ws handshakes, so
+  // `fetch(url, {mode:'no-cors'})`, an <img src> and a plain navigation all
+  // arrive without one. They cannot arrive without Sec-Fetch-*, which the user
+  // agent writes itself and script cannot strip.
+  const before = ensured.length;
+  const noCors = await get("/cdp/pw-sec/json/version", {
+    "sec-fetch-mode": "no-cors",
+    "sec-fetch-site": "cross-site",
+    "sec-fetch-dest": "empty",
+  });
+  assert.equal(noCors.status, 403);
+  const navigation = await get("/cdp/pw-sec/json/version", {
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-dest": "document",
+  });
+  assert.equal(navigation.status, 403, "a clicked link is a web page too");
+  assert.equal(
+    ensured.length,
+    before,
+    "reaching /json/* alone provisions a browser — a fleet slot and a seeded profile per name",
+  );
+});
+
 test("an invalid browser name is refused before anything is provisioned", async () => {
   const before = ensured.length;
   const res = await get("/cdp/NOT_A_NAME/json/version");
@@ -252,8 +308,8 @@ test("a browser already driven over one lane refuses the other", async () => {
 function upgrade(
   path: string,
   headers: Record<string, string> = {},
-): Promise<{ socket: net.Socket | null; status: number }> {
-  return new Promise((resolve, reject) => {
+): Promise<{ socket: net.Socket | null; status: number; body: string }> {
+  return new Promise((resolve) => {
     const req = http.request({
       host: "127.0.0.1",
       port: gatewayPort,
@@ -266,12 +322,26 @@ function upgrade(
         ...headers,
       },
     });
-    req.on("upgrade", (res, socket) => resolve({ socket: socket as net.Socket, status: res.statusCode ?? 0 }));
-    req.on("response", (res) => resolve({ socket: null, status: res.statusCode ?? 0 }));
-    // A refused upgrade is a destroyed socket, which surfaces here.
-    req.on("error", () => resolve({ socket: null, status: 0 }));
+    req.on("upgrade", (res, socket) =>
+      resolve({ socket: socket as net.Socket, status: res.statusCode ?? 0, body: "" }),
+    );
+    // A refusal answers the upgrade request with an ordinary response, which
+    // is where the reason for it lives.
+    req.on("response", (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => (body += c));
+      res.on("end", () => resolve({ socket: null, status: res.statusCode ?? 0, body }));
+    });
+    req.on("error", () => resolve({ socket: null, status: 0, body: "" }));
     req.end();
   });
+}
+
+/** Poll until `done()`, or give up — release runs on socket events, not awaits. */
+async function waitFor(done: () => boolean, ms = 2000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
 }
 
 test("the driver's websocket reaches the browser, and is counted while it is open", async () => {
@@ -294,27 +364,141 @@ test("the driver's websocket reaches the browser, and is counted while it is ope
     up.socket.destroy();
   }
   // The counter has to come back down, or the browser is never reaped again.
-  const deadline = Date.now() + 2000;
-  while (registry.hasCdp("pw-ws") && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 20));
-  }
+  await waitFor(() => !registry.hasCdp("pw-ws"));
   assert.equal(registry.hasCdp("pw-ws"), false, "closing the socket releases the browser");
 });
 
-test("an upgrade carrying an Origin is dropped", async () => {
+test("an upgrade carrying an Origin is refused", async () => {
   const up = await upgrade("/cdp/pw-ws2/devtools/browser/x", { origin: "http://evil.example" });
   assert.equal(up.socket, null, "a page-originated upgrade must never be spliced to a browser");
+  assert.equal(up.status, 403);
   assert.equal(registry.hasCdp("pw-ws2"), false);
 });
 
-test("an upgrade for a browser somebody else is driving is dropped", async () => {
-  registry.cdpOpened("pw-taken");
+test("an upgrade carrying Fetch Metadata is refused", async () => {
+  const up = await upgrade("/cdp/pw-ws3/devtools/browser/x", { "sec-fetch-dest": "websocket" });
+  assert.equal(up.socket, null);
+  assert.equal(up.status, 403);
+  assert.equal(registry.hasCdp("pw-ws3"), false);
+});
+
+test("an upgrade for a browser somebody else is driving says so, and is not just dropped", async () => {
+  registry.cdpOpened("pw-taken"); // held with no driver key recorded: not us
   try {
     const up = await upgrade("/cdp/pw-taken/devtools/browser/x");
     assert.equal(up.socket, null);
+    assert.equal(up.status, 409, "a destroyed socket reaches the driver as 'socket hang up' and explains nothing");
+    assert.match(up.body, /already being driven over the CDP lane/);
   } finally {
     registry.cdpClosed("pw-taken");
   }
+});
+
+test("the lane is held by the DRIVER, so the holder is not locked out of its own follow-ups", async () => {
+  await get("/cdp/pw-solo/json/version");
+  const first = await upgrade("/cdp/pw-solo/devtools/browser/8f2c-abc");
+  assert.ok(first.socket, "the first socket takes the lane");
+  try {
+    const again = await get("/cdp/pw-solo/json/version");
+    assert.equal(
+      again.status,
+      200,
+      "enumerating targets mid-session is ordinary CDP; the holder must not 409 itself",
+    );
+    const second = await upgrade("/cdp/pw-solo/devtools/page/A1");
+    assert.ok(second.socket, "one socket per target is a legitimate client shape (chrome-remote-interface)");
+    second.socket.destroy();
+    // One of the driver's two sockets going away is not the driver going away.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(registry.hasCdp("pw-solo"), true, "the lane is held until the LAST socket closes");
+  } finally {
+    first.socket.destroy();
+  }
+  await waitFor(() => !registry.hasCdp("pw-solo"));
+  assert.equal(registry.hasCdp("pw-solo"), false);
+});
+
+test("a driver that gives up DURING the provision still releases the browser", async () => {
+  // The bug this pins: the release listeners used to be registered inside the
+  // `.then()` of the Docker hop. A driver that aborted while that promise was
+  // in flight had already emitted `close`, so nothing ever fired — the name
+  // answered 409 on both lanes and held a fleet slot until the attached tier
+  // expired hours later (or never, with ATTACHED_IDLE_TTL_SEC=0).
+  slow.set("pw-abort", 400);
+  try {
+    const sock = net.connect(gatewayPort, "127.0.0.1");
+    sock.on("error", () => {});
+    await once(sock, "connect");
+    sock.write(
+      "GET /cdp/pw-abort/devtools/browser/x HTTP/1.1\r\n" +
+        `Host: ${SELF}\r\n` +
+        "Connection: Upgrade\r\nUpgrade: websocket\r\n" +
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+    );
+    // Well inside the 400ms Docker hop, and well past the ~1ms loopback trip.
+    await new Promise((r) => setTimeout(r, 60));
+    sock.destroy();
+    // Asserted PAST the hop, not as soon as the counter reads zero: the bug is
+    // a claim taken after the abort, so a reading from before the provision
+    // finishes would pass against the broken version too.
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(
+      registry.hasCdp("pw-abort"),
+      false,
+      "an aborted upgrade must not leave the browser marked held by a driver that is gone",
+    );
+    // And the lane is genuinely free afterwards, not merely uncounted.
+    const after = await get("/cdp/pw-abort/json/version");
+    assert.equal(after.status, 200);
+  } finally {
+    slow.delete("pw-abort");
+  }
+});
+
+// --- provisioning -----------------------------------------------------------
+
+test("two handshakes for one cold browser share a single provision", async () => {
+  // Without single-flight both reach createAndStart, and the loser gets
+  // Docker's 409 name conflict — not a ProvisionError, so it lands on the
+  // Express backstop as a JSON 500 in the middle of a plain-text lane.
+  slow.set("pw-race", 150);
+  try {
+    const [a, b] = await Promise.all([
+      get("/cdp/pw-race/json/version"),
+      get("/cdp/pw-race/json/version"),
+    ]);
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    assert.equal(
+      ensured.filter((n) => n === "pw-race").length,
+      1,
+      "concurrent first requests must join one provision, the way bridge.ts shares `attaching`",
+    );
+  } finally {
+    slow.delete("pw-race");
+  }
+});
+
+// --- the CLI ----------------------------------------------------------------
+
+test("bin/chikin-pw warms a browser and reports its Chrome version", async (t) => {
+  // chikin-pw reads `"Browser"` straight off the wire, so it is the one thing
+  // that sees the handshake's FORMATTING rather than its parsed shape.
+  try {
+    await run("curl", ["--version"]);
+  } catch {
+    t.skip("curl is not installed");
+    return;
+  }
+  const script = fileURLToPath(new URL("../../../bin/chikin-pw", import.meta.url));
+  const { stdout } = await run(script, ["pw-cli", "--json"], {
+    env: { ...process.env, CHIKIN_GATEWAY: `http://${SELF}`, GATEWAY_TOKEN: "", CHIKIN_TOKEN: "" },
+  });
+  const out = JSON.parse(stdout) as { endpoint: string; browser: string; chrome: string };
+  assert.equal(out.endpoint, `http://${SELF}/cdp/pw-cli/`);
+  assert.equal(out.browser, "pw-cli");
+  assert.equal(out.chrome, "Chrome/153.0.8010.36", "Chrome pretty-prints this field; the CLI must cope");
+  assert.ok(ensured.includes("pw-cli"), "warming a browser is what the command is for");
 });
 
 // --- pure pieces ------------------------------------------------------------
@@ -364,13 +548,20 @@ test("matchCdpUpgrade: splits our paths and declines everybody else's", () => {
   assert.equal(matchCdpUpgrade("/cdp/../etc/passwd"), null);
 });
 
-test("cdpAccessOk: Host must be ours, Origin must be absent", () => {
+test("cdpAccessOk: Host must be ours, and nothing a browser sent gets through", () => {
   const req = (headers: Record<string, string>) => ({ headers }) as unknown as http.IncomingMessage;
   assert.equal(cdpAccessOk(req({ host: SELF })), true);
   assert.equal(cdpAccessOk(req({ host: `localhost:${gatewayPort}` })), true);
   assert.equal(cdpAccessOk(req({ host: "attacker.test" })), false);
   assert.equal(cdpAccessOk(req({})), false, "a missing Host is not one of ours");
   assert.equal(cdpAccessOk(req({ host: SELF, origin: `http://${SELF}` })), false);
+  for (const h of ["sec-fetch-mode", "sec-fetch-site", "sec-fetch-dest", "sec-fetch-user"]) {
+    assert.equal(
+      cdpAccessOk(req({ host: SELF, [h]: "whatever" })),
+      false,
+      `${h} is written by the user agent and cannot be stripped by script — it means a browser`,
+    );
+  }
 });
 
 test("trackCdpActivity: stamps on traffic, and stays quiet without it", async () => {

@@ -1,4 +1,5 @@
 import httpProxy from "http-proxy";
+import { STATUS_CODES } from "node:http";
 import type { Request, Response } from "express";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
@@ -72,21 +73,49 @@ export function rewriteCdpJson(body: string, name: string, selfHost: string): st
 }
 
 /**
+ * Fetch Metadata: headers a user agent writes onto EVERY request it makes —
+ * every fetch in every mode, every subresource load, every navigation, every
+ * websocket handshake — and that no HTTP library sends of its own accord.
+ *
+ * They are forbidden header names, so script cannot set, spoof or strip them:
+ * if one is here, a browser put it here. That is the property `Origin` lacks.
+ */
+const FETCH_METADATA = ["sec-fetch-mode", "sec-fetch-site", "sec-fetch-dest", "sec-fetch-user"];
+
+/**
+ * Did a web browser make this request, as opposed to a program?
+ *
+ * `Origin` alone does not answer it. Fetch attaches an Origin only to
+ * CORS-tainted requests, non-GET/HEAD methods and websocket handshakes — so a
+ * `mode: 'no-cors'` GET, an `<img src>`, or a plain top-level navigation to
+ * `/cdp/<name>/json/version` arrives with no Origin at all, and "has an Origin"
+ * is therefore only *part* of "is a web page". Fetch Metadata is the half that
+ * covers the rest, and the two together are the check.
+ */
+export function fromWebPage(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (typeof origin === "string" && origin !== "") return true;
+  return FETCH_METADATA.some((h) => req.headers[h] !== undefined);
+}
+
+/**
  * May this request drive a browser over CDP?
  *
  * Three checks, and the middle one is the inverse of the VNC guard's:
  *
  *  - **Host** must be one of ours — the same DNS-rebinding guard every other
  *    surface applies (CHK-006a).
- *  - **Origin must be ABSENT.** A CDP driver is a program, and neither
- *    Playwright nor puppeteer nor a raw ws client sends an Origin; a browser
- *    always does, on every fetch and every websocket handshake. So "has an
- *    Origin at all" is precisely "is a web page", and a web page has no
- *    business on this lane — not even one served from our own dashboard
- *    origin, since allowing that would re-open a full control channel into a
- *    logged-in browser to anything that can get script onto that page. This is
- *    the only Origin check in the system: the browser's Chrome runs
- *    `--remote-allow-origins=*` (CHK-002), so it will accept anyone we forward.
+ *  - **It must not come from a web browser** (`fromWebPage`): no Origin, and no
+ *    Fetch Metadata. A CDP driver is a program, and neither Playwright nor
+ *    puppeteer nor a raw ws client sends either. A web page has no business on
+ *    this lane — not even one served from our own dashboard origin, since
+ *    allowing that would re-open a full control channel into a logged-in
+ *    browser to anything that can get script onto that page. Chrome will not
+ *    make this check for us: the browsers run `--remote-allow-origins=*`
+ *    (CHK-002), so they accept whatever we forward. Refusing the *whole* GET
+ *    surface matters as much as refusing the websocket, because reaching
+ *    `/json/*` alone provisions a browser (a fleet slot and a seeded profile
+ *    volume per name) and exposes `/json/close/<id>`.
  *  - **Bearer** when GATEWAY_TOKEN is set. Unlike noVNC — which is driven by a
  *    browser navigation that cannot carry a header — a CDP driver can:
  *    `connectOverCDP(url, { headers })` sends them on both the HTTP hop and the
@@ -94,8 +123,7 @@ export function rewriteCdpJson(body: string, name: string, selfHost: string): st
  */
 export function cdpAccessOk(req: IncomingMessage): boolean {
   if (!hostOk(req)) return false;
-  const origin = req.headers.origin;
-  if (typeof origin === "string" && origin !== "") return false;
+  if (fromWebPage(req)) return false;
   return bearerOk(req);
 }
 
@@ -254,7 +282,9 @@ function onDriverGone(socket: Duplex, release: () => void): void {
 }
 
 /**
- * Who is already driving this Browser, if anyone.
+ * Who is already driving this Browser, if anyone — asked without reference to
+ * who is doing the asking. `conflictFor` is what a request is judged against;
+ * this is for decisions about the Browser itself, like rotating its image.
  *
  * One lane at a time, per Name. MCP has enforced one session per browser since
  * issue #6; two drivers on one Chrome — one of them synthesising clicks the
@@ -268,6 +298,51 @@ export function busyWith(registry: Registry, name: string): "mcp" | "cdp" | null
   return null;
 }
 
+/** Name -> the driver currently holding the CDP lane on it. */
+const cdpHolders = new Map<string, string>();
+
+/**
+ * Which driver this request belongs to.
+ *
+ * The source address is the whole of what an HTTP hop tells us: a driver's
+ * `/json/*` fetch and its websocket are separate TCP connections with nothing
+ * in common but where they came from. So the grain is coarse — two processes
+ * on the same host look like one driver — and that is the deliberate trade.
+ * The lane exists to stop a SECOND driver stealing a Browser out from under
+ * the first; locking the first driver out of its own follow-up request (a
+ * `/json/list` mid-session, a second target socket — the chrome-remote-interface
+ * pattern) is not that, it is just a lane nobody can use twice.
+ */
+export function driverKey(req: IncomingMessage): string {
+  return req.socket?.remoteAddress ?? "unknown";
+}
+
+/**
+ * Is this Browser held by somebody OTHER than the driver making this request?
+ *
+ * MCP always conflicts — the two lanes never share a Chrome. CDP conflicts only
+ * when the holder is a different driver; an unrecorded holder (the registry
+ * says held but no key was taken) counts as different, so the refusal fails
+ * closed.
+ */
+export function conflictFor(registry: Registry, name: string, driver: string): "mcp" | "cdp" | null {
+  const busy = busyWith(registry, name);
+  if (busy === "cdp" && cdpHolders.get(name) === driver) return null;
+  return busy;
+}
+
+/** Take the lane for `driver`, or add a second socket to the one it holds. */
+function holdLane(registry: Registry, name: string, driver: string): void {
+  cdpHolders.set(name, driver);
+  registry.cdpOpened(name);
+}
+
+/** Give back one socket's share; the last one out drops the driver's claim. */
+function releaseLane(registry: Registry, name: string): void {
+  registry.cdpClosed(name);
+  if (!registry.hasCdp(name)) cdpHolders.delete(name);
+}
+
 /**
  * Ensure the Browser exists and answer with its IP.
  *
@@ -277,7 +352,7 @@ export function busyWith(registry: Registry, name: string): "mcp" | "cdp" | null
  * health probe is recreated once — at connect time nobody's session is
  * disturbed, and the profile volume survives a recreate.
  */
-async function provisionForCdp(deps: CdpDeps, name: string): Promise<string> {
+async function provisionOnce(deps: CdpDeps, name: string): Promise<string> {
   // Rotating a stale image is safe here for the same reason it is on a cold MCP
   // attach (#57): the lane refuses a connect while anyone else is driving, so
   // there is nobody to tear down.
@@ -297,6 +372,31 @@ async function provisionForCdp(deps: CdpDeps, name: string): Promise<string> {
   }
 }
 
+/** Provisions running right now, one per Name — see provisionForCdp. */
+const provisioning = new Map<string, Promise<string>>();
+
+/**
+ * Single-flight `provisionOnce`, the way the bridge shares one `attaching`
+ * promise (bridge.ts).
+ *
+ * Nothing else serialises this lane: the busy check only sees a Browser once a
+ * websocket is open, and the handshake that opens one happens first. So two
+ * `/json/version` fetches for the same cold Name both find no container, both
+ * create one, and the loser gets Docker's 409 name conflict — which is not a
+ * ProvisionError, so it would surface as a bare 500 on a lane that is plain
+ * text everywhere else. Concurrent callers share one provision instead, and
+ * both get the same IP.
+ */
+function provisionForCdp(deps: CdpDeps, name: string): Promise<string> {
+  const inFlight = provisioning.get(name);
+  if (inFlight) return inFlight;
+  const started: Promise<string> = provisionOnce(deps, name).finally(() => {
+    if (provisioning.get(name) === started) provisioning.delete(name);
+  });
+  provisioning.set(name, started);
+  return started;
+}
+
 /**
  * Express handler for `/cdp/:name/*` — the `/json/*` handshake and anything
  * else the DevTools HTTP endpoint serves.
@@ -305,7 +405,7 @@ async function provisionForCdp(deps: CdpDeps, name: string): Promise<string> {
  * what it shows a human is the status line of a failed fetch.
  */
 export function makeCdpHttpHandler(deps: CdpDeps) {
-  return function cdpHttpHandler(req: Request, res: Response, next: (e?: unknown) => void): void {
+  return function cdpHttpHandler(req: Request, res: Response): void {
     const name = req.params.name;
     if (!config.cdpLane) {
       res.status(404).type("text/plain").send("the CDP lane is disabled (CHIKIN_CDP_LANE=0)");
@@ -319,7 +419,7 @@ export function makeCdpHttpHandler(deps: CdpDeps) {
       res.status(403).type("text/plain").send("forbidden");
       return;
     }
-    const busy = busyWith(deps.registry, name);
+    const busy = conflictFor(deps.registry, name, driverKey(req));
     if (busy) {
       res
         .status(409)
@@ -347,9 +447,40 @@ export function makeCdpHttpHandler(deps: CdpDeps) {
           res.status(503).type("text/plain").send(e.message);
           return;
         }
-        next(e);
+        // Not Express's JSON backstop: a CDP client shows a human the status
+        // line of a failed fetch, and a JSON-RPC envelope in the middle of a
+        // plain-text lane tells that human nothing.
+        log.error(`cdp[${name}]: unexpected failure`, String(e));
+        if (!res.headersSent) res.status(500).type("text/plain").send("internal gateway error");
       });
   };
+}
+
+/**
+ * Turn an upgrade down in words.
+ *
+ * Express is not in this path, so nothing writes a status line unless we do —
+ * and a bare `socket.destroy()` reaches the driver as `socket hang up`, which
+ * says nothing about whether the browser is taken, the lane is off, or the
+ * request looked like it came from a web page. A refusal a human can read is
+ * worth the six lines, and an HTTP response is a legal answer to an upgrade
+ * request (RFC 9110 §15: the server simply declines to switch protocols).
+ */
+function refuseUpgrade(socket: Duplex, status: number, reason: string): void {
+  const body = `${reason}\n`;
+  // Destroyed once the refusal is on the wire, not merely half-closed: an
+  // upgrade socket is detached from its http.Server, so nothing else will ever
+  // reach it, and a client that keeps its own half open would otherwise leave
+  // this one hanging around — and `server.close()` waiting on it forever.
+  socket.end(
+    `HTTP/1.1 ${status} ${STATUS_CODES[status] ?? "Error"}\r\n` +
+      "content-type: text/plain\r\n" +
+      `content-length: ${Buffer.byteLength(body)}\r\n` +
+      "connection: close\r\n" +
+      "\r\n" +
+      body,
+    () => socket.destroy(),
+  );
 }
 
 /**
@@ -369,42 +500,82 @@ export function makeCdpUpgradeHandler(deps: CdpDeps) {
     const m = matchCdpUpgrade(req.url ?? "");
     if (!m) return false;
     const { name, rest } = m;
-    if (!config.cdpLane || !cdpAccessOk(req)) {
+    if (!config.cdpLane) {
+      refuseUpgrade(socket, 404, "the CDP lane is disabled (CHIKIN_CDP_LANE=0)");
+      return true;
+    }
+    if (!cdpAccessOk(req)) {
       log.warn(
         `cdp: rejected upgrade for '${name}' (origin='${req.headers.origin ?? ""}' host='${req.headers.host ?? ""}')`,
       );
-      socket.destroy();
+      refuseUpgrade(socket, 403, "forbidden");
       return true;
     }
-    if (busyWith(deps.registry, name) !== null) {
-      log.warn(`cdp: refused a second driver for '${name}'`);
-      socket.destroy();
+    const driver = driverKey(req);
+    const busy = conflictFor(deps.registry, name, driver);
+    if (busy !== null) {
+      log.warn(`cdp: refused a second driver for '${name}' (held over the ${busy} lane)`);
+      refuseUpgrade(
+        socket,
+        409,
+        `browser '${name}' is already being driven over the ${busy.toUpperCase()} lane`,
+      );
+      return true;
+    }
+
+    // Count the open socket as attachment so the reaper applies the attached
+    // tier (ATTACHED_IDLE_TTL_SEC) instead of reclaiming a working browser
+    // after IDLE_TTL_SEC.
+    holdLane(deps.registry, name, driver);
+    let stopSampling: (() => void) | null = null;
+    let spliced = false;
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      stopSampling?.();
+      releaseLane(deps.registry, name);
+      // Before the splice, nobody else can close this socket: http-proxy has
+      // no other end to end, and a driver that FINs leaves it half-open — a
+      // socket with nothing on it that `server.close()` then waits on forever.
+      // After the splice the proxy owns both ends, and a half-close there may
+      // still have bytes to deliver (AGENTS.md: an `end` is not a `close`).
+      if (!spliced && !socket.destroyed && !socket.writableEnded) socket.destroy();
+      log.info(`cdp[${name}]: driver disconnected`);
+    };
+    // Claimed and armed BEFORE the awaited Docker inspect below, because a
+    // driver that gives up during it (Playwright's 30s connect default, a ^C,
+    // an aborted retry) has already emitted `close` by the time that promise
+    // settles — listeners added afterwards never fire, and the Browser stays
+    // marked held by a driver that is gone: 409 on both lanes, a fleet slot
+    // spent, nothing to reap it but the attached tier hours later.
+    onDriverGone(socket, release);
+    if (socket.destroyed) {
+      release();
       return true;
     }
 
     void deps.provisioner
       .resolveIp(name)
       .then((ip) => {
-        // Count the open socket as attachment so the reaper applies the
-        // attached tier (ATTACHED_IDLE_TTL_SEC) instead of reclaiming a working
-        // browser after IDLE_TTL_SEC, and sample the socket so that tier is
-        // measured against traffic the driver actually sent.
-        deps.registry.cdpOpened(name);
-        const stopSampling = trackCdpActivity(socket as unknown as ByteCounter, () =>
+        if (released || socket.destroyed) {
+          release();
+          return;
+        }
+        // Sample the socket so the attached tier is measured against traffic
+        // the driver actually sent.
+        stopSampling = trackCdpActivity(socket as unknown as ByteCounter, () =>
           deps.registry.touchBrowserActivity(name),
         );
-        onDriverGone(socket, () => {
-          stopSampling();
-          deps.registry.cdpClosed(name);
-          log.info(`cdp[${name}]: driver disconnected`);
-        });
         log.info(`cdp[${name}]: driver attached`);
         req.url = rest;
+        spliced = true;
         proxy.ws(req, socket, head, { target: cdpTarget(ip) });
       })
       .catch((e: unknown) => {
         log.warn(`cdp[${name}]: no browser to upgrade onto`, String(e));
-        socket.destroy();
+        if (!socket.destroyed) refuseUpgrade(socket, 502, `no browser named '${name}' to upgrade onto`);
+        release();
       });
     return true;
   };

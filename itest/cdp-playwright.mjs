@@ -12,13 +12,52 @@
 // Run it against a SCRATCH gateway, not the live fleet (itest/README): it
 // provisions one real browser and removes nothing that was already there.
 
-import { chromium } from "playwright-core";
 import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 
 const BASE = process.env.BASE ?? "http://localhost:8080";
 const TOKEN = process.env.GATEWAY_TOKEN ?? "";
 const NAME = process.argv[2] ?? "inst-pwcheck";
 const ENDPOINT = `${BASE}/cdp/${NAME}/`;
+const CONTAINER = `chikin-chrome-${NAME}`;
+const VOLUME = `chikin-profile-${NAME}`;
+
+// This script ends in `docker rm -f` and `docker volume rm -f`, so it may only
+// ever be pointed at a disposable name. A chikin profile volume is disposable
+// by NAME (isInstanceName in gateway/src/config.ts, issues #58/#59): `golden`,
+// `hermes` and every named client profile hold hand-authenticated logins whose
+// only other copy is an unlabelled snapshot volume. Refuse before provisioning,
+// not before cleaning up — a sticky name has no business on this script at all.
+if (!NAME.startsWith("inst-") || NAME === "inst-") {
+  console.error(`FAIL  refusing to run against '${NAME}': this script only drives disposable inst-* names.`);
+  console.error("      It removes the browser and profile volume it creates, and a sticky profile");
+  console.error("      (golden, hermes, a named client) must never be a candidate for that.");
+  process.exit(2);
+}
+
+// playwright-core is a devDependency of the GATEWAY (itest/ has no package.json
+// of its own), and a bare specifier is resolved from this file's own directory
+// upwards — which never reaches gateway/node_modules. Resolve from there
+// explicitly, and after the name guard above, so a refusal never depends on a
+// module being installed.
+const fromGateway = createRequire(new URL("../gateway/", import.meta.url));
+const { chromium } = fromGateway("playwright-core");
+
+const docker = (args) => {
+  try {
+    execFileSync("docker", args, { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// Remove only what this run made. An inst-* name the operator is already using
+// for something else is still somebody's browser.
+const preexisting = {
+  container: docker(["container", "inspect", CONTAINER]),
+  volume: docker(["volume", "inspect", VOLUME]),
+};
 
 let failures = 0;
 const check = (label, ok, detail = "") => {
@@ -94,12 +133,17 @@ check(
   "dashboard still shows a CDP driver attached",
 );
 
-// Leave the fleet as we found it.
-try {
-  execFileSync("docker", ["rm", "-f", `chikin-chrome-${NAME}`], { stdio: "ignore" });
-  execFileSync("docker", ["volume", "rm", "-f", `chikin-profile-${NAME}`], { stdio: "ignore" });
-} catch {
-  console.log(`note: could not clean up chikin-chrome-${NAME}; remove it by hand`);
+// Leave the fleet as we found it — which means removing what this run created
+// and nothing else.
+for (const [what, args, ours] of [
+  [CONTAINER, ["rm", "-f", CONTAINER], !preexisting.container],
+  [VOLUME, ["volume", "rm", "-f", VOLUME], !preexisting.volume],
+]) {
+  if (!ours) {
+    console.log(`note: ${what} was already here before this run — leaving it alone`);
+    continue;
+  }
+  if (!docker(args)) console.log(`note: could not remove ${what}; remove it by hand`);
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
