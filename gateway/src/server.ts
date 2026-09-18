@@ -227,7 +227,7 @@ export function createApp(deps: ServerDeps): express.Express {
     // that moves for reasons neither driver can account for.
     const cdpRefusal = () =>
       rpcError(RPC.BUSY, `browser '${name}' is being driven over the CDP lane`);
-    if (deps.registry.hasCdp(name)) {
+    if (deps.registry.heldByCdp(name)) {
       res.status(409).json(cdpRefusal());
       return;
     }
@@ -252,7 +252,7 @@ export function createApp(deps: ServerDeps): express.Express {
       // holding its websocket URL from an earlier handshake can take it. The
       // exclusion has to be re-asserted here; `reserve` itself knows only about
       // MCP sessions.
-      if (deps.registry.hasCdp(name)) {
+      if (deps.registry.heldByCdp(name)) {
         res.status(409).json(cdpRefusal());
         return;
       }

@@ -141,10 +141,12 @@ export const config = {
 
   // The CDP lane (#87): `/cdp/<name>/`, where Playwright and anything else that
   // speaks the DevTools Protocol drive a Browser with no MCP in the path. On by
-  // default — it is guarded exactly as the MCP endpoint is (Host, bearer, and
-  // an Origin rule strictly stricter than the dashboard's), and a gateway
-  // nobody drives that way is not harmed by the route existing. Set
-  // CHIKIN_CDP_LANE=0 to serve 404 there and leave raw CDP unreachable.
+  // default — Host-guarded and bearer-gated like the MCP endpoint, and on top
+  // of that it refuses anything a web browser sent: any request carrying an
+  // Origin OR any Sec-Fetch-* header, since a no-cors GET or a navigation
+  // carries no Origin at all. A gateway nobody drives that way is not harmed by
+  // the route existing. Set CHIKIN_CDP_LANE=0 to serve 404 there and leave raw
+  // CDP unreachable.
   cdpLane: bool("CHIKIN_CDP_LANE", true),
 
   // The per-browser MCP engine. One child process per browser, connecting to

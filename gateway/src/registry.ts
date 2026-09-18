@@ -284,6 +284,41 @@ export class Registry {
     return (this.activity.get(name)?.cdp ?? 0) > 0;
   }
 
+  /**
+   * CDP handshakes taking this Name right now — the claim that makes the lane
+   * exclusion (#87) true from the FIRST request instead of from the first
+   * websocket. A cold `/json/*` hop provisions a container before any socket
+   * exists, and that provision runs for as long as PROVISION_TIMEOUT_SEC.
+   *
+   * Deliberately not `Activity.cdp`: that counts open driver sockets and feeds
+   * the reaper's attached tier and the dashboard, and a handshake in flight is
+   * not a driver attached. Counted rather than a flag because two handshakes
+   * for one cold Name legitimately overlap (they share a single provision), so
+   * the Name is free again only when the last of them is done.
+   */
+  private cdpClaims = new Map<string, number>();
+
+  /** Claim a Name for a CDP handshake. Always balance with `unclaimCdp`. */
+  claimCdp(name: string): void {
+    this.cdpClaims.set(name, (this.cdpClaims.get(name) ?? 0) + 1);
+  }
+
+  unclaimCdp(name: string): void {
+    const n = this.cdpClaims.get(name);
+    if (n === undefined) return;
+    if (n > 1) this.cdpClaims.set(name, n - 1);
+    else this.cdpClaims.delete(name);
+  }
+
+  /**
+   * Is the CDP lane holding this Name at all — a driver's open socket, or a
+   * handshake on its way to one? This, not `hasCdp`, is the question the MCP
+   * side has to ask before claiming a Name for a session.
+   */
+  heldByCdp(name: string): boolean {
+    return this.hasCdp(name) || this.cdpClaims.has(name);
+  }
+
   /** A nav verification disagreed with the browser (suspicion, not action). */
   noteNavStrike(name: string, now: number = Date.now()): void {
     this.ensureActivity(name, now).navStrikes += 1;

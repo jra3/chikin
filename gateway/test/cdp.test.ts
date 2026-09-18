@@ -117,6 +117,9 @@ function stubProvisioner() {
   // Names whose container has vanished from under a driver — the wedge/reap
   // case the lane has to answer honestly instead of quietly rebuilding.
   const gone = new Set<string>();
+  // Names Docker refuses outright, for the exits a cold handshake can take
+  // that are neither a 200 nor a browser somebody is already driving.
+  const broken = new Set<string>();
   const wait = async (name: string): Promise<void> => {
     const ms = slow.get(name);
     if (ms) await new Promise((r) => setTimeout(r, ms));
@@ -125,6 +128,7 @@ function stubProvisioner() {
     ensureContainer: async (name: string) => {
       ensured.push(name);
       await wait(name);
+      if (broken.has(name)) throw new Error("the docker daemon is not answering");
       return "127.0.0.1";
     },
     resolveIp: async (name: string) => {
@@ -135,11 +139,11 @@ function stubProvisioner() {
     recreateContainer: async () => {},
     listFleet: async () => [],
   };
-  return { provisioner, ensured, slow, gone };
+  return { provisioner, ensured, slow, gone, broken };
 }
 
 const registry = new Registry();
-const { provisioner, ensured, slow, gone } = stubProvisioner();
+const { provisioner, ensured, slow, gone, broken } = stubProvisioner();
 const chrome = fakeChrome();
 const deps = { registry, provisioner: provisioner as never };
 const gateway = http.createServer(createApp(deps));
@@ -601,6 +605,45 @@ test("two handshakes for one cold browser share a single provision", async () =>
     );
   } finally {
     slow.delete("pw-race");
+  }
+});
+
+test("the handshake takes the Name for the whole provision, not just from the websocket", async () => {
+  // A cold provision runs for seconds, up to PROVISION_TIMEOUT_SEC, and no
+  // websocket exists for any of it. An MCP initialize landing in that window
+  // used to be accepted, and its own lazy attach then raced the handshake for
+  // the same container name — Docker's 409 name conflict, which neither lane
+  // classifies as a ProvisionError.
+  slow.set("pw-claim", 300);
+  try {
+    const handshake = get("/cdp/pw-claim/json/version");
+    await waitFor(() => registry.heldByCdp("pw-claim"));
+    const init = await initialize("pw-claim");
+    assert.equal(init.status, 409, "the Name is spoken for from the first request, not the first socket");
+    assert.match(init.body, /CDP lane/);
+    assert.equal((await handshake).status, 200);
+
+    // And the claim is scoped to the request: a handshake that never comes back
+    // to open a websocket must leave the Name usable by both lanes again.
+    await waitFor(() => !registry.heldByCdp("pw-claim"));
+    assert.equal(registry.heldByCdp("pw-claim"), false);
+  } finally {
+    slow.delete("pw-claim");
+  }
+});
+
+test("a handshake that cannot provision hands the Name back", async () => {
+  // The exit that matters most: a claim held past a failure would leave the
+  // Name answering 409 on BOTH lanes forever, which is worse than the race it
+  // was taken to close.
+  broken.add("pw-broken");
+  try {
+    const res = await get("/cdp/pw-broken/json/version");
+    assert.equal(res.status, 500);
+    await waitFor(() => !registry.heldByCdp("pw-broken"));
+    assert.equal(registry.heldByCdp("pw-broken"), false, "a dead cold handshake must not strand the Name");
+  } finally {
+    broken.delete("pw-broken");
   }
 });
 

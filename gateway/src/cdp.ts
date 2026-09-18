@@ -449,6 +449,24 @@ export function makeCdpHttpHandler(deps: CdpDeps) {
         .send(`browser '${name}' is already being driven over the ${busy.toUpperCase()} lane`);
       return;
     }
+    // The lane exclusion has to hold from the FIRST request, not from the first
+    // websocket. A cold handshake provisions a container before any socket
+    // exists — seconds, up to PROVISION_TIMEOUT_SEC — and for all of it the MCP
+    // side would read this Name as free, open a session on it, and then have
+    // its own lazy attach race Docker for the same container name. Scoped to
+    // this request and given back on whichever of `finish`/`close` comes first,
+    // so a handshake that fails, or that never comes back to open a websocket,
+    // cannot leave the Name refusing both lanes forever.
+    deps.registry.claimCdp(name);
+    let claimed = true;
+    const unclaim = (): void => {
+      if (!claimed) return;
+      claimed = false;
+      deps.registry.unclaimCdp(name);
+    };
+    res.on("finish", unclaim);
+    res.on("close", unclaim);
+
     // Laziness is for the FIRST request on an unheld Name (#63) — that is what
     // it is for. Once this driver holds the lane it has a websocket spliced to
     // a running container, and every provision ends in `waitHealthy`: a browser
