@@ -486,7 +486,7 @@ the exact command to use if the selected images aren't runnable; `bin/chikin-up`
 Independently, the gateway now *pulls* a missing registry image at startup rather
 than dying, so the plain `docker compose up -d` path self-heals where it can.
 
-The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTransport` facing clients, `StdioClientTransport` to each `chrome-devtools-mcp` child) with `dockerode` for provisioning and `http-proxy` for the noVNC and CDP reverse proxies. See `gateway/src/` — `server.ts` (routing/auth), `provisioner.ts` (Docker lifecycle), `bridge.ts` (MCP↔stdio pump), `cdp.ts` (the CDP lane), `reaper.ts` (idle reclaim).
+The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTransport` facing clients, `StdioClientTransport` to each `chrome-devtools-mcp` child) with `dockerode` for provisioning and `http-proxy` for the noVNC and CDP reverse proxies. See `gateway/src/` — `server.ts` (routing/auth), `provisioner.ts` (Docker lifecycle), `bridge.ts` (MCP↔stdio pump), `cdp.ts` (the CDP lane), `reaper.ts` (idle reclaim). Why the CDP lane is a proxy through the gateway's one published port rather than a published `:9222` per container is [ADR 0005](docs/adr/0005-proxy-raw-cdp-through-the-gateway.md).
 
 ## Troubleshooting
 

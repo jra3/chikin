@@ -22,7 +22,7 @@ import type { Registry } from "./registry.js";
  * and publishing it per container would hand every local process an
  * unauthenticated browser logged in as the operator. Routing it through the
  * gateway keeps ONE published port, and the lane inherits the guards that port
- * already has.
+ * already has. The decision and the options it beat are docs/adr/0005.
  *
  * The lane provisions exactly like the MCP one — lazily, on the first request
  * (#63), from the golden Seed Volume — so a Playwright script gets the same

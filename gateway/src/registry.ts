@@ -2,7 +2,10 @@ import { Session } from "./session.js";
 
 /** Per-name browser activity, used by the reaper. Outlives any single session. */
 export interface Activity {
-  /** epoch ms of the last MCP frame or stream close for this browser. */
+  /**
+   * epoch ms of the last MCP frame or stream close for this browser, or, on
+   * the CDP lane, of a driver's socket opening, closing or sending commands.
+   */
   last: number;
   /** open server->client SSE streams right now. >0 means a client is attached. */
   streams: number;
@@ -17,8 +20,10 @@ export interface Activity {
    */
   cdp: number;
   /**
-   * epoch ms of the last frame that actually drove the BROWSER — a `tools/call`
-   * the gate forwarded to chrome-devtools-mcp (bridge.ts).
+   * epoch ms of the last traffic that actually drove the BROWSER: a `tools/call`
+   * the gate forwarded to chrome-devtools-mcp (bridge.ts), or on the CDP lane a
+   * driver taking the browser and then the commands its socket carries, sampled
+   * from `bytesRead` rather than stamped on a timer (cdp.ts).
    *
    * Deliberately separate from `last`, which measures MCP protocol traffic and
    * is therefore useless as an activity signal for an attached client: the
@@ -235,10 +240,14 @@ export class Registry {
   }
 
   /**
-   * Stamp REAL browser work (a forwarded `tools/call`). Also refreshes `last`,
-   * since a tool call is protocol traffic too. Called from exactly one place —
-   * the bridge's client pump, on `classifyClientFrame(...) === "forward"` — so
-   * that pings and gateway-owned tools can never move this clock (issue #57).
+   * Stamp REAL browser work. Also refreshes `last`, since browser work is
+   * protocol traffic too.
+   *
+   * Every caller has to have watched the browser move, never a clock: the
+   * bridge's client pump on `classifyClientFrame(...) === "forward"`, so pings
+   * and gateway-owned tools cannot move it (issue #57), and the CDP lane on a
+   * driver taking the browser and on its socket's byte counter advancing
+   * (cdp.ts). A caller that stamps on a schedule re-creates #57.
    */
   touchBrowserActivity(name: string, now: number = Date.now()): void {
     const a = this.ensureActivity(name, now);
