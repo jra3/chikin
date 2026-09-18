@@ -191,6 +191,39 @@ node client/keepalive.mjs http://localhost:8080/b/golden/   # ^C when you're don
 
 From then on **every new browser is cloned from the seed and starts logged in** — and the MCP automation sees those cookies (it shares the persistent profile context). Re-run `chikin-snapshot` whenever sessions expire. It works because every container uses Chrome's keyring-less `basic` cookie store, so the encryption key travels in the copied `Local State` and decrypts in the clones. Caveat: all seeded browsers share one identity, so sites that forbid concurrent sessions may re-challenge.
 
+### Drive a browser with Playwright (the CDP lane)
+
+Not everything that wants a logged-in browser is an MCP client. `/cdp/<name>/` hands the raw DevTools Protocol to Playwright, puppeteer, or anything else that speaks it — same fleet, same lazy provisioning, same golden seed, no MCP in the path.
+
+```js
+import { chromium } from 'playwright-core';
+
+const browser = await chromium.connectOverCDP('http://127.0.0.1:8080/cdp/giard-scrape/', {
+  timeout: 120_000,                       // a cold browser takes up to PROVISION_TIMEOUT_SEC
+  // headers: { Authorization: `Bearer ${process.env.GATEWAY_TOKEN}` },   // if you set one
+});
+const context = browser.contexts()[0];    // ← the golden profile. NOT newContext()
+const page = await context.newPage();
+await page.goto('https://www.ancestry.com/');
+```
+
+```python
+# Python reaches the same endpoint
+browser = playwright.chromium.connect_over_cdp("http://127.0.0.1:8080/cdp/giard-scrape/", timeout=120_000)
+context = browser.contexts[0]
+```
+
+The first request provisions `chikin-chrome-giard-scrape` from `SEED_VOLUME`, exactly as a browser tool call does on the MCP side, and it counts against `MAX_FLEET` like any other browser. `bin/chikin-pw <name>` warms it first and prints the endpoint, which is the easy way to keep a cold start out of your script's connect timeout.
+
+Things worth knowing before your first run:
+
+- **`browser.contexts()[0]`, never `browser.newContext()`.** The logins live in the browser's persistent profile, which Playwright sees as the *default* context. A fresh context is a fresh, logged-out one.
+- **One driver at a time.** A browser being driven over CDP refuses an MCP session and vice versa, both with a 409. Want two? Use two names — each gets its own clone of the seed.
+- **These browsers are headful**, under Xvfb, which is the whole anti-detection point. So noVNC works while your script runs: open `http://localhost:8080/vnc/<name>/` to watch it, or to clear a CAPTCHA by hand mid-run.
+- **The lane is guarded** by the same Host check as everything else, by `GATEWAY_TOKEN` when you set one, and by refusing any request that carries an `Origin` header — a driver never sends one and a web page always does.
+- **Downloads land in the container**, at `/tmp/chikin-shared/<name>` on the host (see below); `download.path()` is not available over CDP. For uploads, pass `setInputFiles` a `{name, mimeType, buffer}` rather than a host path.
+- An idle driver is still reaped: an open CDP socket counts as attached, and the attached tier is measured against traffic your driver actually sends (`ATTACHED_IDLE_TTL_SEC`).
+
 ### Scratch files (per-browser)
 
 Each browser `<name>` gets its own host directory `/tmp/chikin-shared/<name>`, mounted **only** into that browser as `~/Downloads` (and at the same `/tmp/chikin-shared/<name>` path, which is what `upload_file` expects). Drop upload files under the per-name dir; downloads triggered in that browser land back there. Scratch files are **not** shared across clients — each browser sees only its own subdir (M2 / CHK-007); cookies/profile are per-name isolated too.
@@ -283,6 +316,7 @@ Set in `.env` (see `.env.example`) or the environment.
 | `IDLE_TTL_SEC` | `900` | Idle seconds before a **detached** browser (no attached client stream) is reaped. Measured against any MCP traffic. |
 | `ATTACHED_IDLE_TTL_SEC` | `14400` | Seconds an **attached** browser may go with no real browser tool call before it is reclaimed anyway. Measured against actual forwarded `tools/call`s — *not* the client bridge's keepalive ping, which by design keeps the plain idle clock fresh — and shown as the dashboard's `browser idle` column. Without this, a window that made one browser tool call and then went idle holds that fleet slot for its whole lifetime and the fleet saturates with browsers parked on `about:blank`. Eviction is survivable: the bridge reconnects transparently, though a disposable `inst-*` browser's profile is discarded with it (logged explicitly). `0` = never reap an attached browser (pre-#57 behaviour). Keep it well above `IDLE_TTL_SEC`. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
+| `CHIKIN_CDP_LANE` | `1` | Serve the [CDP lane](#drive-a-browser-with-playwright-the-cdp-lane) at `/cdp/<name>/` — Playwright, puppeteer and other DevTools-protocol clients, with no MCP in the path. Same lazy provisioning, same golden seed, same `MAX_FLEET`. `0` answers 404 there and leaves the browsers' CDP reachable only through the MCP endpoint. |
 | `CHIKIN_VOLUME_GC` | `1` | Sweep orphaned `chikin-profile-inst-*` volumes (disposable profiles whose container is gone) once at startup. Scoped by name — `golden`, `hermes` and named client profiles are never candidates. `0` disables. See [Profile volumes](#profile-volumes-and-cleaning-them-up). |
 | `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up. Nothing is provisioned when a client connects, so this bounds the **first browser tool call** — overrunning it fails that one call as a retryable tool error ("chikin could not start a browser"), leaving the session up with every tool registered. |
 | `WINDOW_SIZE` | `1920,1080` | Chrome window / Xvfb screen size for provisioned browsers. |

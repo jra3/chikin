@@ -577,8 +577,17 @@ export class Provisioner {
     return "unknown";
   }
 
-  /** The container's IP on the control network (used for CDP by IP). */
-  private async resolveIp(name: string): Promise<string> {
+  /**
+   * The container's IP on the browser data plane, which is how anything reaches
+   * its CDP endpoint: Chrome refuses a Host header that is not an IP or
+   * `localhost`, so the `<container>.<network>` DNS form the noVNC proxy uses
+   * is not an option here.
+   *
+   * Public because the CDP lane's websocket upgrade needs it without
+   * provisioning (#87) — the handshake that handed the driver that URL already
+   * ensured the container. Throws `ProvisionError` if the browser is gone.
+   */
+  async resolveIp(name: string): Promise<string> {
     const info = await this.docker.getContainer(containerName(name)).inspect();
     const ip = info.NetworkSettings.Networks?.[config.network]?.IPAddress;
     if (!ip) {

@@ -118,6 +118,13 @@ services:
       # passes a pageId, and the gateway cannot supply one (see README).
       CDM_EXTRA_ARGS: "${CDM_EXTRA_ARGS:-}"
       NAV_VERIFY_DELAY_MS: "${NAV_VERIFY_DELAY_MS:-2500}"
+      # The CDP lane (#87): /cdp/<name>/, where Playwright, puppeteer and any
+      # other DevTools-protocol client drive a browser directly, with no MCP in
+      # the path. On by default — it is Host-guarded, bearer-gated (a CDP client
+      # can attach headers, unlike a noVNC navigation) and refuses any request
+      # carrying an Origin. 0 serves 404 there, leaving the browsers' CDP
+      # reachable only through the MCP endpoint.
+      CHIKIN_CDP_LANE: "${CHIKIN_CDP_LANE:-1}"
       CHROME_IMAGE: "ghcr.io/jra3/chikin:${CHIKIN_VERSION:-sha-e1b3e92}"
       # Golden-profile seed volume. Empty = off; set to chikin-seed and populate
       # it with bin/chikin-snapshot to have new browsers start logged in.

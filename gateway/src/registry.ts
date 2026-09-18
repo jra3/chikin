@@ -7,6 +7,16 @@ export interface Activity {
   /** open server->client SSE streams right now. >0 means a client is attached. */
   streams: number;
   /**
+   * Open CDP websockets right now — the non-MCP lane (#87). Counted apart from
+   * `streams` because it is a different protocol on a different route, but it
+   * means the same thing to the reaper: somebody is holding this browser. A CDP
+   * socket's lifetime is its driver's process, so unlike an MCP stream it is a
+   * strong signal — and the attached tier is still measured against
+   * `lastBrowserActivity`, sampled from that socket's own traffic, so a driver
+   * that connected and wandered off ages out like anything else.
+   */
+  cdp: number;
+  /**
    * epoch ms of the last frame that actually drove the BROWSER — a `tools/call`
    * the gate forwarded to chrome-devtools-mcp (bridge.ts).
    *
@@ -198,7 +208,14 @@ export class Registry {
   // --- activity -------------------------------------------------------------
 
   private newActivity(now: number): Activity {
-    return { last: now, streams: 0, lastBrowserActivity: now, navStrikes: 0, childRespawns: 0 };
+    return {
+      last: now,
+      streams: 0,
+      cdp: 0,
+      lastBrowserActivity: now,
+      navStrikes: 0,
+      childRespawns: 0,
+    };
   }
 
   /**
@@ -240,6 +257,31 @@ export class Registry {
     if (!a) return;
     a.streams = Math.max(0, a.streams - 1);
     a.last = now;
+  }
+
+  /**
+   * A CDP driver attached (#87). Stamps browser activity as well as `last`: the
+   * websocket opening IS the driver taking the browser, and the sampler that
+   * keeps that clock fresh afterwards has nothing to report until the first
+   * command arrives.
+   */
+  cdpOpened(name: string, now: number = Date.now()): void {
+    const a = this.ensureActivity(name, now);
+    a.cdp += 1;
+    a.last = now;
+    a.lastBrowserActivity = now;
+  }
+
+  cdpClosed(name: string, now: number = Date.now()): void {
+    const a = this.activity.get(name);
+    if (!a) return;
+    a.cdp = Math.max(0, a.cdp - 1);
+    a.last = now;
+  }
+
+  /** Is a CDP driver holding this browser right now? */
+  hasCdp(name: string): boolean {
+    return (this.activity.get(name)?.cdp ?? 0) > 0;
   }
 
   /** A nav verification disagreed with the browser (suspicion, not action). */

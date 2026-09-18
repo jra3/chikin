@@ -118,7 +118,7 @@ export class Reaper {
       // that very volume; the TTL is what stops a just-started session from
       // being raced. `isPending` re-checks the same thing inside the create gate.
       if (containers && !containers.has(name)) {
-        if (this.registry.getByName(name) || a.streams > 0) continue;
+        if (this.registry.getByName(name) || a.streams > 0 || a.cdp > 0) continue;
         if (now - a.last <= config.idleTtlMs) continue;
         try {
           const discarded = await this.provisioner.removeInstanceVolume(
@@ -144,16 +144,30 @@ export class Reaper {
       // that tier is measured against real browser work, because `a.last` is
       // refreshed by the client bridge's keepalive ping every ~120s and so can
       // never age out on an attached session.
-      const attached = a.streams > 0;
+      //
+      // An open CDP websocket counts as attachment too (#87). It is the same
+      // question — is anybody holding this browser? — and the same answer
+      // serves: the tier is measured against `lastBrowserActivity`, which that
+      // lane samples from the driver's own socket traffic rather than stamping
+      // on a timer, so a driver that connected and went quiet still ages out.
+      const attached = a.streams > 0 || a.cdp > 0;
       let why: string;
       if (attached) {
         if (config.attachedIdleTtlMs <= 0) continue; // escape hatch: never reap attached
         if (now - a.lastBrowserActivity <= config.attachedIdleTtlMs) continue;
         const workIdleSec = Math.round((now - a.lastBrowserActivity) / 1000);
+        // Say which lane is losing its browser, because the two recover
+        // differently: an MCP client rebuilds its transport and replays
+        // initialize, while a CDP driver's websocket simply dies under it and
+        // its script sees the failure. Both are deliberate; only one is quiet.
+        const holder =
+          a.cdp > 0
+            ? "a CDP driver is still attached — its websocket dies with the container"
+            : "a client stream is still open — it reconnects transparently";
         why =
-          `evicting ATTACHED ${name}: no browser tool call for ${workIdleSec}s ` +
+          `evicting ATTACHED ${name}: no browser work for ${workIdleSec}s ` +
           `(> ATTACHED_IDLE_TTL_SEC=${Math.round(config.attachedIdleTtlMs / 1000)}s), ` +
-          `a client stream is still open — it reconnects transparently`;
+          holder;
       } else {
         if (now - a.last <= config.idleTtlMs) continue;
         why = `reclaiming ${name} (idle ${Math.round((now - a.last) / 1000)}s, no open stream)`;

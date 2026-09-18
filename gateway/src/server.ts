@@ -1,5 +1,4 @@
 import express, { type Request, type Response, type NextFunction } from "express";
-import { timingSafeEqual } from "node:crypto";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { config } from "./config.js";
 import { log } from "./log.js";
@@ -11,6 +10,8 @@ import { createSession } from "./bridge.js";
 import { renderDashboard } from "./dashboard.js";
 import { runtimeConfig, configWarnings } from "./runtime.js";
 import { makeVncHttpHandler, vncUpgradeHandler, hostOk } from "./vnc.js";
+import { makeCdpHttpHandler, makeCdpUpgradeHandler } from "./cdp.js";
+import { bearerOk } from "./auth.js";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
@@ -19,27 +20,16 @@ export interface ServerDeps {
   provisioner: Provisioner;
 }
 
-function tokenOk(provided: string): boolean {
-  if (!config.token) return true; // auth disabled (dev only)
-  const a = Buffer.from(provided);
-  const b = Buffer.from(config.token);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
 function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   // Empty token => auth disabled: accept requests with no Authorization header
   // at all (loopback-trusted). With a token set, a valid Bearer is required.
-  if (!config.token) {
+  // The check itself lives in auth.ts because the CDP lane's websocket upgrade
+  // needs the same one on a path Express never sees.
+  if (bearerOk(req)) {
     next();
     return;
   }
-  const header = req.header("authorization") ?? "";
-  const m = header.match(/^Bearer\s+(.+)$/i);
-  if (!m || !tokenOk(m[1])) {
-    res.status(401).json(rpcError(RPC.UNAUTHORIZED, "missing or invalid bearer token"));
-    return;
-  }
-  next();
+  res.status(401).json(rpcError(RPC.UNAUTHORIZED, "missing or invalid bearer token"));
 }
 
 function nameMiddleware(req: Request, res: Response, next: NextFunction): void {
@@ -188,6 +178,14 @@ export function createApp(deps: ServerDeps): express.Express {
   // requests under /vnc/<name>/ are forwarded. Origin/Host-guarded in vnc.ts.
   app.use("/vnc/:name", makeVncHttpHandler(deps.registry));
 
+  // CDP lane (#87): raw DevTools Protocol for Playwright and friends, with no
+  // MCP in the path. A catch-all for the same reason — everything under
+  // /cdp/<name>/ belongs to the browser's own DevTools endpoint. Its guards are
+  // NOT this router's middleware: the websocket upgrade below bypasses Express
+  // entirely, so both paths call the one `cdpAccessOk` inside cdp.ts rather
+  // than growing a second spelling of the same rule.
+  app.use("/cdp/:name", makeCdpHttpHandler(deps));
+
   // MCP endpoint, one logical browser per <name>. Bearer-protected.
   const b = express.Router({ mergeParams: true });
 
@@ -220,6 +218,17 @@ export function createApp(deps: ServerDeps): express.Express {
       res
         .status(400)
         .json(rpcError(RPC.INVALID_REQUEST, "missing mcp-session-id (expected an initialize request)"));
+      return;
+    }
+
+    // One lane at a time (#87). A CDP driver holding this browser is not a
+    // stale session to reclaim — it is a live process on another protocol, and
+    // handing the same Chrome to chrome-devtools-mcp as well produces a browser
+    // that moves for reasons neither driver can account for.
+    if (deps.registry.hasCdp(name)) {
+      res
+        .status(409)
+        .json(rpcError(RPC.BUSY, `browser '${name}' is being driven over the CDP lane`));
       return;
     }
 
@@ -319,11 +328,15 @@ export function createApp(deps: ServerDeps): express.Express {
   return app;
 }
 
-/** Handle raw HTTP upgrades: only the /vnc/<name>/ websocket is permitted. */
-export function makeUpgradeHandler() {
+/**
+ * Handle raw HTTP upgrades: the /vnc/<name>/ websocket and the CDP lane's
+ * /cdp/<name>/devtools/... socket. Anything else is dropped.
+ */
+export function makeUpgradeHandler(deps: ServerDeps) {
+  const cdpUpgradeHandler = makeCdpUpgradeHandler(deps);
   return (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
-    if (!vncUpgradeHandler(req, socket, head)) {
-      socket.destroy();
-    }
+    if (cdpUpgradeHandler(req, socket, head)) return;
+    if (vncUpgradeHandler(req, socket, head)) return;
+    socket.destroy();
   };
 }

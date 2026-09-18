@@ -42,16 +42,27 @@ function ageCell(ms: number | null, flagged = false): string {
  * said it was doing as the tooltip. Per session, and independent of the sticky
  * browser name.
  */
-function handleCell(session: { handle?: string; handleDescription?: string } | undefined): string {
-  return session?.handle
-    ? `<td><code title="${esc(session.handleDescription ?? "")}">${esc(session.handle)}</code></td>`
-    : `<td class="dash">—</td>`;
+function handleCell(
+  session: { handle?: string; handleDescription?: string } | undefined,
+  act?: { cdp: number },
+): string {
+  if (session?.handle) {
+    return `<td><code title="${esc(session.handleDescription ?? "")}">${esc(session.handle)}</code></td>`;
+  }
+  // A CDP driver holds no session and so claims no chikin_identify handle, but
+  // it is emphatically driving this browser — an empty cell would read as
+  // "nobody is using it", the one thing it does not mean (#87).
+  if (act && act.cdp > 0) {
+    return `<td><code title="driven over the CDP lane — Playwright, puppeteer, or another DevTools client">cdp</code></td>`;
+  }
+  return `<td class="dash">—</td>`;
 }
 
-/** Whether a client currently holds an open SSE stream for this name. */
-function attachedCell(streams: number | undefined): string {
-  if (streams === undefined) return `<td class="dash">—</td>`;
-  return streams > 0 ? `<td>yes</td>` : `<td class="soft">no</td>`;
+/** Whether anybody holds this browser right now: an MCP stream or a CDP socket. */
+function attachedCell(act: { streams: number; cdp: number } | undefined): string {
+  if (act === undefined) return `<td class="dash">—</td>`;
+  if (act.cdp > 0) return `<td>yes (cdp)</td>`;
+  return act.streams > 0 ? `<td>yes</td>` : `<td class="soft">no</td>`;
 }
 
 /**
@@ -126,6 +137,10 @@ function configPanel(): string {
         : "0 (attached browsers are never reaped)",
     ],
     ["CHIKIN_VOLUME_GC", rc.volumeGc ? "on (orphaned inst-* volumes swept at startup)" : "off"],
+    [
+      "CHIKIN_CDP_LANE",
+      rc.cdpLane ? "on (/cdp/<name>/ — Playwright and other CDP drivers)" : "off (/cdp/ answers 404)",
+    ],
     ["WINDOW_SIZE", rc.windowSize],
     ["SHARED_DIR", rc.sharedDir],
     ["CHIKIN_NETWORK", rc.network],
@@ -164,7 +179,7 @@ function browserRow(
   const workIdleMs = act ? now - act.lastBrowserActivity : 0;
   const overAttachedTtl =
     !!act &&
-    act.streams > 0 &&
+    (act.streams > 0 || act.cdp > 0) &&
     config.attachedIdleTtlMs > 0 &&
     workIdleMs > config.attachedIdleTtlMs;
   const name = esc(m.name);
@@ -174,12 +189,12 @@ function browserRow(
   const running = m.state === "running";
   return `<tr>
     <td class="pin-l"><code class="nm">${name}</code></td>
-    ${handleCell(session)}
+    ${handleCell(session, act)}
     <td class="grp"><span class="pill ${running ? "ok" : "bad"}">${esc(m.state)}</span></td>
     <td class="soft status" title="${esc(m.status)}">${esc(m.status)}</td>
     ${sandboxCell(sandbox)}
     <td class="grp">${session ? `<span class="pill ok nodot">live</span>` : `<span class="dash">—</span>`}</td>
-    ${attachedCell(act?.streams)}
+    ${attachedCell(act)}
     ${ageCell(act ? now - act.last : null)}
     ${ageCell(act ? workIdleMs : null, overAttachedTtl)}
     ${countCell(act?.navStrikes, "grp")}
@@ -208,8 +223,8 @@ function sessionRow(name: string, registry: Registry, now: number): string {
   const act = registry.getActivity(name);
   return `<tr class="noslot">
     <td><code class="nm">${esc(name)}</code></td>
-    ${handleCell(session)}
-    ${attachedCell(act?.streams)}
+    ${handleCell(session, act)}
+    ${attachedCell(act)}
     ${ageCell(act ? now - act.last : null)}
     ${countCell(act?.navStrikes)}
     ${countCell(act?.childRespawns)}

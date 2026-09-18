@@ -139,6 +139,14 @@ export const config = {
   cdpPort: int("CHROME_CDP_PORT", 9222),
   vncPort: int("CHROME_VNC_PORT", 6080),
 
+  // The CDP lane (#87): `/cdp/<name>/`, where Playwright and anything else that
+  // speaks the DevTools Protocol drive a Browser with no MCP in the path. On by
+  // default — it is guarded exactly as the MCP endpoint is (Host, bearer, and
+  // an Origin rule strictly stricter than the dashboard's), and a gateway
+  // nobody drives that way is not harmed by the route existing. Set
+  // CHIKIN_CDP_LANE=0 to serve 404 there and leave raw CDP unreachable.
+  cdpLane: bool("CHIKIN_CDP_LANE", true),
+
   // The per-browser MCP engine. One child process per browser, connecting to
   // the container's CDP endpoint over the internal network.
   cdmCommand: str("CDM_COMMAND", "/app/node_modules/.bin/chrome-devtools-mcp"),
