@@ -58,7 +58,8 @@ if [ -n "$TOKEN" ]; then
 fi
 
 # The provision happens inside this request, so allow the gateway's own timeout
-# plus slack. No Origin header — the lane refuses any request that carries one.
+# plus slack. curl sends neither an Origin nor a Sec-Fetch-* header, which is
+# what the lane requires: it refuses anything a web browser sent.
 body="$(curl -sS --max-time 150 -w '\n%{http_code}' "${auth[@]}" "${ENDPOINT}json/version" || true)"
 code="$(printf '%s' "$body" | tail -n1)"
 payload="$(printf '%s' "$body" | sed '$d')"
