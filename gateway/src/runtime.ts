@@ -33,6 +33,12 @@ export interface RuntimeConfig {
   attachedIdleTtlSec: number;
   /** Whether the startup sweep reclaims orphaned chikin-profile-inst-* volumes. */
   volumeGc: boolean;
+  /**
+   * Whether `/cdp/<name>/` serves the CDP lane (#87). Worth reporting because a
+   * disabled lane answers 404, which a driver reads as a wrong URL rather than
+   * as a gateway that was told not to offer it.
+   */
+  cdpLane: boolean;
   network: string;
   egressNetwork: string;
   sharedDir: string;
@@ -54,6 +60,7 @@ export function runtimeConfig(): RuntimeConfig {
     idleTtlSec: Math.round(config.idleTtlMs / 1000),
     attachedIdleTtlSec: Math.round(config.attachedIdleTtlMs / 1000),
     volumeGc: config.volumeGc,
+    cdpLane: config.cdpLane,
     network: config.network,
     egressNetwork: config.egressNetwork,
     sharedDir: config.sharedDir,

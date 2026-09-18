@@ -577,8 +577,24 @@ export class Provisioner {
     return "unknown";
   }
 
-  /** The container's IP on the control network (used for CDP by IP). */
-  private async resolveIp(name: string): Promise<string> {
+  /**
+   * The container's IP on the browser data plane, which is how anything reaches
+   * its CDP endpoint: Chrome refuses a Host header that is not an IP or
+   * `localhost`, so the `<container>.<network>` DNS form the noVNC proxy uses
+   * is not an option here.
+   *
+   * Public because the CDP lane's websocket upgrade needs it without
+   * provisioning (#87) — the handshake that handed the driver that URL already
+   * ensured the container.
+   *
+   * Two different failures, and only one of them is ours: a container that is
+   * GONE rejects with dockerode's raw error (a 404 from the inspect), while
+   * `ProvisionError` is thrown only for a container that exists but has no
+   * address on the data plane. So `instanceof ProvisionError` is not a test for
+   * "the browser is missing" — both CDP callers deliberately map ANY rejection
+   * here to a 502, which is the shape a caller wants.
+   */
+  async resolveIp(name: string): Promise<string> {
     const info = await this.docker.getContainer(containerName(name)).inspect();
     const ip = info.NetworkSettings.Networks?.[config.network]?.IPAddress;
     if (!ip) {

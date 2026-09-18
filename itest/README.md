@@ -33,6 +33,27 @@ blocked as mixed content before a packet moves — which made an earlier version
 report four confident, wrong answers. The self-`:6080` check is the control that
 catches that class of breakage.
 
+`cdp-playwright.mjs` asks the question the CDP lane exists for (#87): can a real
+Playwright drive a real fleet browser through `/cdp/<name>/`? `gateway/test/cdp.test.ts`
+proves the wiring against a fake Chrome — the ws-URL rewrite, the guards, the
+upgrade, the bookkeeping — but a fake Chrome cannot prove the protocol works end
+to end, and that is the whole claim. It uses `playwright-core` from
+`../gateway/node_modules` (no browser download: the lane connects to the fleet's
+Chrome, never a bundled one).
+
+```bash
+GATEWAY_TOKEN=<your token> node cdp-playwright.mjs          # exits non-zero on any failed check
+BASE=http://localhost:8081 node cdp-playwright.mjs inst-pw1 # a scratch gateway on another port
+```
+
+It provisions one browser, drives `example.com` in the profile's default context,
+asserts the browser is real headful Chrome (a bundled Chromium would say
+`HeadlessChrome`), and asserts MCP is refused while the driver holds the browser.
+It then removes the container and volume **it** created, leaving anything that
+was already there alone, and it refuses outright to run against a name that is
+not `inst-*` — the cleanup is a `docker volume rm`, and a sticky profile is not
+something a test may put at risk.
+
 `reaper-helper.mjs` drives the live reaper test. Every mode calls
 `chikin_identify` before touching a browser tool (the gate added in #54) and
 exits non-zero the moment the gateway refuses a call. `hold` keeps one real

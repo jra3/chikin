@@ -29,7 +29,7 @@ Real (non-headless) Google Chrome in Docker, for browser automation that should 
                               └─ create / start / stop chrome containers
 ```
 
-- The gateway exposes **one MCP endpoint per browser** at `/b/<name>/`. `<name>` must match `[a-z0-9-]+` (1–32 chars). It maps to container `chikin-chrome-<name>` and volume `chikin-profile-<name>`.
+- The gateway exposes **one MCP endpoint per browser** at `/b/<name>/`. `<name>` must match `[a-z0-9-]+` (1–32 chars). It maps to container `chikin-chrome-<name>` and volume `chikin-profile-<name>`. A driver that speaks raw DevTools Protocol rather than MCP reaches the same browser at `/cdp/<name>/` — see [the CDP lane](#drive-a-browser-with-playwright-the-cdp-lane).
 - On connect, the gateway spawns **one** `chrome-devtools-mcp` child and bridges the client's HTTP MCP session to the child's stdio. No container yet: the child answers `initialize`, `tools/list` and pings on its own. On the session's **first browser tool call** the gateway provisions the container (creating the profile volume if needed), waits for Chrome to come up, and rebinds the child to that browser's CDP endpoint.
 - **Networks.** Three, since the control plane was split off (ADR 0002): `chikin-control` is `internal: true` and carries **only** gateway ↔ socket-proxy, so a compromised browser cannot reach the Docker API. `chikin-net` is `internal: true` and carries the gateway ↔ browser data plane (CDP, VNC). `chikin-egress` is a normal bridge giving browsers internet access, with inter-container forwarding off. No Chrome ports are published to the host. Browsers still share `chikin-net` with each other — cross-browser isolation is [#20](https://github.com/jra3/chikin/issues/20).
 - The gateway talks to Docker **only** through `tecnativa/docker-socket-proxy`, scoped to containers + volumes + images (+ POST). No `exec`, no host `info`, no swarm/secrets.
@@ -132,7 +132,7 @@ A session's browser name (`inst-<pid>`) says *which profile* it drives, not *wha
 
 Open the dashboard at <http://localhost:8080/> and click **open noVNC** next to any running browser, or go straight to `http://localhost:8080/vnc/<name>/`. You can drive that Chrome window by hand — useful for logging in or clearing a captcha while the MCP client keeps the session. The page title and the dashboard's **handle** column show which session (`chikin_identify` handle) owns each browser.
 
-The dashboard is also the only place the connected-vs-driven split is visible, and the page is built around it: a **browsers** table, then a **connected sessions** table. **`fleet slots in use: N/MAX`** heads the page and counts *browsers that exist* — every fleet container, i.e. every name that has made a browser tool call and not yet been reaped, including ones whose client has since disconnected. Live sessions that have never made one hold no slot: they are the second table, **`connected — holds no fleet slot`**, with no noVNC link (there is no browser to view yet — that URL 502s until one exists). The **`browser idle`** column is time since a real browser tool call, which is what the attached reap TTL measures; the plain **`idle`** column stays near zero on any attached session because the client bridge pings. The **`strikes`**, **`respawns`** and **`chrome`** columns are the wedge canary — read them together, as [Wedge self-healing](#wedge-self-healing-issue-15) explains. Durations read in human units with the exact seconds in the cell's tooltip, and the page refreshes itself every 5s (pausable top-right; paused while the tab is hidden, and it still works with JavaScript off).
+The dashboard is also the only place the connected-vs-driven split is visible, and the page is built around it: a **browsers** table, then a **connected sessions** table. **`fleet slots in use: N/MAX`** heads the page and counts *browsers that exist* — every fleet container, i.e. every name that has made a browser tool call and not yet been reaped, including ones whose client has since disconnected. Live sessions that have never made one hold no slot: they are the second table, **`connected — holds no fleet slot`**, with no noVNC link (there is no browser to view yet — that URL 502s until one exists). The **`browser idle`** column is time since a real browser tool call, which is what the attached reap TTL measures; the plain **`idle`** column stays near zero on any attached session because the client bridge pings. A browser held over the CDP lane has no MCP session and so no `chikin_identify` handle — its **handle** column reads `cdp` and **attached** reads `yes (cdp)`, since an empty cell would read as "nobody is using it". The **`strikes`**, **`respawns`** and **`chrome`** columns are the wedge canary — read them together, as [Wedge self-healing](#wedge-self-healing-issue-15) explains. Durations read in human units with the exact seconds in the cell's tooltip, and the page refreshes itself every 5s (pausable top-right; paused while the tab is hidden, and it still works with JavaScript off).
 
 ### Recording (video / GIF)
 
@@ -190,6 +190,39 @@ node client/keepalive.mjs http://localhost:8080/b/golden/   # ^C when you're don
 `chikin-profile-golden` and `chikin-seed` are now the most expensive things on the host to lose, and a single `docker volume prune --all` takes both — read [Profile volumes and cleaning them up](#profile-volumes-and-cleaning-them-up) before you run any prune.
 
 From then on **every new browser is cloned from the seed and starts logged in** — and the MCP automation sees those cookies (it shares the persistent profile context). Re-run `chikin-snapshot` whenever sessions expire. It works because every container uses Chrome's keyring-less `basic` cookie store, so the encryption key travels in the copied `Local State` and decrypts in the clones. Caveat: all seeded browsers share one identity, so sites that forbid concurrent sessions may re-challenge.
+
+### Drive a browser with Playwright (the CDP lane)
+
+Not everything that wants a logged-in browser is an MCP client. `/cdp/<name>/` hands the raw DevTools Protocol to Playwright, puppeteer, or anything else that speaks it — same fleet, same lazy provisioning, same golden seed, no MCP in the path.
+
+```js
+import { chromium } from 'playwright-core';
+
+const browser = await chromium.connectOverCDP('http://127.0.0.1:8080/cdp/giard-scrape/', {
+  timeout: 120_000,                       // a cold browser takes up to PROVISION_TIMEOUT_SEC
+  // headers: { Authorization: `Bearer ${process.env.GATEWAY_TOKEN}` },   // if you set one
+});
+const context = browser.contexts()[0];    // ← the golden profile. NOT newContext()
+const page = await context.newPage();
+await page.goto('https://www.ancestry.com/');
+```
+
+```python
+# Python reaches the same endpoint
+browser = playwright.chromium.connect_over_cdp("http://127.0.0.1:8080/cdp/giard-scrape/", timeout=120_000)
+context = browser.contexts[0]
+```
+
+The first request provisions `chikin-chrome-giard-scrape` from `SEED_VOLUME`, exactly as a browser tool call does on the MCP side, and it counts against `MAX_FLEET` like any other browser. `bin/chikin-pw <name>` warms it first and prints the endpoint, which is the easy way to keep a cold start out of your script's connect timeout.
+
+Things worth knowing before your first run:
+
+- **`browser.contexts()[0]`, never `browser.newContext()`.** The logins live in the browser's persistent profile, which Playwright sees as the *default* context. A fresh context is a fresh, logged-out one.
+- **One driver at a time.** A browser being driven over CDP refuses an MCP session and vice versa, both with a 409. The lane is held by the *driver*, not by the connection, so your own follow-up `/json/*` requests and any further sockets you open are fine; a driver at another address is turned away. Want two? Use two names — each gets its own clone of the seed.
+- **These browsers are headful**, under Xvfb, which is the whole anti-detection point. So noVNC works while your script runs: open `http://localhost:8080/vnc/<name>/` to watch it, or to clear a CAPTCHA by hand mid-run.
+- **The lane is guarded** by the same Host check as everything else, by `GATEWAY_TOKEN` when you set one, and by refusing anything that looks like it came from a web browser: an `Origin` header, or any `Sec-Fetch-*` header. No CDP driver sends either; a browser sends `Sec-Fetch-*` on every request it makes, including the `no-cors` fetches and navigations that carry no Origin at all.
+- **Downloads land in the container**, at `/tmp/chikin-shared/<name>` on the host (see below); `download.path()` is not available over CDP. For uploads, pass `setInputFiles` a `{name, mimeType, buffer}` rather than a host path.
+- An idle driver is still reaped: an open CDP socket counts as attached, and the attached tier is measured against traffic your driver actually sends (`ATTACHED_IDLE_TTL_SEC`).
 
 ### Scratch files (per-browser)
 
@@ -280,9 +313,10 @@ Set in `.env` (see `.env.example`) or the environment.
 | `BROWSER_CPUS` | `2.0` | CPU cap per browser in cores (fractions allowed, e.g. `1.5`); mapped to Docker `NanoCpus`. `0` disables. |
 | `BROWSER_NOFILE` | `8192` | Open-file-descriptor ceiling per browser (soft=hard). Kept generous because Chrome is fd-hungry. `0` disables. |
 | `SEED_VOLUME` | *(empty)* | Docker volume cloned into every new profile so browsers start logged in. Empty = off. Populate with `bin/chikin-snapshot` (see [Pre-authenticated browsers](#pre-authenticated-browsers-golden-profile)). |
-| `IDLE_TTL_SEC` | `900` | Idle seconds before a **detached** browser (no attached client stream) is reaped. Measured against any MCP traffic. |
-| `ATTACHED_IDLE_TTL_SEC` | `14400` | Seconds an **attached** browser may go with no real browser tool call before it is reclaimed anyway. Measured against actual forwarded `tools/call`s — *not* the client bridge's keepalive ping, which by design keeps the plain idle clock fresh — and shown as the dashboard's `browser idle` column. Without this, a window that made one browser tool call and then went idle holds that fleet slot for its whole lifetime and the fleet saturates with browsers parked on `about:blank`. Eviction is survivable: the bridge reconnects transparently, though a disposable `inst-*` browser's profile is discarded with it (logged explicitly). `0` = never reap an attached browser (pre-#57 behaviour). Keep it well above `IDLE_TTL_SEC`. |
+| `IDLE_TTL_SEC` | `900` | Idle seconds before a **detached** browser (no attached client stream, no CDP driver) is reaped. Measured against any MCP traffic, or a CDP driver's own socket traffic. |
+| `ATTACHED_IDLE_TTL_SEC` | `14400` | Seconds an **attached** browser may go with no real browser tool call before it is reclaimed anyway. Measured against actual forwarded `tools/call`s — *not* the client bridge's keepalive ping, which by design keeps the plain idle clock fresh — and shown as the dashboard's `browser idle` column. An open CDP socket counts as attached too, measured there against bytes the driver actually sends rather than a timer. Without this, a window that made one browser tool call and then went idle holds that fleet slot for its whole lifetime and the fleet saturates with browsers parked on `about:blank`. Eviction is survivable on the MCP side: the bridge reconnects transparently, though a disposable `inst-*` browser's profile is discarded with it (logged explicitly). A CDP driver gets no such courtesy — its websocket dies with the container and the script sees the failure. `0` = never reap an attached browser (pre-#57 behaviour). Keep it well above `IDLE_TTL_SEC`. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
+| `CHIKIN_CDP_LANE` | `1` | Serve the [CDP lane](#drive-a-browser-with-playwright-the-cdp-lane) at `/cdp/<name>/` — Playwright, puppeteer and other DevTools-protocol clients, with no MCP in the path. Same lazy provisioning, same golden seed, same `MAX_FLEET`. `0` answers 404 there and leaves the browsers' CDP reachable only through the MCP endpoint. |
 | `CHIKIN_VOLUME_GC` | `1` | Sweep orphaned `chikin-profile-inst-*` volumes (disposable profiles whose container is gone) once at startup. Scoped by name — `golden`, `hermes` and named client profiles are never candidates. `0` disables. See [Profile volumes](#profile-volumes-and-cleaning-them-up). |
 | `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up. Nothing is provisioned when a client connects, so this bounds the **first browser tool call** — overrunning it fails that one call as a retryable tool error ("chikin could not start a browser"), leaving the session up with every tool registered. |
 | `WINDOW_SIZE` | `1920,1080` | Chrome window / Xvfb screen size for provisioned browsers. |
@@ -375,7 +409,7 @@ The container starts as **root** only long enough for `entrypoint.sh` to chown t
 
 ## Security
 
-- **CDP has no authentication.** chikin never publishes a Chrome port to the host. In fleet mode the only host-exposed surface is the gateway on `127.0.0.1:8080`, and `/b/<name>/` requires a bearer token; the control-plane network is `internal: true`.
+- **CDP has no authentication.** chikin never publishes a Chrome port to the host. In fleet mode the only host-exposed surface is the gateway on `127.0.0.1:8080`, and `/b/<name>/` requires a bearer token; the control-plane network is `internal: true`. The [CDP lane](#drive-a-browser-with-playwright-the-cdp-lane) proxies raw CDP through that same port under the same bearer, and additionally refuses anything a web browser sent (an `Origin`, or any `Sec-Fetch-*` header) — a page that reached it would hold a full control channel into a logged-in browser. `CHIKIN_CDP_LANE=0` removes the route.
 - **Linux caveat:** on a Linux host you can still reach a container's CDP by its *container IP* (e.g. `http://172.x.x.x:9222`) because the host routes to Docker bridges directly — `internal: true` does not change this. The boundary chikin provides is "not reachable from other machines and not on any host port." If you need to block host-local access too, add a `DOCKER-USER` iptables rule; that's outside chikin's scope.
 - **Scoped Docker access.** The gateway reaches Docker only through `tecnativa/docker-socket-proxy` with a read-only socket mount, scoped to containers/volumes/images (+POST). `exec`, `info`, swarm, and secrets are denied — verify with the proxy returning `403` on `/info` and `/exec/...`.
 - **Chrome's renderer sandbox is ON by default** where the host supports it (see [Renderer sandbox](#renderer-sandbox-h1) below). This closes the H1 audit finding: a renderer exploit from a hostile page no longer means immediate in-container code execution — it now *also* needs a sandbox escape. On a host that can't sandbox, chikin falls back to `--no-sandbox` (loud WARN); there, still treat a profile volume as a fully compromised browser profile after visiting untrusted content.
@@ -452,7 +486,7 @@ the exact command to use if the selected images aren't runnable; `bin/chikin-up`
 Independently, the gateway now *pulls* a missing registry image at startup rather
 than dying, so the plain `docker compose up -d` path self-heals where it can.
 
-The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTransport` facing clients, `StdioClientTransport` to each `chrome-devtools-mcp` child) with `dockerode` for provisioning and `http-proxy` for the noVNC reverse proxy. See `gateway/src/` — `server.ts` (routing/auth), `provisioner.ts` (Docker lifecycle), `bridge.ts` (MCP↔stdio pump), `reaper.ts` (idle reclaim).
+The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTransport` facing clients, `StdioClientTransport` to each `chrome-devtools-mcp` child) with `dockerode` for provisioning and `http-proxy` for the noVNC and CDP reverse proxies. See `gateway/src/` — `server.ts` (routing/auth), `provisioner.ts` (Docker lifecycle), `bridge.ts` (MCP↔stdio pump), `cdp.ts` (the CDP lane), `reaper.ts` (idle reclaim). Why the CDP lane is a proxy through the gateway's one published port rather than a published `:9222` per container is [ADR 0005](docs/adr/0005-proxy-raw-cdp-through-the-gateway.md).
 
 ## Troubleshooting
 
@@ -460,7 +494,7 @@ The gateway is TypeScript on the official MCP SDK (`StreamableHTTPServerTranspor
 
 **The first browser tool call hangs, then returns "chikin could not start a browser".** Chrome didn't come up within `PROVISION_TIMEOUT_SEC` (connecting provisions nothing, so this can only surface on a tool call, never on the connect). If the message also says no slot is missing, check `docker logs chikin-chrome-<name>` and the gateway's own log for the underlying Docker error; most often it's `/dev/shm` pressure (the fleet sets `shm_size` 2 GB per browser). The session survives — the same call works once the browser can be built.
 
-**"browser '<name>' already has an active session" (409).** That name is in use by another client. Pick a different name, or have the other client disconnect (MCP `DELETE`/terminate frees the name immediately).
+**"browser '<name>' already has an active session" (409).** That name is in use by another client. Pick a different name, or have the other client disconnect (MCP `DELETE`/terminate frees the name immediately). A 409 naming a *lane* ("is being driven over the CDP lane", "already being driven over the MCP lane") is the same rule across protocols: one driver per browser, so give the other lane its own name.
 
 **"fleet is full" on a browser tool call.** Every slot is held by a browser that has actually been driven. Raise `MAX_FLEET`, let an idle browser get reaped, or retry — the session survives, so the same call succeeds once a slot frees. The dashboard's "fleet slots in use" line and `browser idle` column show what is holding them.
 

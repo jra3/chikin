@@ -82,7 +82,8 @@ async function main(): Promise<void> {
   const reaper = new Reaper(registry, provisioner);
   reaper.start();
 
-  const app = createApp({ registry, provisioner });
+  const deps = { registry, provisioner };
+  const app = createApp(deps);
 
   // Never listen on the browser data plane (CHK-002 / issue #20). HOST=0.0.0.0
   // would include chikin-net, putting this MCP endpoint — no bearer by default,
@@ -97,13 +98,18 @@ async function main(): Promise<void> {
 
   const servers = plan.hosts.map((host) => {
     const server = http.createServer(app);
-    server.on("upgrade", makeUpgradeHandler());
+    server.on("upgrade", makeUpgradeHandler(deps));
     server.listen(config.port, host, () => {
       log.info(`gateway listening on http://${host}:${config.port}`);
     });
     return server;
   });
   log.info(`  MCP:       POST http://<listen-addr>:${config.port}/b/<name>/`);
+  if (config.cdpLane) {
+    log.info(`  CDP lane:  http://127.0.0.1:${config.port}/cdp/<name>/  (Playwright, puppeteer)`);
+  } else {
+    log.info("  CDP lane:  disabled (CHIKIN_CDP_LANE=0)");
+  }
   log.info(`  dashboard: http://127.0.0.1:${config.port}/`);
 
   const shutdown = (sig: string) => {

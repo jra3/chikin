@@ -19,6 +19,10 @@ The one container clients connect to; it provisions/reaps Browsers and multiplex
 One provisioned Chrome container with its own sticky, isolated profile, addressed by a **Name**. Provisioned on a session's first browser tool call (not on connect), reaped when idle; the profile persists.
 _Avoid_: tab, session, page (those are things *inside* a Browser)
 
+**Lane**:
+How a driver reaches a Browser. The **MCP Lane** (`/b/<name>/`) speaks MCP and works the Browser through a `chrome-devtools-mcp` child; the **CDP Lane** (`/cdp/<name>/`) hands the raw DevTools Protocol to a Playwright or puppeteer process. Both provision the same Browser from the same Seed Volume and spend the same fleet slot; a Browser is driven by one Lane at a time, and the other is refused.
+_Avoid_: mode, transport, protocol (a Lane is who is driving, not how the bytes are framed)
+
 **Name**:
 The `[a-z0-9-]` identifier that picks a Browser. A stable Name (`giard`) is a sticky persistent profile; the default `inst-<pid>` gives each Claude Code instance its own throwaway-per-run Browser.
 

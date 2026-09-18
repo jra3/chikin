@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# chikin-pw <name> [--json]
+#
+# Warm a browser on the CDP lane and print the endpoint a Playwright (or
+# puppeteer) script connects to:
+#
+#   $ chikin-pw giard-scrape
+#   http://127.0.0.1:8080/cdp/giard-scrape/
+#
+#   const browser = await chromium.connectOverCDP('http://127.0.0.1:8080/cdp/giard-scrape/');
+#   const context = browser.contexts()[0];   // the golden profile, NOT newContext()
+#
+# Why warm it at all: browsers are provisioned on the first request (issue #63),
+# and a cold one can take up to PROVISION_TIMEOUT_SEC (90s) to answer — well past
+# Playwright's 30s connect default. This script absorbs that wait, so the script
+# that follows connects to a browser that is already up.
+#
+# Env: CHIKIN_GATEWAY (default http://127.0.0.1:8080), GATEWAY_TOKEN / CHIKIN_TOKEN.
+set -euo pipefail
+
+NAME="${1:-}"
+JSON=0
+# `[ ... ] && x` would be the LAST command of the list under `set -e`, so a
+# false test exits the script. Always spell these as an if.
+if [ "${2:-}" = "--json" ]; then
+  JSON=1
+fi
+
+if [ -z "$NAME" ]; then
+  cat >&2 <<'EOF'
+usage: chikin-pw <name> [--json]
+
+  <name>  the browser to drive: [a-z0-9-], 1-32 chars. A stable name keeps a
+          sticky profile; an inst-* name is disposable and is destroyed with
+          its browser.
+
+The browser is provisioned from SEED_VOLUME on first use, so it starts logged
+in wherever the golden profile is. One driver at a time: a name already held by
+an MCP session (or another CDP driver) answers 409.
+EOF
+  exit 2
+fi
+
+# The same rule the gateway applies (gateway/src/names.ts), checked here so a
+# typo fails locally instead of as a 400 from a proxy hop.
+if ! printf '%s' "$NAME" | grep -qE '^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$'; then
+  echo "chikin-pw: invalid browser name '$NAME' (need [a-z0-9-], 1-32 chars, no leading/trailing dash)" >&2
+  exit 2
+fi
+
+GATEWAY="${CHIKIN_GATEWAY:-http://127.0.0.1:8080}"
+TOKEN="${GATEWAY_TOKEN:-${CHIKIN_TOKEN:-}}"
+ENDPOINT="${GATEWAY}/cdp/${NAME}/"
+
+auth=()
+if [ -n "$TOKEN" ]; then
+  auth=(-H "Authorization: Bearer ${TOKEN}")
+fi
+
+# The provision happens inside this request, so allow the gateway's own timeout
+# plus slack. curl sends neither an Origin nor a Sec-Fetch-* header, which is
+# what the lane requires: it refuses anything a web browser sent.
+body="$(curl -sS --max-time 150 -w '\n%{http_code}' "${auth[@]}" "${ENDPOINT}json/version" || true)"
+code="$(printf '%s' "$body" | tail -n1)"
+payload="$(printf '%s' "$body" | sed '$d')"
+
+case "$code" in
+  200) ;;
+  409)
+    echo "chikin-pw: $payload" >&2
+    echo "  One driver at a time. Use another name, or stop the client holding this one." >&2
+    exit 1
+    ;;
+  429)
+    echo "chikin-pw: $payload" >&2
+    echo "  The fleet is full. Free a slot (dashboard: ${GATEWAY}/) or raise MAX_FLEET." >&2
+    exit 1
+    ;;
+  401 | 403)
+    echo "chikin-pw: gateway refused this request (HTTP $code): $payload" >&2
+    echo "  Set GATEWAY_TOKEN if the gateway has one, and reach it on 127.0.0.1." >&2
+    exit 1
+    ;;
+  404)
+    echo "chikin-pw: no CDP lane on this gateway (HTTP 404)." >&2
+    echo "  Check CHIKIN_CDP_LANE in ${GATEWAY}/healthz — 0 turns this route off." >&2
+    exit 1
+    ;;
+  *)
+    echo "chikin-pw: gateway did not hand over a browser (HTTP ${code:-none}): $payload" >&2
+    exit 1
+    ;;
+esac
+
+# Chrome pretty-prints its DevTools JSON — `  "Browser": "Chrome/153.0.8010.36",`,
+# one key per line, space after the colon — and the gateway's rewrite is a string
+# replace that preserves that formatting. Tolerate the space, or this silently
+# reports no version at all.
+chrome="$(printf '%s' "$payload" | sed -n 's/.*"Browser": *"\([^"]*\)".*/\1/p')"
+
+if [ "$JSON" = "1" ]; then
+  printf '{"endpoint":"%s","browser":"%s","chrome":"%s","vnc":"%s"}\n' \
+    "$ENDPOINT" "$NAME" "$chrome" "${GATEWAY}/vnc/${NAME}/"
+  exit 0
+fi
+
+echo "$ENDPOINT"
+echo "  browser: ${NAME}${chrome:+ (${chrome})} — warm and waiting" >&2
+echo "  watch it: ${GATEWAY}/vnc/${NAME}/" >&2

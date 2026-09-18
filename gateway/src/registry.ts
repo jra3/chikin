@@ -2,13 +2,28 @@ import { Session } from "./session.js";
 
 /** Per-name browser activity, used by the reaper. Outlives any single session. */
 export interface Activity {
-  /** epoch ms of the last MCP frame or stream close for this browser. */
+  /**
+   * epoch ms of the last MCP frame or stream close for this browser, or, on
+   * the CDP lane, of a driver's socket opening, closing or sending commands.
+   */
   last: number;
   /** open server->client SSE streams right now. >0 means a client is attached. */
   streams: number;
   /**
-   * epoch ms of the last frame that actually drove the BROWSER — a `tools/call`
-   * the gate forwarded to chrome-devtools-mcp (bridge.ts).
+   * Open CDP websockets right now — the non-MCP lane (#87). Counted apart from
+   * `streams` because it is a different protocol on a different route, but it
+   * means the same thing to the reaper: somebody is holding this browser. A CDP
+   * socket's lifetime is its driver's process, so unlike an MCP stream it is a
+   * strong signal — and the attached tier is still measured against
+   * `lastBrowserActivity`, sampled from that socket's own traffic, so a driver
+   * that connected and wandered off ages out like anything else.
+   */
+  cdp: number;
+  /**
+   * epoch ms of the last traffic that actually drove the BROWSER: a `tools/call`
+   * the gate forwarded to chrome-devtools-mcp (bridge.ts), or on the CDP lane a
+   * driver taking the browser and then the commands its socket carries, sampled
+   * from `bytesRead` rather than stamped on a timer (cdp.ts).
    *
    * Deliberately separate from `last`, which measures MCP protocol traffic and
    * is therefore useless as an activity signal for an attached client: the
@@ -198,7 +213,14 @@ export class Registry {
   // --- activity -------------------------------------------------------------
 
   private newActivity(now: number): Activity {
-    return { last: now, streams: 0, lastBrowserActivity: now, navStrikes: 0, childRespawns: 0 };
+    return {
+      last: now,
+      streams: 0,
+      cdp: 0,
+      lastBrowserActivity: now,
+      navStrikes: 0,
+      childRespawns: 0,
+    };
   }
 
   /**
@@ -218,10 +240,14 @@ export class Registry {
   }
 
   /**
-   * Stamp REAL browser work (a forwarded `tools/call`). Also refreshes `last`,
-   * since a tool call is protocol traffic too. Called from exactly one place —
-   * the bridge's client pump, on `classifyClientFrame(...) === "forward"` — so
-   * that pings and gateway-owned tools can never move this clock (issue #57).
+   * Stamp REAL browser work. Also refreshes `last`, since browser work is
+   * protocol traffic too.
+   *
+   * Every caller has to have watched the browser move, never a clock: the
+   * bridge's client pump on `classifyClientFrame(...) === "forward"`, so pings
+   * and gateway-owned tools cannot move it (issue #57), and the CDP lane on a
+   * driver taking the browser and on its socket's byte counter advancing
+   * (cdp.ts). A caller that stamps on a schedule re-creates #57.
    */
   touchBrowserActivity(name: string, now: number = Date.now()): void {
     const a = this.ensureActivity(name, now);
@@ -240,6 +266,66 @@ export class Registry {
     if (!a) return;
     a.streams = Math.max(0, a.streams - 1);
     a.last = now;
+  }
+
+  /**
+   * A CDP driver attached (#87). Stamps browser activity as well as `last`: the
+   * websocket opening IS the driver taking the browser, and the sampler that
+   * keeps that clock fresh afterwards has nothing to report until the first
+   * command arrives.
+   */
+  cdpOpened(name: string, now: number = Date.now()): void {
+    const a = this.ensureActivity(name, now);
+    a.cdp += 1;
+    a.last = now;
+    a.lastBrowserActivity = now;
+  }
+
+  cdpClosed(name: string, now: number = Date.now()): void {
+    const a = this.activity.get(name);
+    if (!a) return;
+    a.cdp = Math.max(0, a.cdp - 1);
+    a.last = now;
+  }
+
+  /** Is a CDP driver holding this browser right now? */
+  hasCdp(name: string): boolean {
+    return (this.activity.get(name)?.cdp ?? 0) > 0;
+  }
+
+  /**
+   * CDP handshakes taking this Name right now — the claim that makes the lane
+   * exclusion (#87) true from the FIRST request instead of from the first
+   * websocket. A cold `/json/*` hop provisions a container before any socket
+   * exists, and that provision runs for as long as PROVISION_TIMEOUT_SEC.
+   *
+   * Deliberately not `Activity.cdp`: that counts open driver sockets and feeds
+   * the reaper's attached tier and the dashboard, and a handshake in flight is
+   * not a driver attached. Counted rather than a flag because two handshakes
+   * for one cold Name legitimately overlap (they share a single provision), so
+   * the Name is free again only when the last of them is done.
+   */
+  private cdpClaims = new Map<string, number>();
+
+  /** Claim a Name for a CDP handshake. Always balance with `unclaimCdp`. */
+  claimCdp(name: string): void {
+    this.cdpClaims.set(name, (this.cdpClaims.get(name) ?? 0) + 1);
+  }
+
+  unclaimCdp(name: string): void {
+    const n = this.cdpClaims.get(name);
+    if (n === undefined) return;
+    if (n > 1) this.cdpClaims.set(name, n - 1);
+    else this.cdpClaims.delete(name);
+  }
+
+  /**
+   * Is the CDP lane holding this Name at all — a driver's open socket, or a
+   * handshake on its way to one? This, not `hasCdp`, is the question the MCP
+   * side has to ask before claiming a Name for a session.
+   */
+  heldByCdp(name: string): boolean {
+    return this.hasCdp(name) || this.cdpClaims.has(name);
   }
 
   /** A nav verification disagreed with the browser (suspicion, not action). */
