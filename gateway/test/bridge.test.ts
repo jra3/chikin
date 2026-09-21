@@ -408,11 +408,12 @@ test("the text parse reads the '## Pages' section only", () => {
 // client to a different page.
 
 test("pageEntries reads the id upstream PRINTED, never the row's position", () => {
-  // The "## Pages" block omits chrome-extension:// pages — they get their own
-  // section — but upstream's ids count across both. So an extension page open
-  // anywhere but last shifts every id after it, and the selected page here is
-  // row 1 of the block and id 2 of the browser. Counting rows would select
-  // somebody else's tab.
+  // Upstream's ids are a counter stamped once per page and never reused, so a
+  // row's position and its id part company as soon as any tab closes; the
+  // "## Pages" block also omits chrome-extension:// pages while their ids come
+  // out of the same counter. Either way the selected page here is row 1 of the
+  // block and id 2 of the browser, and counting rows would select somebody
+  // else's tab.
   const got = pageEntries(
     navReply(
       "## Pages\n" +

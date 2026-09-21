@@ -106,12 +106,21 @@ const NO_BROWSER_URL = "http://127.0.0.1:1";
 // forwarding the capture. Every branch of that is fail-open: whatever does not
 // work out, the capture is forwarded exactly as it was before this existed.
 const FOREGROUND_TOOLS = new Set(["take_screenshot"]);
+// Client tools that change WHICH page the child's tools act on. Forwarding one
+// moves `selectionEpoch`, which is how an activation already in flight finds
+// out that the client has since made a choice of its own.
+const SELECTION_TOOLS = new Set(["select_page", "new_page", "close_page"]);
 // Per injected call. Activation is a latency tax on every screenshot, so it is
 // bounded well under the capture it is protecting.
 const ACTIVATE_TIMEOUT_MS = Number(process.env.SCREENSHOT_ACTIVATE_TIMEOUT_MS || 5_000);
-// A capture still outstanding after this is waiting on a frame that is not
-// coming. Long enough that a legitimately slow `fullPage` capture of a huge
-// document is never mistaken for one.
+// How long a capture the activation could NOT protect is left outstanding
+// before the child is replaced. Only those: a capture whose tab the gateway
+// demonstrably brought to the front is either fast or honestly slow, so it
+// rides Puppeteer's 180s protocolTimeout exactly as it did before any of this
+// existed. Deadlining it too would make every retry of a legitimately slow
+// `fullPage` capture cost another respawn — and a respawn discards the child's
+// page ids, snapshot uids and console history — so the call would degrade on
+// each attempt instead of ever completing.
 // Both are test seams, deliberately NOT operator knobs (like NAV_VERIFY_DELAY_MS
 // above): documenting either one obliges a docker-compose.yml line too, or the
 // operator's .env is silently inert — see gateway/test/compose-env.test.ts.
@@ -127,12 +136,13 @@ export interface ReportedPages {
  * to ACT on a page rather than judge one (the screenshot activation, #89).
  *
  * `id` is what `select_page` takes, and it is NOT the entry's position in the
- * list: the "## Pages" block omits chrome-extension:// pages — they get their
- * own section — while upstream's ids keep counting across both, so a single
- * extension page open anywhere but last shifts every id after it. Read the id
- * upstream printed; never count the rows. It is optional so that a channel
- * which stopped carrying ids degrades to no activation at all rather than to
- * activating the wrong page.
+ * list: `McpContext.createPagesSnapshot` stamps each new page object with
+ * `#nextPageId++` from 1 and never renumbers or reuses one, so the first tab a
+ * client closes puts every later row permanently out of step with its own id —
+ * and `getPageById` throws `No page found` for the retired number rather than
+ * handing back a neighbour. Read the id upstream printed; never count the
+ * rows. It is optional so that a channel which stopped carrying ids degrades
+ * to no activation at all rather than to activating the wrong page.
  */
 export interface PageEntry {
   id?: number;
@@ -573,6 +583,11 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   let cdpFailStreak = 0;
   // tools/list request ids whose replies need the synthetic chikin_reset appended
   const toolsListIds = new Set<string | number>();
+  // Moves whenever a CLIENT frame that can change which page the child's tools
+  // act on is handed over. Only the screenshot activation reads it, to tell
+  // "the selection is still the one I read" from "the client has chosen since"
+  // — see bringSelectedToFront.
+  let selectionEpoch = 0;
   // Requests the GATEWAY issued to the child on its own behalf (the screenshot
   // activation, issue #89) — never the client's. They are kept out of
   // `inflight` so a respawn never answers the client for a frame it did not
@@ -1204,7 +1219,9 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // Everything past the identify gate: track the request, record nav state, and
   // hand the frame to the child. Split out of the pump below so the lazy-attach
   // path can re-enter it with the very same frame once the browser is up.
-  function forwardToChild(msg: JSONRPCMessage, f: Frame): void {
+  // `activated` is the activation's own verdict on the frame it is releasing
+  // (see bringSelectedToFront); it decides whether the capture gets a deadline.
+  function forwardToChild(msg: JSONRPCMessage, f: Frame, activated = false): void {
     const tracked = f && f.method !== undefined && f.id !== undefined;
     if (tracked) {
       inflight.set(f.id as string | number, true);
@@ -1223,7 +1240,12 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       if (tracked) failRequest(f.id as string | number, "chikin browser restarting; retry the request");
       return;
     }
-    if (tracked && f.method === "tools/call" && FOREGROUND_TOOLS.has(f.params?.name ?? ""))
+    // Both of these have to happen on THIS side of the send: the epoch's whole
+    // meaning is "a client frame is already queued at the child", which is only
+    // true of frames handed over before ours.
+    if (tracked && f.method === "tools/call" && SELECTION_TOOLS.has(f.params?.name ?? ""))
+      selectionEpoch++;
+    if (!activated && tracked && f.method === "tools/call" && FOREGROUND_TOOLS.has(f.params?.name ?? ""))
       armCaptureDeadline(f.id as string | number);
     const gen = childGen; // bind this send to the child it used
     child.send(msg).catch((e) => {
@@ -1272,68 +1294,112 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   }
 
   async function activateThenForward(msg: JSONRPCMessage, f: Frame): Promise<void> {
+    let activated = false;
     try {
-      await bringSelectedToFront();
+      activated = await bringSelectedToFront();
     } catch (e) {
       // Fail-open: an unactivated capture is the old behaviour, a dropped one
       // is a new bug.
       log.warn(`session[${name}]: screenshot activation failed`, String(e));
     }
     if (session.isClosed) return;
-    forwardToChild(msg, f);
+    forwardToChild(msg, f, activated);
   }
 
   /**
    * Put the child's selected page in front, so the capture that follows has a
-   * compositor frame to read (issue #89).
+   * compositor frame to read (issue #89). Returns whether it demonstrably did:
+   * only a capture known to have been protected can be left to Puppeteer's own
+   * 180s timeout, which is what `forwardToChild` reads this for.
    *
-   * The selection is ASKED FOR rather than remembered: upstream's page ids
-   * shift whenever a page — or an extension page, which the block does not even
-   * print — opens or closes, so an id learned from an earlier reply can name a
-   * different page by now, and selecting the wrong one silently would be a
-   * worse bug than the hang this fixes. Both calls run on the child's own tool
-   * mutex, so nothing of the client's can overtake them; a client that
-   * pipelines a `close_page` alongside its screenshot can still land between
-   * them, which is what the check afterwards is for.
+   * The selection is ASKED FOR rather than remembered. Upstream retires a page
+   * id the moment its tab goes away and never reissues it, so an id learned
+   * from an earlier reply can name nothing at all by now — and a tab can close
+   * without the client asking for it (`window.close()`, a popup finishing its
+   * OAuth hop). A retired id makes `select_page` throw `No page found` BEFORE
+   * it asks for a page block, so the error reply carries no selection to read;
+   * that outcome is retried once against a freshly read id rather than passed
+   * over in silence.
+   *
+   * Both injected calls run on the child's own tool mutex, so nothing of the
+   * client's can overtake them — but a client that pipelines its own
+   * `select_page` / `new_page` / `close_page` alongside the screenshot can be
+   * queued between them, and re-selecting the page read before that would
+   * silently revert a choice the client has already been told succeeded.
+   * `selectionEpoch` is how that is noticed: it moves when such a frame is
+   * handed to the child, so an epoch that moved means the client's newer intent
+   * wins and the activation stands down.
    */
-  async function bringSelectedToFront(): Promise<void> {
-    const before = pageEntries((await callChild("list_pages", {}, ACTIVATE_TIMEOUT_MS))?.result);
-    const target = before?.find((p) => p.selected);
-    if (!target || !Number.isInteger(target.id)) {
+  async function bringSelectedToFront(): Promise<boolean> {
+    const epoch = selectionEpoch;
+    const clientChoseSince = (): boolean => {
+      if (selectionEpoch === epoch) return false;
       log.warn(
-        `session[${name}]: could not tell which page is selected, so this screenshot is being ` +
-          `taken without bringing it to the front — if that tab is not the foreground one the ` +
-          `capture can block until Puppeteer's 180s protocolTimeout, holding the session's tool ` +
-          `mutex for the whole wait`,
+        `session[${name}]: the client picked a page itself while this capture was being set up, ` +
+          `so its own choice is left standing and the capture is forwarded without bringing a ` +
+          `tab to the front`,
       );
-      return;
+      return true;
+    };
+
+    // Two passes at most: one to use the ids as read, one to re-read them after
+    // an id turned out to name a tab that had already gone.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const before = pageEntries((await callChild("list_pages", {}, ACTIVATE_TIMEOUT_MS))?.result);
+      const target = before?.find((p) => p.selected);
+      if (!target || !Number.isInteger(target.id)) {
+        log.warn(
+          `session[${name}]: could not tell which page is selected, so this screenshot is being ` +
+            `taken without bringing it to the front — if that tab is not the foreground one the ` +
+            `capture can block until Puppeteer's 180s protocolTimeout, holding the session's tool ` +
+            `mutex for the whole wait`,
+        );
+        return false;
+      }
+      if (clientChoseSince()) return false;
+
+      const after = await selectToFront(target.id as number);
+      if (!after) {
+        // An error reply (`No page found` for a retired id, or a tool upstream
+        // has renamed) or nothing at all within ACTIVATE_TIMEOUT_MS. The tab is
+        // NOT in front either way, and saying so here is the only warning the
+        // operator gets before the capture's own deadline much later.
+        log.warn(
+          `session[${name}]: bringing page ${target.id} (${target.url}) to the front failed` +
+            (attempt === 0
+              ? "; re-reading the page list once, in case that id named a tab that has closed"
+              : "; forwarding the capture without it, which can block until Puppeteer's 180s " +
+                "protocolTimeout with the session's tool mutex held"),
+        );
+        continue;
+      }
+
+      const now = after.find((p) => p.selected);
+      if (now && (now.id === target.id || now.url === target.url)) return true;
+      if (clientChoseSince()) return false;
+      // The id landed somewhere other than the page it was read from. Put the
+      // client's own selection back, by the id that very reply printed.
+      const restore = after.find((p) => p.url === target.url && Number.isInteger(p.id));
+      log.warn(
+        `session[${name}]: the selected page changed while bringing it to the front ` +
+          `(${target.url} -> ${now?.url ?? "nothing selected"})` +
+          (restore ? "; restoring it" : "; it is no longer open, leaving the child's own choice"),
+      );
+      if (!restore) return false;
+      const back = await selectToFront(restore.id as number);
+      return back?.find((p) => p.selected)?.url === target.url;
     }
-    const after = pageEntries(
-      (
-        await callChild(
-          "select_page",
-          { pageId: target.id, bringToFront: true },
-          ACTIVATE_TIMEOUT_MS,
-        )
-      )?.result,
-    );
-    const now = after?.find((p) => p.selected);
-    if (!now || now.url === target.url) return;
-    // The page set moved between the two calls, so the id named a different
-    // page by the time it was used. Put the client's own selection back, by the
-    // id that very reply printed.
-    const restore = after?.find((p) => p.url === target.url && Number.isInteger(p.id));
-    log.warn(
-      `session[${name}]: the selected page changed while bringing it to the front ` +
-        `(${target.url} -> ${now.url})` +
-        (restore ? "; restoring it" : "; it is no longer open, leaving the child's own choice"),
-    );
-    if (restore)
-      await callChild(
-        "select_page",
-        { pageId: restore.id, bringToFront: true },
-        ACTIVATE_TIMEOUT_MS,
-      );
+    return false;
+  }
+
+  /**
+   * One injected `select_page ... bringToFront`. null means it did not land —
+   * a timeout, or an error reply, which upstream renders with no page block at
+   * all because the handler throws before asking for one.
+   */
+  async function selectToFront(pageId: number): Promise<PageEntry[] | null> {
+    const reply = await callChild("select_page", { pageId, bringToFront: true }, ACTIVATE_TIMEOUT_MS);
+    return pageEntries(reply?.result);
   }
 
   /**
@@ -1345,6 +1411,11 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
    * holds it — so the deadline replaces the child instead. That reconnects to
    * the same container with its tabs intact, and fails this request retryably
    * on the way through.
+   *
+   * Armed ONLY for a capture the activation could not protect. See
+   * SCREENSHOT_DEADLINE_MS: replacing the child costs the session its page
+   * ids, snapshot uids and console history, which is worth it against a wait
+   * that is never going to end and not against one that is merely long.
    */
   function armCaptureDeadline(id: string | number): void {
     const timer = setTimeout(() => {

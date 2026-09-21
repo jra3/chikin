@@ -26,57 +26,84 @@ import { tapLines } from "./log-tap.js";
  * queue, the way upstream's tool mutex does. So a test that gets its screenshot
  * back is a test in which the gateway really did activate the tab first, and a
  * regression does not fail an assertion about an implementation detail, it
- * hangs a session the way the bug did.
+ * hangs a session the way the bug did. Its page ids follow McpContext's: a
+ * counter stamped once per page and never reused, so a closed tab retires a
+ * number rather than renumbering its neighbours.
  */
 const FAKE_CDM = `#!/usr/bin/env node
 import { appendFileSync, existsSync, rmSync } from "node:fs";
 
 appendFileSync("__PIDFILE__", process.pid + "\\n");
-const WEDGE = "__WEDGEFILE__"; // while this exists, no capture EVER returns
-const SHIFT = "__SHIFTFILE__"; // one-shot: the next select_page finds ids moved
+const WEDGE = "__WEDGEFILE__"; // while this exists: no tab can be fronted, no capture returns
+const SLOW = "__SLOWFILE__"; //  while this exists: a capture takes its time, but DOES return
+const CLOSE = "__CLOSEFILE__"; // one-shot: the selected tab closes under the next select_page
+const DELAY = "__DELAYFILE__"; // while this exists: list_pages dawdles, widening the window
 const trace = (line) => appendFileSync("__TRACEFILE__", line + "\\n");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // The browser. Only ONE tab is composited — \`front\` — and it is not the tab
 // the tools act on (\`selected\`), which is the whole of the bug.
-let pages = ["https://example.com/", "https://example.org/", "https://iana.org/"];
-let selected = 1;
-let front = 0;
+//
+// Page ids follow McpContext: a counter stamped once per page object, from 1,
+// never renumbered and never reused. So a tab that closes retires its number,
+// and upstream re-selects its first remaining page rather than shuffling
+// anyone up.
+let nextId = 1;
+let pages = ["https://example.com/", "https://example.org/", "https://iana.org/"].map((url) => ({
+  id: nextId++,
+  url,
+}));
+let selected = 2;
+let front = 3;
 
 const block = () =>
-  ["## Pages", ...pages.map((u, i) => i + ": " + u + (i === selected ? " [selected]" : ""))].join("\\n");
+  [
+    "## Pages",
+    ...pages.map((p) => p.id + ": " + p.url + (p.id === selected ? " [selected]" : "")),
+  ].join("\\n");
 const said = (line) => ({ content: [{ type: "text", text: line + "\\n" + block() }] });
+// A handler that throws answers with its message and nothing else: upstream
+// throws before asking for a page block, so an error reply names no selection.
+const threw = (message) => ({ content: [{ type: "text", text: message }], isError: true });
 const never = () => new Promise(() => {});
 
 async function tool(name, args) {
   trace(name);
-  if (name === "list_pages") return said("Listed pages.");
+  if (name === "list_pages") {
+    if (existsSync(DELAY)) await sleep(300);
+    return said("Listed pages.");
+  }
   if (name === "select_page") {
-    // A page closing renumbers every id after it — upstream's ids are positions
-    // in its own page list. This is the race the gateway checks for.
-    if (existsSync(SHIFT)) {
-      rmSync(SHIFT);
-      pages.shift();
-      if (selected > 0) selected--;
-      if (front > 0) front--;
+    // A tab closing on its own — window.close(), a popup finishing its hop —
+    // retires its id for good. This is the race the activation has to survive:
+    // the id it just read now resolves to nothing.
+    if (existsSync(CLOSE)) {
+      rmSync(CLOSE);
+      pages = pages.filter((p) => p.id !== selected);
+      selected = pages[0].id;
     }
-    if (args.pageId < 0 || args.pageId >= pages.length)
-      return { content: [{ type: "text", text: "No such page." }], isError: true };
-    selected = args.pageId;
-    if (args.bringToFront) front = args.pageId;
-    return said("Selected page " + args.pageId + ".");
+    if (existsSync(WEDGE)) return threw("No page found");
+    const page = pages.find((p) => p.id === args.pageId);
+    if (!page) return threw("No page found");
+    selected = page.id;
+    if (args.bringToFront) front = page.id;
+    return said("Selected page " + page.id + ".");
   }
   if (name === "new_page") {
     // The documented trap: \`background\` SELECTS the new page while leaving
     // another tab in front.
-    pages.push(args.url);
-    selected = pages.length - 1;
-    if (!args.background) front = selected;
+    const page = { id: nextId++, url: args.url };
+    pages.push(page);
+    selected = page.id;
+    if (!args.background) front = page.id;
     return said("Opened " + args.url + ".");
   }
   if (name === "take_screenshot") {
     if (existsSync(WEDGE)) return never();
     // No compositor frame for a tab that is not in front: this is the hang.
     if (selected !== front) return never();
+    // A real capture of a huge fullPage document: slow, and not stuck.
+    if (existsSync(SLOW)) await sleep(3500);
     return { content: [{ type: "image", data: "aGk=", mimeType: "image/png" }] };
   }
   return said("ok");
@@ -135,7 +162,9 @@ const tmp = mkdtempSync(join(tmpdir(), "chikin-shot-"));
 const fakeCdm = join(tmp, "fake-cdm.mjs");
 const pidFile = join(tmp, "children.pids");
 const wedgeFile = join(tmp, "wedge-capture");
-const shiftFile = join(tmp, "shift-ids");
+const slowFile = join(tmp, "slow-capture");
+const closeFile = join(tmp, "close-selected");
+const delayFile = join(tmp, "delay-list-pages");
 const traceFile = join(tmp, "calls.trace");
 // Paths are baked into the script rather than passed as env vars:
 // StdioClientTransport spawns children with a curated default environment, so
@@ -144,7 +173,9 @@ writeFileSync(
   fakeCdm,
   FAKE_CDM.replace("__PIDFILE__", pidFile)
     .replace("__WEDGEFILE__", wedgeFile)
-    .replace("__SHIFTFILE__", shiftFile)
+    .replace("__SLOWFILE__", slowFile)
+    .replace("__CLOSEFILE__", closeFile)
+    .replace("__DELAYFILE__", delayFile)
     .replace("__TRACEFILE__", traceFile),
   { mode: 0o755 },
 );
@@ -307,40 +338,113 @@ test("new_page(background: true) — the documented trap — no longer hangs the
   }
 });
 
-test("a selection that moves under the activation is put back", async () => {
+test("an id that has been retired under the activation is re-read, not given up on", async () => {
   const { lines, stop } = await tapLines();
-  const { client, close } = await connect("inst-shot4", "shot-race");
+  const { client, close } = await connect("inst-shot4", "shot-retired-id");
   try {
     const before = await client.callTool({ name: "list_pages", arguments: {} });
-    const wanted = selectedUrl(before);
-    // A page closes between the gateway reading the ids and using one — a
-    // client that pipelines close_page alongside its screenshot. The id it read
-    // now names a DIFFERENT page.
-    writeFileSync(shiftFile, "");
+    assert.equal(selectedUrl(before), "https://example.org/");
+    // The selected tab goes away between the gateway reading its id and using
+    // it — a page that closed itself, which needs no client call at all.
+    // Upstream never reissues the number: `select_page` throws `No page found`,
+    // and that error reply carries no page block to read a selection out of.
+    resetTrace();
+    writeFileSync(closeFile, "");
     const shot = await client.callTool({ name: "take_screenshot", arguments: {} });
-    assert.equal((shot.content as { type: string }[])[0]?.type, "image", textOf(shot));
+    assert.equal(
+      (shot.content as { type: string }[])[0]?.type,
+      "image",
+      `the capture is retried against a fresh id rather than forwarded unactivated: ${textOf(shot)}`,
+    );
+    assert.deepEqual(
+      trace(),
+      ["list_pages", "select_page", "list_pages", "select_page", "take_screenshot"],
+      "one re-read, and one only",
+    );
 
     const after = await client.callTool({ name: "list_pages", arguments: {} });
     assert.equal(
       selectedUrl(after),
-      wanted,
-      "the client is left on the page it had selected, not the one the stale id named",
+      "https://example.com/",
+      "the client is left on the page the child chose when its own went away",
     );
   } finally {
+    rmSync(closeFile, { force: true });
     stop();
     await close();
   }
   assert.ok(
-    lines.some((l) => /selected page changed while bringing it to the front/.test(l)),
-    `the swap is said out loud, not silently corrected: ${lines.join(" | ")}`,
+    lines.some((l) => /to the front failed.*re-reading the page list once/.test(l)),
+    `the failed activation is said out loud, not swallowed: ${lines.join(" | ")}`,
   );
+});
+
+test("a page the client itself picked during the activation is not put back", async () => {
+  const { lines, stop } = await tapLines();
+  const { client, close } = await connect("inst-shot6", "shot-client-picks");
+  try {
+    await client.callTool({ name: "list_pages", arguments: {} }); // attach the browser
+    // The client does not wait for its screenshot before asking for a different
+    // tab. Re-selecting the page the activation read first would revert a
+    // choice the client has already been told succeeded.
+    writeFileSync(delayFile, "");
+    const shot = client.callTool({ name: "take_screenshot", arguments: {} });
+    await new Promise((r) => setTimeout(r, 150));
+    const picked = await client.callTool({
+      name: "select_page",
+      arguments: { pageId: 1, bringToFront: true },
+    });
+    rmSync(delayFile, { force: true });
+    assert.equal(selectedUrl(picked), "https://example.com/");
+
+    const done = await shot;
+    assert.equal((done.content as { type: string }[])[0]?.type, "image", textOf(done));
+    const after = await client.callTool({ name: "list_pages", arguments: {} });
+    assert.equal(
+      selectedUrl(after),
+      "https://example.com/",
+      "the client is left on the page IT chose, not the one the activation read first",
+    );
+  } finally {
+    rmSync(delayFile, { force: true });
+    stop();
+    await close();
+  }
+  assert.ok(
+    lines.some((l) => /picked a page itself while this capture was being set up/.test(l)),
+    `standing down is said out loud: ${lines.join(" | ")}`,
+  );
+});
+
+test("a capture the gateway DID bring to the front is allowed to be slow", async () => {
+  // The deadline replaces the child, which costs the session its page ids,
+  // snapshot uids and console history — so a client retrying a legitimately
+  // slow fullPage capture would degrade it on every attempt and never get it.
+  // A capture whose tab is demonstrably in front is not stuck, just slow: it
+  // rides Puppeteer's own 180s protocolTimeout, as it did before #89.
+  writeFileSync(slowFile, "");
+  const { client, close } = await connect("inst-shot7", "shot-slow");
+  try {
+    const started = Date.now();
+    const shot = await client.callTool({ name: "take_screenshot", arguments: {} });
+    assert.equal((shot.content as { type: string }[])[0]?.type, "image", textOf(shot));
+    assert.ok(
+      Date.now() - started > 2000,
+      "the capture really did outlast SCREENSHOT_DEADLINE_MS without being cut short",
+    );
+  } finally {
+    rmSync(slowFile, { force: true });
+    await close();
+  }
 });
 
 test("a capture that never returns replaces the child, instead of freezing the session", async () => {
   // The blast radius half of #89: the child holds its tool mutex for the whole
   // of Puppeteer's 180s protocolTimeout, so failing the client's request would
   // leave every other call on the session queued behind it. Only a fresh child
-  // frees it.
+  // frees it. The wedged child below cannot bring a tab to the front either,
+  // which is what makes this capture one the gateway never managed to protect
+  // — the only kind the deadline is armed for.
   writeFileSync(wedgeFile, "");
   const { client, close } = await connect("inst-shot5", "shot-wedged");
   try {

@@ -89,11 +89,13 @@ test("extension pages are not mistaken for the pages the child acts on", () => {
 
 test("the page id the activation sends is upstream's, not the row's position", () => {
   // The screenshot activation (issue #89) re-selects the child's selected page
-  // BY ID to bring it to the front. Upstream numbers pages across the whole
-  // browser and then prints extension pages in a separate section, so one
-  // extension page ahead of a real one makes the block's single row id 1. A
-  // gateway that counted rows would send pageId 0 and move the client to
-  // somebody else's tab — silently, because select_page would succeed.
+  // BY ID to bring it to the front. Upstream's ids are a counter — createPagesSnapshot
+  // stamps `#nextPageId++` once per page object, from 1, and never renumbers or
+  // reuses one — so a row's position stops matching its id the moment any tab
+  // closes, and getPageById throws `No page found` for the retired number. The
+  // reply below prints that id, not the row: a gateway that counted rows would
+  // send pageId 0 and move the client to somebody else's tab — silently,
+  // because select_page would succeed.
   const reply = realReply(
     ["chrome-extension://abcdef/popup.html", "https://example.com/"],
     "https://example.com/",
