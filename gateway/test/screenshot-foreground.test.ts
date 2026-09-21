@@ -31,15 +31,18 @@ import { tapLines } from "./log-tap.js";
  * number rather than renumbering its neighbours.
  */
 const FAKE_CDM = `#!/usr/bin/env node
-import { appendFileSync, existsSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 
 appendFileSync("__PIDFILE__", process.pid + "\\n");
 const WEDGE = "__WEDGEFILE__"; // while this exists: no tab can be fronted, no capture returns
 const SLOW = "__SLOWFILE__"; //  while this exists: a capture takes its time, but DOES return
 const CLOSE = "__CLOSEFILE__"; // one-shot: the selected tab closes under the next select_page
-const DELAY = "__DELAYFILE__"; // while this exists: list_pages dawdles, widening the window
+const DELAY = "__DELAYFILE__"; // list_pages dawdles for the ms this file names
+const SELDELAY = "__SELDELAYFILE__"; // select_page dawdles AFTER acting, for the ms it names
 const trace = (line) => appendFileSync("__TRACEFILE__", line + "\\n");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// A dawdle file's contents are its duration; an empty one means 300ms.
+const dawdle = (f) => (existsSync(f) ? sleep(Number(readFileSync(f, "utf8").trim()) || 300) : null);
 
 // The browser. Only ONE tab is composited — \`front\` — and it is not the tab
 // the tools act on (\`selected\`), which is the whole of the bug.
@@ -70,8 +73,15 @@ const never = () => new Promise(() => {});
 async function tool(name, args) {
   trace(name);
   if (name === "list_pages") {
-    if (existsSync(DELAY)) await sleep(300);
+    await dawdle(DELAY);
     return said("Listed pages.");
+  }
+  if (name === "navigate_page") {
+    // A long tool call is ordinary, not a fault: it just holds the one mutex.
+    // "slow:<ms>" is how this file asks for one.
+    const held = /^slow:(\\d+)$/.exec(args.url ?? "");
+    if (held) await sleep(Number(held[1]));
+    return said("Navigated to " + args.url + ".");
   }
   if (name === "select_page") {
     // A tab closing on its own — window.close(), a popup finishing its hop —
@@ -87,6 +97,7 @@ async function tool(name, args) {
     if (!page) return threw("No page found");
     selected = page.id;
     if (args.bringToFront) front = page.id;
+    await dawdle(SELDELAY);
     return said("Selected page " + page.id + ".");
   }
   if (name === "new_page") {
@@ -100,8 +111,11 @@ async function tool(name, args) {
   }
   if (name === "take_screenshot") {
     if (existsSync(WEDGE)) return never();
+    // With --experimentalPageIdRouting upstream captures the page the CALLER
+    // named, not the selected one — so that is the tab needing a frame.
+    const shot = typeof args.pageId === "number" ? args.pageId : selected;
     // No compositor frame for a tab that is not in front: this is the hang.
-    if (selected !== front) return never();
+    if (shot !== front) return never();
     // A real capture of a huge fullPage document: slow, and not stuck.
     if (existsSync(SLOW)) await sleep(3500);
     return { content: [{ type: "image", data: "aGk=", mimeType: "image/png" }] };
@@ -120,7 +134,7 @@ async function handle(m) {
     });
   else if (m.method === "tools/list")
     reply({
-      tools: ["list_pages", "select_page", "new_page", "take_screenshot"].map((name) => ({
+      tools: ["list_pages", "select_page", "new_page", "navigate_page", "take_screenshot"].map((name) => ({
         name,
         description: "fake",
         inputSchema: { type: "object" },
@@ -165,6 +179,7 @@ const wedgeFile = join(tmp, "wedge-capture");
 const slowFile = join(tmp, "slow-capture");
 const closeFile = join(tmp, "close-selected");
 const delayFile = join(tmp, "delay-list-pages");
+const selDelayFile = join(tmp, "delay-select-page");
 const traceFile = join(tmp, "calls.trace");
 // Paths are baked into the script rather than passed as env vars:
 // StdioClientTransport spawns children with a curated default environment, so
@@ -176,6 +191,7 @@ writeFileSync(
     .replace("__SLOWFILE__", slowFile)
     .replace("__CLOSEFILE__", closeFile)
     .replace("__DELAYFILE__", delayFile)
+    .replace("__SELDELAYFILE__", selDelayFile)
     .replace("__TRACEFILE__", traceFile),
   { mode: 0o755 },
 );
@@ -190,6 +206,9 @@ process.env.CDM_COMMAND = fakeCdm;
 process.env.GATEWAY_TOKEN = ""; // auth off; this test is about captures
 // Short enough to assert on, far longer than the fake needs to answer.
 process.env.SCREENSHOT_DEADLINE_MS = "2000";
+// Likewise: long enough that an unobstructed child always answers inside it,
+// short enough that a test can afford to let it expire.
+process.env.SCREENSHOT_ACTIVATE_TIMEOUT_MS = "1500";
 // The nav watchdog would otherwise verify this file's new_page against a
 // browser that does not exist. It has its own tests.
 process.env.NAV_VERIFY_DELAY_MS = "600000";
@@ -261,6 +280,21 @@ async function callWhenReady(
       await new Promise((r) => setTimeout(r, 100));
     }
   }
+}
+
+/**
+ * What a call that may never come back actually did: "returned", its error
+ * text, or "still waiting". A regression in any of this HANGS a session rather
+ * than failing an assertion, so every such call here is bounded.
+ */
+function outcomeWithin(call: Promise<unknown>, ms: number): Promise<string> {
+  return Promise.race([
+    call.then(
+      () => "returned",
+      (e: unknown) => `error: ${String(e)}`,
+    ),
+    new Promise<string>((r) => setTimeout(r, ms, "still waiting")),
+  ]);
 }
 
 const textOf = (r: unknown) =>
@@ -471,6 +505,107 @@ test("a capture that never returns replaces the child, instead of freezing the s
     );
   } finally {
     rmSync(wedgeFile, { force: true });
+    await close();
+  }
+});
+
+test("a page the client picks AFTER the injected select_page still leaves a deadline", async () => {
+  const { lines, stop } = await tapLines();
+  const { client, close } = await connect("inst-shot8", "shot-late-pick");
+  try {
+    await client.callTool({ name: "list_pages", arguments: {} }); // attach the browser
+    // The client's frame arrives while the injected select_page is in flight,
+    // so the child runs it AFTER: the tab the gateway fronted is not the tab
+    // the capture ends up being taken of. Reporting that activation as a
+    // success is the #89 hang with its own rescue disarmed.
+    writeFileSync(selDelayFile, "400");
+    const shot = client.callTool({ name: "take_screenshot", arguments: {} });
+    await new Promise((r) => setTimeout(r, 200));
+    await client.callTool({
+      name: "new_page",
+      arguments: { url: "https://late.example/", background: true },
+    });
+    rmSync(selDelayFile, { force: true });
+
+    const outcome = await outcomeWithin(shot, 15_000);
+    assert.match(
+      outcome,
+      /restart/i,
+      `the capture was still treated as unprotected, so the deadline rescued it: ${outcome}`,
+    );
+  } finally {
+    rmSync(selDelayFile, { force: true });
+    stop();
+    await close();
+  }
+  assert.ok(
+    lines.some((l) => /picked a page itself while this capture was being set up/.test(l)),
+    `the gateway says it stood down: ${lines.join(" | ")}`,
+  );
+});
+
+test("a long call holding the mutex does not have a sibling capture's deadline kill it", async () => {
+  const { lines, stop } = await tapLines();
+  const { client, close } = await connect("inst-shot9", "shot-mutex-sibling");
+  try {
+    // Put the capture's own tab in front first, so the only thing between it
+    // and an answer is the mutex the call ahead of it is holding. That same
+    // held mutex is what times the activation out, which is why the two always
+    // turn up together.
+    await client.callTool({ name: "select_page", arguments: { pageId: 2, bringToFront: true } });
+    const nav = client
+      .callTool({ name: "navigate_page", arguments: { url: "slow:4000" } })
+      .then(textOf, (e: unknown) => `error: ${String(e)}`);
+    await new Promise((r) => setTimeout(r, 100));
+    let shot: unknown;
+    const capture = client
+      .callTool({ name: "take_screenshot", arguments: {} })
+      .then((r) => {
+        shot = r;
+        return r;
+      });
+
+    const outcome = await outcomeWithin(capture, 20_000);
+    assert.equal(outcome, "returned", `a queued capture is not a stuck one: ${outcome}`);
+    assert.equal((shot as { content: { type: string }[] }).content[0]?.type, "image");
+    assert.match(
+      await nav,
+      /Navigated to slow:4000/,
+      "and the call it was queued behind was not failed out from under the client either",
+    );
+  } finally {
+    stop();
+    await close();
+  }
+  // The injected list_pages timed out and then replied anyway, late. A frame
+  // the gateway issued must never reach the client transport, which has no
+  // stream for its id and says so in a line that reads like a broken link.
+  assert.ok(
+    !lines.some((l) => /http send failed/.test(l)),
+    `no reply of the gateway's own leaked at the client: ${lines.join(" | ")}`,
+  );
+});
+
+test("a capture that names its own page fronts THAT page, not the selected one", async () => {
+  // CDM_EXTRA_ARGS=--experimentalPageIdRouting is a supported opt-in, and under
+  // it upstream captures the page the CALLER named. Fronting the selected page
+  // instead leaves the named one uncomposited — the #89 hang again, and
+  // reported as a protected capture so nothing rescues it.
+  const { client, close } = await connect("inst-shot10", "shot-routed-id");
+  try {
+    const before = await client.callTool({ name: "list_pages", arguments: {} });
+    assert.equal(selectedUrl(before), "https://example.org/", "and page 1 is not it");
+    let shot: unknown;
+    const capture = client
+      .callTool({ name: "take_screenshot", arguments: { pageId: 1 } })
+      .then((r) => {
+        shot = r;
+        return r;
+      });
+    const outcome = await outcomeWithin(capture, 15_000);
+    assert.equal(outcome, "returned", `the page the capture names was fronted: ${outcome}`);
+    assert.equal((shot as { content: { type: string }[] }).content[0]?.type, "image");
+  } finally {
     await close();
   }
 });
