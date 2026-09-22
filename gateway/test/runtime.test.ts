@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runtimeConfig, seedingLine, configWarningsFor } from "../src/runtime.js";
 
@@ -79,4 +80,63 @@ test("seed volume on the host + SEED_VOLUME unset is warned about", () => {
     configWarningsFor({ ...rc, seedVolume: "chikin-seed", seedingOn: true }, ["chikin-seed"]),
     [],
   );
+});
+
+// --- the per-Browser resource caps (#93) -------------------------------------
+
+// The BROWSER_* caps reached Docker and were reported by nothing, so the
+// frozen-env remedy ("read /healthz, not .env") had nothing to read and a
+// pids cap being hit was only findable by `docker inspect`. compose-env.test.ts
+// could not catch it: every cap had its compose line. This closes the other end.
+test("every BROWSER_* var config.ts reads is in the runtime report", () => {
+  // dist/test/*.js -> gateway/src/config.ts
+  const src = readFileSync(fileURLToPath(new URL("../../src/config.ts", import.meta.url)), "utf8");
+  const read = [...new Set([...src.matchAll(/"(BROWSER_[A-Z0-9_]+)"/g)].map((m) => m[1]))].sort();
+  assert.ok(read.length >= 4, "parsed suspiciously few BROWSER_* vars from config.ts");
+  assert.deepEqual(
+    Object.keys(runtimeConfig().browserCaps).sort(),
+    read,
+    "a BROWSER_* cap read in config.ts is missing from runtimeConfig().browserCaps (or vice versa)",
+  );
+});
+
+test("the caps report their effective values", () => {
+  assert.deepEqual(runtimeConfig().browserCaps, {
+    BROWSER_MEMORY_MB: 3072,
+    BROWSER_PIDS_LIMIT: 512,
+    BROWSER_CPUS: 2,
+    BROWSER_NOFILE: 8192,
+  });
+  const { cfg } = runtimeWithEnv({ BROWSER_PIDS_LIMIT: "4096", BROWSER_CPUS: "1.5" }) as {
+    cfg: { browserCaps: Record<string, unknown> };
+  };
+  assert.equal(cfg.browserCaps.BROWSER_PIDS_LIMIT, 4096);
+  assert.equal(cfg.browserCaps.BROWSER_CPUS, 1.5);
+});
+
+test("a cap Docker never receives reads \"off\", never a bare 0", () => {
+  // Same process for both, so the report and the HostConfig see one env.
+  const dir = fileURLToPath(new URL("../src/", import.meta.url));
+  const out = execFileSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `Promise.all([import(${JSON.stringify(dir + "runtime.js")}), import(${JSON.stringify(dir + "provisioner.js")})])` +
+        `.then(([r, p]) => process.stdout.write(JSON.stringify({caps: r.runtimeConfig().browserCaps, limits: p.resourceLimits()})));`,
+    ],
+    {
+      env: {
+        ...process.env,
+        BROWSER_MEMORY_MB: "0",
+        BROWSER_PIDS_LIMIT: "-1",
+        BROWSER_CPUS: "0",
+        BROWSER_NOFILE: "0",
+      },
+      encoding: "utf8",
+    },
+  );
+  const { caps, limits } = JSON.parse(out) as { caps: Record<string, unknown>; limits: Record<string, unknown> };
+  assert.deepEqual(limits, {}, "no cap reaches the HostConfig");
+  for (const [k, v] of Object.entries(caps)) assert.equal(v, "off", `${k} reported as ${String(v)}`);
 });

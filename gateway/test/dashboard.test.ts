@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { renderDashboard } from "../src/dashboard.js";
 import { Registry } from "../src/registry.js";
 import { config } from "../src/config.js";
+import { runtimeConfig } from "../src/runtime.js";
 
 // The dashboard's `idle` column is the plain MCP-traffic clock, which the
 // client bridge's 120s keepalive ping pins near zero on every attached session
@@ -103,6 +104,15 @@ test("the runtime-config panel surfaces the attached TTL knob", async () => {
     new RegExp(String(Math.round(config.attachedIdleTtlMs / 1000))),
     "with its effective value from THIS process",
   );
+});
+
+test("the runtime-config panel lists every per-browser cap beside MAX_FLEET (#93)", async () => {
+  const html = await renderDashboard(fakeProvisioner([]) as never, new Registry());
+  const panel = html.slice(html.indexOf("<h2>runtime config"));
+  for (const k of Object.keys(runtimeConfig().browserCaps)) {
+    assert.match(panel, new RegExp(`<code>${k}</code></dt><dd>`), `${k} is on the panel`);
+  }
+  assert.match(panel, /BROWSER_PIDS_LIMIT<\/code><\/dt><dd>512 threads/, "with its effective value and unit");
 });
 
 // --- the #81 redesign's invariants ------------------------------------------

@@ -1,5 +1,5 @@
 import { config } from "./config.js";
-import { runtimeConfig, configWarnings } from "./runtime.js";
+import { runtimeConfig, configWarnings, type BrowserCapVar } from "./runtime.js";
 import type { Registry } from "./registry.js";
 import type { Provisioner, FleetMember, SandboxStatus } from "./provisioner.js";
 
@@ -120,6 +120,15 @@ function gauge(used: number, max: number): string {
  * panel is the running truth. Seeding leads because it is the knob that failed
  * silently for ~7 weeks.
  */
+const CAP_UNIT: Record<BrowserCapVar, string> = {
+  BROWSER_MEMORY_MB: "MiB per browser (swap pinned equal)",
+  // The pids cgroup counts threads, and Chrome runs 10–30 per process: a browser
+  // hit the 512 default with 16 processes in it (#93).
+  BROWSER_PIDS_LIMIT: "threads per browser (the pids cgroup counts threads, not processes)",
+  BROWSER_CPUS: "cores per browser",
+  BROWSER_NOFILE: "open files per browser (soft=hard)",
+};
+
 function configPanel(): string {
   const rc = runtimeConfig();
   const seeding = rc.seedingOn
@@ -129,6 +138,9 @@ function configPanel(): string {
     ["CHROME_IMAGE", rc.chromeImage],
     ["CHIKIN_SANDBOX", rc.sandbox],
     ["MAX_FLEET", String(rc.maxFleet)],
+    ...(Object.entries(rc.browserCaps) as [BrowserCapVar, number | "off"][]).map(
+      ([k, v]): [string, string] => [k, v === "off" ? "off (no cap applied)" : `${v} ${CAP_UNIT[k]}`],
+    ),
     ["IDLE_TTL_SEC", `${rc.idleTtlSec} (detached browsers)`],
     [
       "ATTACHED_IDLE_TTL_SEC",
