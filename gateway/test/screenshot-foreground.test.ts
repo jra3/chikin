@@ -109,10 +109,14 @@ async function tool(name, args) {
     return said("Opened " + args.url + ".");
   }
   if (name === "take_screenshot") {
+    // With --experimentalPageIdRouting upstream reads the page the CALL names
+    // rather than the selected one (ToolHandler.js), so the tab that needs a
+    // compositor frame is that one.
+    const target = typeof args.pageId === "number" ? args.pageId : selected;
     // No compositor frame for a tab that is not in front: this is the hang,
     // and nothing in the gateway rescues it — so every test that takes one
     // carries its own node:test timeout.
-    if (selected !== front) return never();
+    if (target !== front) return never();
     return { content: [{ type: "image", data: "aGk=", mimeType: "image/png" }] };
   }
   return said("ok");
@@ -510,3 +514,40 @@ test("a capture queued behind a long call still returns, and no injected reply l
     `no reply of the gateway's own leaked at the client: ${lines.join(" | ")}`,
   );
 });
+
+test(
+  "a capture that names its own page is forwarded untouched",
+  { timeout: CAPTURE_TIMEOUT_MS },
+  async () => {
+    const { client, close } = await connect("inst-shot-routed", "shot-routed");
+    try {
+      // The fake starts with page 3 in front and page 2 selected, which is the
+      // reported case exactly: a capture that NAMES page 3 reads the tab that
+      // already has a compositor frame, so it worked before any of this landed.
+      // Bringing the selected tab to the front instead would take that frame
+      // away and hang a capture that used to return.
+      const before = await client.callTool({ name: "list_pages", arguments: {} });
+      assert.equal(selectedUrl(before), "https://example.org/", "page 2 is the selected one");
+
+      resetTrace();
+      const shot = await client.callTool({
+        name: "take_screenshot",
+        arguments: { pageId: 3 },
+      });
+      assert.equal((shot.content as { type: string }[])[0]?.type, "image", textOf(shot));
+      assert.deepEqual(
+        trace(),
+        ["take_screenshot"],
+        "nothing was injected ahead of a capture that picked its own page",
+      );
+
+      // And the selection is still the client's, which is the other half of why
+      // the routed tab is not fronted: upstream's select_page cannot bring a
+      // page forward without also selecting it.
+      const after = await client.callTool({ name: "list_pages", arguments: {} });
+      assert.equal(selectedUrl(after), "https://example.org/", "selection untouched");
+    } finally {
+      await close();
+    }
+  },
+);

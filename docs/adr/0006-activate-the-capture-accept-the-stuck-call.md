@@ -87,12 +87,36 @@ No timing constant remains anywhere in the activation path.
 - Never make a slow but healthy call worse than it is now. Returning at 180s
   beats never returning.
 
+## Why a capture that names its own page is left alone
+
+`CDM_EXTRA_ARGS=--experimentalPageIdRouting` makes upstream route a page-scoped
+tool by `params.pageId` rather than by the selected page (`ToolHandler.js`), so
+a `take_screenshot{pageId}` reads a tab the activation was never aiming at.
+Those captures are forwarded untouched.
+
+Fronting the routed tab is not on offer. `select_page` is the only activation
+upstream exposes, and its handler calls `context.selectPage(page)` before it
+honours `bringToFront` (`tools/pages.js`), so it cannot bring a tab forward
+without also selecting it. Honouring the routed target would move the session's
+selection for good, and every later `take_snapshot`, `click` or `navigate_page`
+that named no id would act on a page the client never chose. That was built
+during #89 and reverted for exactly this.
+
+Leaving it alone is also the only choice that cannot make things worse. The
+routed tab is frequently the front one already, in which case fronting the
+SELECTED tab takes the compositor frame away and hangs a capture that used to
+return. Supporting routed captures properly needs a path that fronts without
+selecting, which means CDP `Target.activateTarget` rather than a tool call. The
+flag is off by default and nothing ships needing it, so that is not built.
+
 ## Considered options
 
 - **Activate before forwarding (chosen).** One injected `list_pages` plus one
-  `select_page{bringToFront}` per capture, on the child's own tool mutex so
-  nothing of the client's can overtake the pair. Fail-open everywhere: an
-  unactivated capture is the old behaviour, a dropped one would be a new bug.
+  `select_page{bringToFront}`, on the child's own tool mutex so nothing of the
+  client's can overtake the pair. One pass in the common case and up to
+  `ACTIVATION_PASSES` (three) when an id was retired under it or the client
+  picked a page itself mid-activation. Fail-open everywhere: an unactivated
+  capture is the old behaviour, a dropped one would be a new bug.
 - **Bump `chrome-devtools-mcp`.** Checked against the 1.6.0 and 1.9.0 tarballs.
   `take_screenshot` still does not activate its page, so this does nothing.
 - **Activate over CDP instead**, with `/json/activate/<targetId>`. It touches no

@@ -1280,12 +1280,42 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
    * queueing every frame behind an activation — costs more than it buys.
    */
   function dispatch(msg: JSONRPCMessage, f: Frame): void {
-    if (f?.method === "tools/call" && FOREGROUND_TOOLS.has(f.params?.name ?? "")) {
+    if (
+      f?.method === "tools/call" &&
+      FOREGROUND_TOOLS.has(f.params?.name ?? "") &&
+      !capturePicksItsOwnPage(f)
+    ) {
       void activateThenForward(msg, f);
       return;
     }
     forwardToChild(msg, f);
   }
+
+  /**
+   * A capture that names the page it wants. Under
+   * `CDM_EXTRA_ARGS=--experimentalPageIdRouting` (documented in `config.ts`)
+   * upstream routes a page-scoped tool by `params.pageId` rather than by the
+   * selected page, so the tab such a capture reads is NOT the tab the
+   * activation would bring to the front.
+   *
+   * It is forwarded untouched, because fronting the routed tab is not something
+   * the gateway can do on its own: upstream's `select_page` handler calls
+   * `context.selectPage(page)` unconditionally and only afterwards honours
+   * `bringToFront` (`tools/pages.js`), so selection is a side effect there is no
+   * way to opt out of. Fronting the routed tab would move the session's
+   * selection for good, and every later `take_snapshot`, `click` or
+   * `navigate_page` that named no id would quietly act on a page the client
+   * never chose. That trade was made once during #89 and reverted.
+   *
+   * Leaving it alone also keeps a working capture working. The routed tab may
+   * already be the front one, in which case fronting the SELECTED tab instead
+   * takes the compositor frame away and hangs a capture that used to return.
+   * Activating a routed capture properly needs a path that fronts without
+   * selecting (CDP `Target.activateTarget`); the flag is off by default, so
+   * nothing ships needing it. See ADR 0006.
+   */
+  const capturePicksItsOwnPage = (f: Frame): boolean =>
+    typeof f.params?.arguments?.pageId === "number";
 
   async function activateThenForward(msg: JSONRPCMessage, f: Frame): Promise<void> {
     try {
@@ -1355,7 +1385,17 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         return true;
       };
 
-      const before = pageEntries((await callChild("list_pages", {}))?.result);
+      const listed = await callChild("list_pages", {});
+      if (!listed) {
+        // No reply at all, rather than a reply we could not read: the session
+        // is closing, or the child is being swapped. This capture never reaches
+        // a live child either (`activateThenForward` returns on a closed
+        // session, `forwardToChild` fails it retryably), so there is no hang
+        // here to warn anyone about.
+        log.debug(`session[${name}]: no child to set this capture's tab up against`);
+        return;
+      }
+      const before = pageEntries(listed.result);
       const target = before?.find((p) => p.selected);
       if (!target || !Number.isInteger(target.id)) {
         log.warn(
@@ -1369,7 +1409,11 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       if (clientChoseSince()) continue;
 
       const after = await selectToFront(target.id as number);
-      if (!after) {
+      if (!after.replied) {
+        log.debug(`session[${name}]: the child went away while fronting this capture's tab`);
+        return;
+      }
+      if (!after.pages) {
         // An error reply — `No page found` for an id upstream has retired, or a
         // tool it has renamed — which carries no page block to read. The tab is
         // NOT in front, and saying so here is the only word the operator gets:
@@ -1391,11 +1435,11 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       // the same URL; "did anything change under us" is the epoch's question,
       // asked just above, and this one is only "is the tab I aimed at the tab
       // that is selected".
-      const now = after.find((p) => p.selected);
+      const now = after.pages.find((p) => p.selected);
       if (now?.id === target.id) return;
       // It landed somewhere other than the page the id was read from. Put the
       // client's own selection back, by the id that very reply printed.
-      const restore = after.find((p) => p.url === target.url && Number.isInteger(p.id));
+      const restore = after.pages.find((p) => p.url === target.url && Number.isInteger(p.id));
       log.warn(
         `session[${name}]: the selected page changed while bringing it to the front ` +
           `(${target.url} -> ${now?.url ?? "nothing selected"})` +
@@ -1408,12 +1452,19 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   }
 
   /**
-   * One injected `select_page ... bringToFront`. null means it did not land: an
-   * error reply, which upstream renders with no page block at all because the
-   * handler throws before asking for one, or a child that went away under it.
+   * One injected `select_page ... bringToFront`.
+   *
+   * The two ways it fails are not the same thing and must not log the same way.
+   * `replied: false` is no reply at all, so the child is going away and nothing
+   * is wrong with the page. `pages: null` is a real reply carrying no page
+   * block, which upstream renders that way when the handler throws before
+   * asking for one — a retired id's `No page found`.
    */
-  async function selectToFront(pageId: number): Promise<PageEntry[] | null> {
-    return pageEntries((await callChild("select_page", { pageId, bringToFront: true }))?.result);
+  async function selectToFront(
+    pageId: number,
+  ): Promise<{ replied: boolean; pages: PageEntry[] | null }> {
+    const reply = await callChild("select_page", { pageId, bringToFront: true });
+    return { replied: reply !== null, pages: reply ? pageEntries(reply.result) : null };
   }
 
   // Client -> child pump. Cache initialize; track requests; fail fast while a
