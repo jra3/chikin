@@ -23,6 +23,17 @@ export interface RuntimeConfig {
   chromeImage: string;
   sandbox: string;
   maxFleet: number;
+  /**
+   * The per-Browser resource caps (M3) applied to every container's HostConfig,
+   * keyed by the env var that sets each one. MAX_FLEET bounds how many Browsers
+   * run; these bound what one of them may use, and a Browser that hits one does
+   * not error — a denied clone() hangs a renderer, which reads as "chikin is
+   * wedged" (#93). A cap ≤ 0 is not applied at all (`resourceLimits` in
+   * provisioner.ts), so it is reported as "off", never as a bare 0.
+   * `runtime.test.ts` fails the build if config.ts reads a BROWSER_* var that
+   * is missing here.
+   */
+  browserCaps: Record<BrowserCapVar, number | "off">;
   idleTtlSec: number;
   /**
    * Grace period for a browser whose client is still attached but which has run
@@ -50,6 +61,15 @@ export interface RuntimeConfig {
   cdmExtraArgs: string[];
 }
 
+export type BrowserCapVar =
+  | "BROWSER_MEMORY_MB"
+  | "BROWSER_PIDS_LIMIT"
+  | "BROWSER_CPUS"
+  | "BROWSER_NOFILE";
+
+/** Same gate as `resourceLimits`: only a positive cap reaches Docker. */
+const cap = (v: number): number | "off" => (v > 0 ? v : "off");
+
 export function runtimeConfig(): RuntimeConfig {
   return {
     seedVolume: config.seedVolume,
@@ -57,6 +77,12 @@ export function runtimeConfig(): RuntimeConfig {
     chromeImage: config.image,
     sandbox: config.sandbox,
     maxFleet: config.maxFleet,
+    browserCaps: {
+      BROWSER_MEMORY_MB: cap(config.memoryMb),
+      BROWSER_PIDS_LIMIT: cap(config.pidsLimit),
+      BROWSER_CPUS: cap(config.cpus),
+      BROWSER_NOFILE: cap(config.nofile),
+    },
     idleTtlSec: Math.round(config.idleTtlMs / 1000),
     attachedIdleTtlSec: Math.round(config.attachedIdleTtlMs / 1000),
     volumeGc: config.volumeGc,
