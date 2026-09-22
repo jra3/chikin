@@ -115,12 +115,11 @@ const FOREGROUND_TOOLS = new Set(["take_screenshot"]);
 // moves `selectionEpoch`, which is how an activation already in flight finds
 // out that the client has since made a choice of its own.
 const SELECTION_TOOLS = new Set(["select_page", "new_page", "close_page"]);
-// Per injected call. Activation is a latency tax on every screenshot, so it is
-// bounded well under the capture it is protecting.
-// A test seam, deliberately NOT an operator knob (like NAV_VERIFY_DELAY_MS
-// above): documenting it obliges a docker-compose.yml line too, or the
-// operator's .env is silently inert — see gateway/test/compose-env.test.ts.
-const ACTIVATE_TIMEOUT_MS = Number(process.env.SCREENSHOT_ACTIVATE_TIMEOUT_MS || 5_000);
+// Reads of the page list the activation will make before giving up. Three
+// covers both reasons a pass can be wasted — an id retired under it, and the
+// client choosing a page for itself while it was in flight — without letting a
+// client that keeps pipelining hold a capture forever.
+const ACTIVATION_PASSES = 3;
 
 export interface ReportedPages {
   pages: string[];
@@ -597,7 +596,9 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   /**
    * Everything the gateway tracks on behalf of the child that is going away.
    * Called at both child swaps: anything left behind would be judged against,
-   * or answered by, a child that never saw it.
+   * or answered by, a child that never saw it. Also at session close — an
+   * injected call carries no clock of its own, so close is the last thing that
+   * can settle one the child was never going to answer.
    */
   function clearChildState(): void {
     pendingNavs.clear();
@@ -610,27 +611,30 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
 
   /**
    * Call a tool on the child on the GATEWAY's own behalf and wait for its
-   * reply. Resolves null on every failure — no child, a respawn in flight, a
-   * send that threw, a reply that never came, or a reply from a child that has
-   * since been replaced (the pump drops stale generations, so only the timer
-   * settles that one). Callers must read null as "carry on without it".
+   * reply. Exactly three things settle it: the reply, `clearChildState()` at a
+   * child swap, and `clearChildState()` at session close. Null means one of
+   * those last two, or that there was nothing to ask in the first place — no
+   * child, or a respawn already in flight — or that the send itself threw.
+   * Callers must read null as "carry on without it".
+   *
+   * There is deliberately NO wall clock on the wait. The child serializes every
+   * tool call, so a clock started at send cannot see that mutex and can only
+   * ever fire on a call that was merely QUEUED behind an ordinary long one —
+   * and firing bought nothing, because the capture was then forwarded into the
+   * same FIFO behind the same injected `list_pages`. The client waited exactly
+   * as long either way; the only thing the timer cost was the activation. That
+   * is ADR 0006's own argument, applied to this fix as well as to what it
+   * replaced.
    */
-  function callChild(
-    tool: string,
-    args: Record<string, unknown>,
-    timeoutMs: number,
-  ): Promise<Frame | null> {
+  function callChild(tool: string, args: Record<string, unknown>): Promise<Frame | null> {
     const c = child;
     if (!c || respawning) return Promise.resolve(null);
     const id = `${injectPrefix}${++injectedSeq}`;
     return new Promise<Frame | null>((resolve) => {
       const settle = (f: Frame | null): void => {
-        clearTimeout(timer);
         injected.delete(id);
         resolve(f);
       };
-      const timer = setTimeout(() => settle(null), timeoutMs);
-      timer.unref?.();
       injected.set(id, settle);
       c.send({
         jsonrpc: "2.0",
@@ -1312,29 +1316,27 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
    * queued between them, and re-selecting the page read before that would
    * silently revert a choice the client has already been told succeeded.
    * `selectionEpoch` is how that is noticed: it moves when such a frame is
-   * handed to the child, so an epoch that moved means the client's newer intent
-   * wins and the activation stands down.
+   * handed to the child. The answer is to READ AGAIN rather than to stand
+   * down — a fresh `list_pages` queues behind the client's own frame on that
+   * same mutex, so it reports the client's newer selection, and fronting that
+   * is what the client wanted. Standing down instead left the capture on
+   * whatever the client had just selected, which for `new_page(background:
+   * true)` is a tab nothing has ever composited: the issue's own headline trap,
+   * reproduced through the guard meant to respect the client.
    *
    * Every branch is fail-open, and none of them reports back: the capture is
    * forwarded either way. Nothing rescues one that blocks anyway — see
    * docs/adr/0006 and issue #90.
    */
   async function bringSelectedToFront(): Promise<void> {
-    const epoch = selectionEpoch;
-    const clientChoseSince = (): boolean => {
-      if (selectionEpoch === epoch) return false;
-      log.warn(
-        `session[${name}]: the client picked a page itself while this capture was being set up, ` +
-          `so its own choice is left standing and the capture is forwarded without bringing a ` +
-          `tab to the front`,
-      );
-      return true;
-    };
+    for (let pass = 0; pass < ACTIVATION_PASSES; pass++) {
+      const last = pass === ACTIVATION_PASSES - 1;
+      // Re-read per pass: a pass that lost to the client's own choice has to
+      // judge the next one against that newer choice, not the original.
+      const epoch = selectionEpoch;
+      const clientChoseSince = (): boolean => selectionEpoch !== epoch;
 
-    // Two passes at most: one to use the ids as read, one to re-read them after
-    // an id turned out to name a tab that had already gone.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const before = pageEntries((await callChild("list_pages", {}, ACTIVATE_TIMEOUT_MS))?.result);
+      const before = pageEntries((await callChild("list_pages", {}))?.result);
       const target = before?.find((p) => p.selected);
       if (!target || !Number.isInteger(target.id)) {
         log.warn(
@@ -1345,27 +1347,36 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         );
         return;
       }
-      if (clientChoseSince()) return;
+      if (clientChoseSince()) {
+        log.warn(
+          `session[${name}]: the client picked a page itself while this capture was being set up` +
+            (last
+              ? `, and it has kept doing so — leaving its choice standing and forwarding the ` +
+                `capture without bringing a tab to the front`
+              : `; reading the page list again so the tab brought to the front is the one it chose`),
+        );
+        continue;
+      }
 
       const after = await selectToFront(target.id as number);
       if (!after) {
-        // An error reply (`No page found` for a retired id, or a tool upstream
-        // has renamed) or nothing at all within ACTIVATE_TIMEOUT_MS. The tab is
-        // NOT in front either way, and saying so here is the only word the
-        // operator gets — nothing downstream notices.
+        // An error reply — `No page found` for an id upstream has retired, or a
+        // tool it has renamed — which carries no page block to read. The tab is
+        // NOT in front, and saying so here is the only word the operator gets:
+        // nothing downstream notices.
         log.warn(
           `session[${name}]: bringing page ${target.id} (${target.url}) to the front failed` +
-            (attempt === 0
-              ? "; re-reading the page list once, in case that id named a tab that has closed"
-              : "; forwarding the capture without it, which can block until Puppeteer's 180s " +
-                "protocolTimeout with the session's tool mutex held"),
+            (last
+              ? "; forwarding the capture without it, which can block until Puppeteer's 180s " +
+                "protocolTimeout with the session's tool mutex held"
+              : "; reading the page list again, in case that id named a tab that has closed"),
         );
         continue;
       }
 
       const now = after.find((p) => p.selected);
       if (now && (now.id === target.id || now.url === target.url)) return;
-      if (clientChoseSince()) return;
+      if (clientChoseSince()) continue;
       // The id landed somewhere other than the page it was read from. Put the
       // client's own selection back, by the id that very reply printed.
       const restore = after.find((p) => p.url === target.url && Number.isInteger(p.id));
@@ -1381,13 +1392,12 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   }
 
   /**
-   * One injected `select_page ... bringToFront`. null means it did not land —
-   * a timeout, or an error reply, which upstream renders with no page block at
-   * all because the handler throws before asking for one.
+   * One injected `select_page ... bringToFront`. null means it did not land: an
+   * error reply, which upstream renders with no page block at all because the
+   * handler throws before asking for one, or a child that went away under it.
    */
   async function selectToFront(pageId: number): Promise<PageEntry[] | null> {
-    const reply = await callChild("select_page", { pageId, bringToFront: true }, ACTIVATE_TIMEOUT_MS);
-    return pageEntries(reply?.result);
+    return pageEntries((await callChild("select_page", { pageId, bringToFront: true }))?.result);
   }
 
   // Client -> child pump. Cache initialize; track requests; fail fast while a
@@ -1444,6 +1454,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     name,
     http,
     async () => {
+      clearChildState();
       try {
         await child?.close();
       } catch {

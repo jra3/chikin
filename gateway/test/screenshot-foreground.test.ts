@@ -189,9 +189,6 @@ const resetTrace = () => rmSync(traceFile, { force: true });
 process.env.PORT = String(port);
 process.env.CDM_COMMAND = fakeCdm;
 process.env.GATEWAY_TOKEN = ""; // auth off; this test is about captures
-// Long enough that an unobstructed child always answers inside it, short enough
-// that a test can afford to let it expire.
-process.env.SCREENSHOT_ACTIVATE_TIMEOUT_MS = "1500";
 // The nav watchdog would otherwise verify this file's new_page against a
 // browser that does not exist. It has its own tests.
 process.env.NAV_VERIFY_DELAY_MS = "600000";
@@ -378,7 +375,7 @@ test("an id that has been retired under the activation is re-read, not given up 
     await close();
   }
   assert.ok(
-    lines.some((l) => /to the front failed.*re-reading the page list once/.test(l)),
+    lines.some((l) => /to the front failed.*reading the page list again/.test(l)),
     `the failed activation is said out loud, not swallowed: ${lines.join(" | ")}`,
   );
 });
@@ -389,8 +386,9 @@ test("a page the client itself picked during the activation is not put back", { 
   try {
     await client.callTool({ name: "list_pages", arguments: {} }); // attach the browser
     // The client does not wait for its screenshot before asking for a different
-    // tab. Re-selecting the page the activation read first would revert a
-    // choice the client has already been told succeeded.
+    // tab. Re-selecting the page the activation read FIRST would revert a
+    // choice the client has already been told succeeded, so the activation
+    // reads the list again and fronts what the client actually picked.
     writeFileSync(delayFile, "");
     const shot = client.callTool({ name: "take_screenshot", arguments: {} });
     await new Promise((r) => setTimeout(r, 150));
@@ -416,8 +414,42 @@ test("a page the client itself picked during the activation is not put back", { 
   }
   assert.ok(
     lines.some((l) => /picked a page itself while this capture was being set up/.test(l)),
-    `standing down is said out loud: ${lines.join(" | ")}`,
+    `noticing the client's own choice is said out loud: ${lines.join(" | ")}`,
   );
+});
+
+test("the documented trap pipelined alongside the capture still gets its image", {
+  timeout: CAPTURE_TIMEOUT_MS,
+}, async () => {
+  const { client, close } = await connect("inst-shot11", "shot-pipelined-trap");
+  try {
+    await client.callTool({ name: "list_pages", arguments: {} }); // attach the browser
+    // `new_page(background: true)` selects a tab nothing has composited — the
+    // workflow the issue names — and here it arrives DURING the activation, so
+    // the gateway learns about it only as a moved selection epoch. Standing
+    // down there would hand the capture the trap itself.
+    writeFileSync(delayFile, "300");
+    const shot = client.callTool({ name: "take_screenshot", arguments: {} });
+    await new Promise((r) => setTimeout(r, 150));
+    const opened = await client.callTool({
+      name: "new_page",
+      arguments: { url: "https://pipelined.example/", background: true },
+    });
+    rmSync(delayFile, { force: true });
+    assert.equal(selectedUrl(opened), "https://pipelined.example/");
+
+    const done = await shot;
+    assert.equal((done.content as { type: string }[])[0]?.type, "image", textOf(done));
+    const after = await client.callTool({ name: "list_pages", arguments: {} });
+    assert.equal(
+      selectedUrl(after),
+      "https://pipelined.example/",
+      "the capture was taken of the page the client had just opened, and left it selected",
+    );
+  } finally {
+    rmSync(delayFile, { force: true });
+    await close();
+  }
 });
 
 test("a capture queued behind a long call still returns, and no injected reply leaks", {
@@ -425,13 +457,14 @@ test("a capture queued behind a long call still returns, and no injected reply l
 }, async () => {
   const { lines, stop } = await tapLines();
   const { client, close } = await connect("inst-shot9", "shot-mutex-sibling");
+  const started = Date.now();
   try {
-    // Put the capture's own tab in front first, so the only thing between it
-    // and an answer is the mutex the call ahead of it is holding. That same
-    // held mutex is what times the activation out, which is why the two always
-    // turn up together — and the activation must fail open rather than cost
-    // the caller its capture.
-    await client.callTool({ name: "select_page", arguments: { pageId: 2, bringToFront: true } });
+    // The capture's tab is NOT in front, so this only comes back if the
+    // activation really happened. Its injected `list_pages` is queued behind a
+    // call holding the child's tool mutex for four seconds, and it has to wait
+    // that out: a clock on the injected call would expire against a child that
+    // is perfectly healthy and merely busy, and forward the capture at the
+    // hang this whole change exists to close.
     const nav = client
       .callTool({ name: "navigate_page", arguments: { url: "slow:4000" } })
       .then(textOf, (e: unknown) => `error: ${String(e)}`);
@@ -447,6 +480,7 @@ test("a capture queued behind a long call still returns, and no injected reply l
     const outcome = await outcomeWithin(capture, 20_000);
     assert.equal(outcome, "returned", `a queued capture is not a lost one: ${outcome}`);
     assert.equal((shot as { content: { type: string }[] }).content[0]?.type, "image");
+    assert.ok(Date.now() - started > 4000, "and it really did wait the mutex out");
     assert.match(
       await nav,
       /Navigated to slow:4000/,
@@ -456,9 +490,9 @@ test("a capture queued behind a long call still returns, and no injected reply l
     stop();
     await close();
   }
-  // The injected list_pages timed out and then replied anyway, late. A frame
-  // the gateway issued must never reach the client transport, which has no
-  // stream for its id and says so in a line that reads like a broken link.
+  // A frame the gateway issued must never reach the client transport, which
+  // has no stream for its id and says so in a line that reads like a broken
+  // client link.
   assert.ok(
     !lines.some((l) => /http send failed/.test(l)),
     `no reply of the gateway's own leaked at the client: ${lines.join(" | ")}`,

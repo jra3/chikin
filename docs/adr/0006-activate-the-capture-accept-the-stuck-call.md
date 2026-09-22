@@ -57,6 +57,23 @@ Four defects in two review rounds, on a guard the issue itself offered only as a
 fallback "in case the bridge is the wrong seam". The bridge was not the wrong
 seam. Shipping the cure without the fallback is the smaller, truer change.
 
+## The injected calls carry no clock either
+
+The activation's own `list_pages` and `select_page` wait indefinitely for the
+child to answer. They were first written with a 5s timeout, which is the same
+mistake one section up: a clock started at send cannot see the tool mutex, so
+the only call it can ever fire on is one that was merely queued behind an
+ordinary long one. And firing bought nothing. On expiry the capture was
+forwarded into the same FIFO behind the same injected `list_pages`, so the
+client waited exactly as long either way — the timer's only effect was to lose
+the activation and hand the capture the 180s hang this change exists to close.
+Writing that into the fix, one section below where this document condemns it, is
+the part worth recording.
+
+So an injected call is settled by exactly three things: its reply,
+`clearChildState()` at a child swap, and `clearChildState()` at session close.
+No timing constant remains anywhere in the activation path.
+
 ## What a guard would have to satisfy
 
 **This section runs ahead of the code.** Issue #90 lands it, and nothing in
