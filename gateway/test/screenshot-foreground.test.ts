@@ -34,11 +34,8 @@ const FAKE_CDM = `#!/usr/bin/env node
 import { appendFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 
 appendFileSync("__PIDFILE__", process.pid + "\\n");
-const WEDGE = "__WEDGEFILE__"; // while this exists: no tab can be fronted, no capture returns
-const SLOW = "__SLOWFILE__"; //  while this exists: a capture takes its time, but DOES return
 const CLOSE = "__CLOSEFILE__"; // one-shot: the selected tab closes under the next select_page
 const DELAY = "__DELAYFILE__"; // list_pages dawdles for the ms this file names
-const SELDELAY = "__SELDELAYFILE__"; // select_page dawdles AFTER acting, for the ms it names
 const trace = (line) => appendFileSync("__TRACEFILE__", line + "\\n");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A dawdle file's contents are its duration; an empty one means 300ms.
@@ -92,12 +89,10 @@ async function tool(name, args) {
       pages = pages.filter((p) => p.id !== selected);
       selected = pages[0].id;
     }
-    if (existsSync(WEDGE)) return threw("No page found");
     const page = pages.find((p) => p.id === args.pageId);
     if (!page) return threw("No page found");
     selected = page.id;
     if (args.bringToFront) front = page.id;
-    await dawdle(SELDELAY);
     return said("Selected page " + page.id + ".");
   }
   if (name === "new_page") {
@@ -110,14 +105,10 @@ async function tool(name, args) {
     return said("Opened " + args.url + ".");
   }
   if (name === "take_screenshot") {
-    if (existsSync(WEDGE)) return never();
-    // With --experimentalPageIdRouting upstream captures the page the CALLER
-    // named, not the selected one — so that is the tab needing a frame.
-    const shot = typeof args.pageId === "number" ? args.pageId : selected;
-    // No compositor frame for a tab that is not in front: this is the hang.
-    if (shot !== front) return never();
-    // A real capture of a huge fullPage document: slow, and not stuck.
-    if (existsSync(SLOW)) await sleep(3500);
+    // No compositor frame for a tab that is not in front: this is the hang,
+    // and nothing in the gateway rescues it — so every test that takes one
+    // carries its own node:test timeout.
+    if (selected !== front) return never();
     return { content: [{ type: "image", data: "aGk=", mimeType: "image/png" }] };
   }
   return said("ok");
@@ -175,11 +166,8 @@ const port = await new Promise<number>((resolve) => {
 const tmp = mkdtempSync(join(tmpdir(), "chikin-shot-"));
 const fakeCdm = join(tmp, "fake-cdm.mjs");
 const pidFile = join(tmp, "children.pids");
-const wedgeFile = join(tmp, "wedge-capture");
-const slowFile = join(tmp, "slow-capture");
 const closeFile = join(tmp, "close-selected");
 const delayFile = join(tmp, "delay-list-pages");
-const selDelayFile = join(tmp, "delay-select-page");
 const traceFile = join(tmp, "calls.trace");
 // Paths are baked into the script rather than passed as env vars:
 // StdioClientTransport spawns children with a curated default environment, so
@@ -187,11 +175,8 @@ const traceFile = join(tmp, "calls.trace");
 writeFileSync(
   fakeCdm,
   FAKE_CDM.replace("__PIDFILE__", pidFile)
-    .replace("__WEDGEFILE__", wedgeFile)
-    .replace("__SLOWFILE__", slowFile)
     .replace("__CLOSEFILE__", closeFile)
     .replace("__DELAYFILE__", delayFile)
-    .replace("__SELDELAYFILE__", selDelayFile)
     .replace("__TRACEFILE__", traceFile),
   { mode: 0o755 },
 );
@@ -204,10 +189,8 @@ const resetTrace = () => rmSync(traceFile, { force: true });
 process.env.PORT = String(port);
 process.env.CDM_COMMAND = fakeCdm;
 process.env.GATEWAY_TOKEN = ""; // auth off; this test is about captures
-// Short enough to assert on, far longer than the fake needs to answer.
-process.env.SCREENSHOT_DEADLINE_MS = "2000";
-// Likewise: long enough that an unobstructed child always answers inside it,
-// short enough that a test can afford to let it expire.
+// Long enough that an unobstructed child always answers inside it, short enough
+// that a test can afford to let it expire.
 process.env.SCREENSHOT_ACTIVATE_TIMEOUT_MS = "1500";
 // The nav watchdog would otherwise verify this file's new_page against a
 // browser that does not exist. It has its own tests.
@@ -262,27 +245,6 @@ async function connect(name: string, handle: string) {
 }
 
 /**
- * Retry a call the gateway answers with its retryable "browser restarting"
- * error. That reply is the contract during a child swap — the point of the
- * assertion is that the session comes BACK, not that it never blinks.
- */
-async function callWhenReady(
-  client: { callTool: (a: { name: string; arguments: Record<string, unknown> }) => Promise<unknown> },
-  name: string,
-  ms = 15_000,
-): Promise<unknown> {
-  const deadline = Date.now() + ms;
-  for (;;) {
-    try {
-      return await client.callTool({ name, arguments: {} });
-    } catch (e) {
-      if (Date.now() > deadline || !/restarting/.test(String(e))) throw e;
-      await new Promise((r) => setTimeout(r, 100));
-    }
-  }
-}
-
-/**
  * What a call that may never come back actually did: "returned", its error
  * text, or "still waiting". A regression in any of this HANGS a session rather
  * than failing an assertion, so every such call here is bounded.
@@ -297,6 +259,14 @@ function outcomeWithin(call: Promise<unknown>, ms: number): Promise<string> {
   ]);
 }
 
+/**
+ * Every test here takes a capture, and the fake child NEVER answers a capture
+ * of a background tab — deliberately, since that is the bug. Nothing in the
+ * gateway rescues such a call any more (docs/adr/0006), so each test carries
+ * its own bound: a regression fails the suite instead of hanging CI.
+ */
+const CAPTURE_TIMEOUT_MS = 30_000;
+
 const textOf = (r: unknown) =>
   (((r as { content?: { text?: string }[] }).content ?? []) as { text?: string }[])
     .map((c) => c.text ?? "")
@@ -304,7 +274,7 @@ const textOf = (r: unknown) =>
 /** The URL the child says its tools are acting on, read from its page block. */
 const selectedUrl = (r: unknown) => /^\d+: (\S+) \[selected\]$/m.exec(textOf(r))?.[1];
 
-test("a capture of a tab that is not in front is taken, not hung (issue #89)", async () => {
+test("a capture of a tab that is not in front is taken, not hung (issue #89)", { timeout: CAPTURE_TIMEOUT_MS }, async () => {
   const { client, close } = await connect("inst-shot", "shot-basic");
   try {
     const before = await client.callTool({ name: "list_pages", arguments: {} });
@@ -331,7 +301,7 @@ test("a capture of a tab that is not in front is taken, not hung (issue #89)", a
   }
 });
 
-test("the client's own selection survives the activation, and it never sees the extra calls", async () => {
+test("the client's own selection survives the activation, and it never sees the extra calls", { timeout: CAPTURE_TIMEOUT_MS }, async () => {
   const { client, close } = await connect("inst-shot2", "shot-selection");
   try {
     const before = await client.callTool({ name: "list_pages", arguments: {} });
@@ -354,7 +324,7 @@ test("the client's own selection survives the activation, and it never sees the 
   }
 });
 
-test("new_page(background: true) — the documented trap — no longer hangs the next capture", async () => {
+test("new_page(background: true) — the documented trap — no longer hangs the next capture", { timeout: CAPTURE_TIMEOUT_MS }, async () => {
   const { client, close } = await connect("inst-shot3", "shot-background");
   try {
     // This is the workflow from the report: `background` selects the new page
@@ -372,7 +342,7 @@ test("new_page(background: true) — the documented trap — no longer hangs the
   }
 });
 
-test("an id that has been retired under the activation is re-read, not given up on", async () => {
+test("an id that has been retired under the activation is re-read, not given up on", { timeout: CAPTURE_TIMEOUT_MS }, async () => {
   const { lines, stop } = await tapLines();
   const { client, close } = await connect("inst-shot4", "shot-retired-id");
   try {
@@ -413,7 +383,7 @@ test("an id that has been retired under the activation is re-read, not given up 
   );
 });
 
-test("a page the client itself picked during the activation is not put back", async () => {
+test("a page the client itself picked during the activation is not put back", { timeout: CAPTURE_TIMEOUT_MS }, async () => {
   const { lines, stop } = await tapLines();
   const { client, close } = await connect("inst-shot6", "shot-client-picks");
   try {
@@ -450,108 +420,17 @@ test("a page the client itself picked during the activation is not put back", as
   );
 });
 
-test("a capture the gateway DID bring to the front is allowed to be slow", async () => {
-  // The deadline replaces the child, which costs the session its page ids,
-  // snapshot uids and console history — so a client retrying a legitimately
-  // slow fullPage capture would degrade it on every attempt and never get it.
-  // A capture whose tab is demonstrably in front is not stuck, just slow: it
-  // rides Puppeteer's own 180s protocolTimeout, as it did before #89.
-  writeFileSync(slowFile, "");
-  const { client, close } = await connect("inst-shot7", "shot-slow");
-  try {
-    const started = Date.now();
-    const shot = await client.callTool({ name: "take_screenshot", arguments: {} });
-    assert.equal((shot.content as { type: string }[])[0]?.type, "image", textOf(shot));
-    assert.ok(
-      Date.now() - started > 2000,
-      "the capture really did outlast SCREENSHOT_DEADLINE_MS without being cut short",
-    );
-  } finally {
-    rmSync(slowFile, { force: true });
-    await close();
-  }
-});
-
-test("a capture that never returns replaces the child, instead of freezing the session", async () => {
-  // The blast radius half of #89: the child holds its tool mutex for the whole
-  // of Puppeteer's 180s protocolTimeout, so failing the client's request would
-  // leave every other call on the session queued behind it. Only a fresh child
-  // frees it. The wedged child below cannot bring a tab to the front either,
-  // which is what makes this capture one the gateway never managed to protect
-  // — the only kind the deadline is armed for.
-  writeFileSync(wedgeFile, "");
-  const { client, close } = await connect("inst-shot5", "shot-wedged");
-  try {
-    const started = Date.now();
-    const err = await client
-      .callTool({ name: "take_screenshot", arguments: {} })
-      .then(() => null, (e: unknown) => e);
-    assert.ok(err, "a capture that never returns must not be waited on forever");
-    assert.match(String(err), /restart/i, `caller told to retry: ${String(err)}`);
-    assert.ok(
-      Date.now() - started < 20_000,
-      "the client is unblocked on the gateway's deadline, not Puppeteer's 180s one",
-    );
-
-    // ...and the session comes back, on a child whose mutex is free.
-    rmSync(wedgeFile, { force: true });
-    const after = await callWhenReady(client, "list_pages");
-    assert.ok(selectedUrl(after), `session still serves calls: ${textOf(after)}`);
-    const shot = await callWhenReady(client, "take_screenshot");
-    assert.equal(
-      ((shot as { content: { type: string }[] }).content ?? [])[0]?.type,
-      "image",
-      "and captures work again on the fresh child",
-    );
-  } finally {
-    rmSync(wedgeFile, { force: true });
-    await close();
-  }
-});
-
-test("a page the client picks AFTER the injected select_page still leaves a deadline", async () => {
-  const { lines, stop } = await tapLines();
-  const { client, close } = await connect("inst-shot8", "shot-late-pick");
-  try {
-    await client.callTool({ name: "list_pages", arguments: {} }); // attach the browser
-    // The client's frame arrives while the injected select_page is in flight,
-    // so the child runs it AFTER: the tab the gateway fronted is not the tab
-    // the capture ends up being taken of. Reporting that activation as a
-    // success is the #89 hang with its own rescue disarmed.
-    writeFileSync(selDelayFile, "400");
-    const shot = client.callTool({ name: "take_screenshot", arguments: {} });
-    await new Promise((r) => setTimeout(r, 200));
-    await client.callTool({
-      name: "new_page",
-      arguments: { url: "https://late.example/", background: true },
-    });
-    rmSync(selDelayFile, { force: true });
-
-    const outcome = await outcomeWithin(shot, 15_000);
-    assert.match(
-      outcome,
-      /restart/i,
-      `the capture was still treated as unprotected, so the deadline rescued it: ${outcome}`,
-    );
-  } finally {
-    rmSync(selDelayFile, { force: true });
-    stop();
-    await close();
-  }
-  assert.ok(
-    lines.some((l) => /picked a page itself while this capture was being set up/.test(l)),
-    `the gateway says it stood down: ${lines.join(" | ")}`,
-  );
-});
-
-test("a long call holding the mutex does not have a sibling capture's deadline kill it", async () => {
+test("a capture queued behind a long call still returns, and no injected reply leaks", {
+  timeout: CAPTURE_TIMEOUT_MS,
+}, async () => {
   const { lines, stop } = await tapLines();
   const { client, close } = await connect("inst-shot9", "shot-mutex-sibling");
   try {
     // Put the capture's own tab in front first, so the only thing between it
     // and an answer is the mutex the call ahead of it is holding. That same
     // held mutex is what times the activation out, which is why the two always
-    // turn up together.
+    // turn up together — and the activation must fail open rather than cost
+    // the caller its capture.
     await client.callTool({ name: "select_page", arguments: { pageId: 2, bringToFront: true } });
     const nav = client
       .callTool({ name: "navigate_page", arguments: { url: "slow:4000" } })
@@ -566,12 +445,12 @@ test("a long call holding the mutex does not have a sibling capture's deadline k
       });
 
     const outcome = await outcomeWithin(capture, 20_000);
-    assert.equal(outcome, "returned", `a queued capture is not a stuck one: ${outcome}`);
+    assert.equal(outcome, "returned", `a queued capture is not a lost one: ${outcome}`);
     assert.equal((shot as { content: { type: string }[] }).content[0]?.type, "image");
     assert.match(
       await nav,
       /Navigated to slow:4000/,
-      "and the call it was queued behind was not failed out from under the client either",
+      "and the call it was queued behind was not disturbed either",
     );
   } finally {
     stop();
@@ -584,28 +463,4 @@ test("a long call holding the mutex does not have a sibling capture's deadline k
     !lines.some((l) => /http send failed/.test(l)),
     `no reply of the gateway's own leaked at the client: ${lines.join(" | ")}`,
   );
-});
-
-test("a capture that names its own page fronts THAT page, not the selected one", async () => {
-  // CDM_EXTRA_ARGS=--experimentalPageIdRouting is a supported opt-in, and under
-  // it upstream captures the page the CALLER named. Fronting the selected page
-  // instead leaves the named one uncomposited — the #89 hang again, and
-  // reported as a protected capture so nothing rescues it.
-  const { client, close } = await connect("inst-shot10", "shot-routed-id");
-  try {
-    const before = await client.callTool({ name: "list_pages", arguments: {} });
-    assert.equal(selectedUrl(before), "https://example.org/", "and page 1 is not it");
-    let shot: unknown;
-    const capture = client
-      .callTool({ name: "take_screenshot", arguments: { pageId: 1 } })
-      .then((r) => {
-        shot = r;
-        return r;
-      });
-    const outcome = await outcomeWithin(capture, 15_000);
-    assert.equal(outcome, "returned", `the page the capture names was fronted: ${outcome}`);
-    assert.equal((shot as { content: { type: string }[] }).content[0]?.type, "image");
-  } finally {
-    await close();
-  }
 });

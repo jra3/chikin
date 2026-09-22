@@ -105,6 +105,11 @@ const NO_BROWSER_URL = "http://127.0.0.1:1";
 // So the gateway brings the target to the front itself, immediately before
 // forwarding the capture. Every branch of that is fail-open: whatever does not
 // work out, the capture is forwarded exactly as it was before this existed.
+//
+// Nothing here BOUNDS a child call that blocks anyway. A stuck call still holds
+// the mutex until Puppeteer gives up, and that residual is knowingly accepted —
+// docs/adr/0006 says why a wall-clock deadline was built and backed out, and
+// issue #90 carries what a real guard would have to satisfy.
 const FOREGROUND_TOOLS = new Set(["take_screenshot"]);
 // Client tools that change WHICH page the child's tools act on. Forwarding one
 // moves `selectionEpoch`, which is how an activation already in flight finds
@@ -112,29 +117,10 @@ const FOREGROUND_TOOLS = new Set(["take_screenshot"]);
 const SELECTION_TOOLS = new Set(["select_page", "new_page", "close_page"]);
 // Per injected call. Activation is a latency tax on every screenshot, so it is
 // bounded well under the capture it is protecting.
-const ACTIVATE_TIMEOUT_MS = Number(process.env.SCREENSHOT_ACTIVATE_TIMEOUT_MS || 5_000);
-// How long a capture the activation could NOT protect is left outstanding
-// before the child is replaced. Only those: a capture whose tab the gateway
-// demonstrably brought to the front is either fast or honestly slow, so it
-// rides Puppeteer's 180s protocolTimeout exactly as it did before any of this
-// existed. Deadlining it too would make every retry of a legitimately slow
-// `fullPage` capture cost another respawn — and a respawn discards the child's
-// page ids, snapshot uids and console history — so the call would degrade on
-// each attempt instead of ever completing.
-// Both are test seams, deliberately NOT operator knobs (like NAV_VERIFY_DELAY_MS
-// above): documenting either one obliges a docker-compose.yml line too, or the
+// A test seam, deliberately NOT an operator knob (like NAV_VERIFY_DELAY_MS
+// above): documenting it obliges a docker-compose.yml line too, or the
 // operator's .env is silently inert — see gateway/test/compose-env.test.ts.
-const SCREENSHOT_DEADLINE_MS = Number(process.env.SCREENSHOT_DEADLINE_MS || 30_000);
-// The deadline measures wall time since the capture was FORWARDED, which is not
-// time the capture has been running: the child serializes every tool call, so a
-// `navigate_page`, `wait_for` or `lighthouse_audit` already holding the mutex
-// makes a perfectly healthy capture sit in the queue — and is also what makes
-// the activation time out, so the two arrive together. A deadline that fires
-// while the child is demonstrably working is therefore extended rather than
-// acted on, this many times. Five windows in all stays under Puppeteer's own
-// 180s protocolTimeout at the shipped 30s, so a child that really is stuck is
-// still replaced before upstream gives up on it.
-const CAPTURE_DEADLINE_REARMS = 4;
+const ACTIVATE_TIMEOUT_MS = Number(process.env.SCREENSHOT_ACTIVATE_TIMEOUT_MS || 5_000);
 
 export interface ReportedPages {
   pages: string[];
@@ -591,15 +577,12 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // effectively suppressed says so instead of just going quiet.
   let navSuperseded = 0;
   let cdpFailStreak = 0;
-  // Replies seen from the child, of any kind. Read only as evidence that the
-  // child moved at all between two moments (see armCaptureDeadline).
-  let childReplies = 0;
   // tools/list request ids whose replies need the synthetic chikin_reset appended
   const toolsListIds = new Set<string | number>();
   // Moves whenever a CLIENT frame that can change which page the child's tools
   // act on is handed over. Only the screenshot activation reads it, to tell
   // "the selection is still the one I read" from "the client has chosen since"
-  // — see bringCaptureToFront.
+  // — see bringSelectedToFront.
   let selectionEpoch = 0;
   // Requests the GATEWAY issued to the child on its own behalf (the screenshot
   // activation, issue #89) — never the client's. They are kept out of
@@ -610,17 +593,6 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   const injected = new Map<string, (f: Frame | null) => void>();
   const injectPrefix = `chikin/${randomUUID()}/`;
   let injectedSeq = 0;
-  // Forwarded captures still outstanding -> the timer that will replace the
-  // child if one never comes back (see SCREENSHOT_DEADLINE_MS).
-  const captureDeadlines = new Map<string | number, NodeJS.Timeout>();
-
-  /** A capture is no longer outstanding — by reply, or by failing its caller. */
-  function clearCaptureDeadline(id: string | number): void {
-    const timer = captureDeadlines.get(id);
-    if (timer === undefined) return;
-    clearTimeout(timer);
-    captureDeadlines.delete(id);
-  }
 
   /**
    * Everything the gateway tracks on behalf of the child that is going away.
@@ -632,8 +604,6 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     toolsListIds.clear();
     navStrikes = 0;
     navSuperseded = 0;
-    for (const t of captureDeadlines.values()) clearTimeout(t);
-    captureDeadlines.clear();
     for (const settle of [...injected.values()]) settle(null);
     injected.clear();
   }
@@ -741,7 +711,6 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // -32001 = "link lost". Fail one pending client request so it unblocks.
   const failRequest = (id: string | number, message: string) => {
     inflight.delete(id);
-    clearCaptureDeadline(id);
     http
       .send({ jsonrpc: "2.0", id, error: { code: -32001, message } })
       .catch((e) => log.warn(`session[${name}]: ->client error send failed`, String(e)));
@@ -792,7 +761,6 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       deps.registry.touch(name);
       cdpFailStreak = 0; // the child is demonstrably talking to Chrome again
       const f = msg as Frame;
-      if (f && f.id !== undefined) childReplies++;
       // A reply to a request the GATEWAY issued. The client never sent it and
       // must never see it. Matched on the id's PREFIX, not on a live `injected`
       // entry: a reply that arrives after its own timeout has already been
@@ -806,7 +774,6 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       }
       if (f && f.id !== undefined) {
         inflight.delete(f.id);
-        clearCaptureDeadline(f.id);
         // Append the gateway's synthetic tools to tools/list replies.
         if (toolsListIds.has(f.id)) {
           toolsListIds.delete(f.id);
@@ -1238,9 +1205,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // Everything past the identify gate: track the request, record nav state, and
   // hand the frame to the child. Split out of the pump below so the lazy-attach
   // path can re-enter it with the very same frame once the browser is up.
-  // `activated` is the activation's own verdict on the frame it is releasing
-  // (see bringCaptureToFront); it decides whether the capture gets a deadline.
-  function forwardToChild(msg: JSONRPCMessage, f: Frame, activated = false): void {
+  function forwardToChild(msg: JSONRPCMessage, f: Frame): void {
     const tracked = f && f.method !== undefined && f.id !== undefined;
     if (tracked) {
       inflight.set(f.id as string | number, true);
@@ -1259,13 +1224,11 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       if (tracked) failRequest(f.id as string | number, "chikin browser restarting; retry the request");
       return;
     }
-    // Both of these have to happen on THIS side of the send: the epoch's whole
-    // meaning is "a client frame is already queued at the child", which is only
-    // true of frames handed over before ours.
+    // On THIS side of the send, never after: the epoch's whole meaning is "a
+    // client frame is already queued at the child", which is only true of
+    // frames handed over before ours.
     if (tracked && f.method === "tools/call" && SELECTION_TOOLS.has(f.params?.name ?? ""))
       selectionEpoch++;
-    if (!activated && tracked && f.method === "tools/call" && FOREGROUND_TOOLS.has(f.params?.name ?? ""))
-      armCaptureDeadline(f.id as string | number);
     const gen = childGen; // bind this send to the child it used
     child.send(msg).catch((e) => {
       const why = String(e);
@@ -1299,10 +1262,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
    * carries needs. A screenshot needs its page in front (issue #89); everything
    * else goes straight through.
    *
-   * Activation delays this frame relative to anything else the client has in
-   * flight. That is harmless here: the child serializes every tool call on one
-   * mutex regardless, and `attachThenForward` already holds a frame back for
-   * the whole of a cold provision.
+   * Activation REORDERS this frame, and that is an accepted cost rather than a
+   * harmless one. A screenshot is held for one or two injected round trips
+   * while every other frame forwards at once, so a client that pipelines a
+   * page-changing call alongside its capture can have that call reach the
+   * child's mutex first and get back an image of the newer page — where before
+   * the capture ran first. `selectionEpoch` does not cover it: that tracks the
+   * tools which change which page is SELECTED, not the ones (`navigate_page`,
+   * `click`, `fill`, `press_key`) that change what the selected page shows.
+   * The window is two round trips on an unloaded child, and the alternative —
+   * queueing every frame behind an activation — costs more than it buys.
    */
   function dispatch(msg: JSONRPCMessage, f: Frame): void {
     if (f?.method === "tools/call" && FOREGROUND_TOOLS.has(f.params?.name ?? "")) {
@@ -1313,23 +1282,20 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   }
 
   async function activateThenForward(msg: JSONRPCMessage, f: Frame): Promise<void> {
-    let activated = false;
     try {
-      activated = await bringCaptureToFront(f);
+      await bringSelectedToFront();
     } catch (e) {
       // Fail-open: an unactivated capture is the old behaviour, a dropped one
       // is a new bug.
       log.warn(`session[${name}]: screenshot activation failed`, String(e));
     }
     if (session.isClosed) return;
-    forwardToChild(msg, f, activated);
+    forwardToChild(msg, f);
   }
 
   /**
-   * Put the page this capture will be taken of in front, so it has a compositor
-   * frame to read (issue #89). Returns whether it demonstrably did: only a
-   * capture known to have been protected can be left to Puppeteer's own 180s
-   * timeout, which is what `forwardToChild` reads this for.
+   * Put the child's selected page in front, so the capture that follows has a
+   * compositor frame to read (issue #89).
    *
    * The selection is ASKED FOR rather than remembered. Upstream retires a page
    * id the moment its tab goes away and never reissues it, so an id learned
@@ -1347,39 +1313,23 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
    * silently revert a choice the client has already been told succeeded.
    * `selectionEpoch` is how that is noticed: it moves when such a frame is
    * handed to the child, so an epoch that moved means the client's newer intent
-   * wins and the activation stands down. Every path that would report success
-   * consults it last of all: a client frame queued AFTER the injected
-   * `select_page` moves the selection off the tab just fronted, so reporting
-   * success there would reopen the hang with its own deadline disarmed.
+   * wins and the activation stands down.
+   *
+   * Every branch is fail-open, and none of them reports back: the capture is
+   * forwarded either way. Nothing rescues one that blocks anyway — see
+   * docs/adr/0006 and issue #90.
    */
-  async function bringCaptureToFront(f: Frame): Promise<boolean> {
+  async function bringSelectedToFront(): Promise<void> {
     const epoch = selectionEpoch;
     const clientChoseSince = (): boolean => {
       if (selectionEpoch === epoch) return false;
       log.warn(
         `session[${name}]: the client picked a page itself while this capture was being set up, ` +
-          `so its own choice is left standing and the capture counts as one the gateway did not ` +
-          `manage to bring to the front`,
+          `so its own choice is left standing and the capture is forwarded without bringing a ` +
+          `tab to the front`,
       );
       return true;
     };
-
-    // `CDM_EXTRA_ARGS=--experimentalPageIdRouting` (config.ts) is a supported
-    // opt-in, and under it upstream routes a page-scoped tool by the id the
-    // CALLER passed rather than by the selected page — so that is the tab
-    // needing a compositor frame. Only a number is honoured; upstream's schema
-    // would reject anything else.
-    const routed = f.params?.arguments?.pageId;
-    if (typeof routed === "number") {
-      const landed = (await selectToFront(routed))?.find((p) => p.selected)?.id === routed;
-      if (!landed)
-        log.warn(
-          `session[${name}]: could not bring page ${routed}, the page this capture names, to the ` +
-            `front — forwarding it anyway, which can block until Puppeteer's 180s ` +
-            `protocolTimeout with the session's tool mutex held`,
-        );
-      return landed && !clientChoseSince();
-    }
 
     // Two passes at most: one to use the ids as read, one to re-read them after
     // an id turned out to name a tab that had already gone.
@@ -1393,16 +1343,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
             `capture can block until Puppeteer's 180s protocolTimeout, holding the session's tool ` +
             `mutex for the whole wait`,
         );
-        return false;
+        return;
       }
-      if (clientChoseSince()) return false;
+      if (clientChoseSince()) return;
 
       const after = await selectToFront(target.id as number);
       if (!after) {
         // An error reply (`No page found` for a retired id, or a tool upstream
         // has renamed) or nothing at all within ACTIVATE_TIMEOUT_MS. The tab is
-        // NOT in front either way, and saying so here is the only warning the
-        // operator gets before the capture's own deadline much later.
+        // NOT in front either way, and saying so here is the only word the
+        // operator gets — nothing downstream notices.
         log.warn(
           `session[${name}]: bringing page ${target.id} (${target.url}) to the front failed` +
             (attempt === 0
@@ -1414,8 +1364,8 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       }
 
       const now = after.find((p) => p.selected);
-      if (now && (now.id === target.id || now.url === target.url)) return !clientChoseSince();
-      if (clientChoseSince()) return false;
+      if (now && (now.id === target.id || now.url === target.url)) return;
+      if (clientChoseSince()) return;
       // The id landed somewhere other than the page it was read from. Put the
       // client's own selection back, by the id that very reply printed.
       const restore = after.find((p) => p.url === target.url && Number.isInteger(p.id));
@@ -1424,11 +1374,10 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
           `(${target.url} -> ${now?.url ?? "nothing selected"})` +
           (restore ? "; restoring it" : "; it is no longer open, leaving the child's own choice"),
       );
-      if (!restore) return false;
-      const back = await selectToFront(restore.id as number);
-      return back?.find((p) => p.selected)?.url === target.url && !clientChoseSince();
+      if (!restore) return;
+      await selectToFront(restore.id as number);
+      return;
     }
-    return false;
   }
 
   /**
@@ -1439,68 +1388,6 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   async function selectToFront(pageId: number): Promise<PageEntry[] | null> {
     const reply = await callChild("select_page", { pageId, bringToFront: true }, ACTIVATE_TIMEOUT_MS);
     return pageEntries(reply?.result);
-  }
-
-  /**
-   * A forwarded capture that never comes back costs its caller more than one
-   * reply: chrome-devtools-mcp holds its per-session tool mutex for the whole
-   * of Puppeteer's 180s protocolTimeout, so every other call on the session
-   * queues behind it and the client reads the session as dead (issue #89).
-   * Failing the client's request here would not free that mutex — the CHILD
-   * holds it — so the deadline replaces the child instead. That reconnects to
-   * the same container with its tabs intact, and fails this request retryably
-   * on the way through.
-   *
-   * Armed ONLY for a capture the activation could not protect. See
-   * SCREENSHOT_DEADLINE_MS: replacing the child costs the session its page
-   * ids, snapshot uids and console history, which is worth it against a wait
-   * that is never going to end and not against one that is merely long.
-   *
-   * And "outstanding" is not "executing". The clock starts when the frame is
-   * handed over, but the child runs one tool at a time, so a capture queued
-   * behind a long `navigate_page` or `lighthouse_audit` has not begun — and
-   * that same held mutex is what timed the activation out in the first place,
-   * so the two show up together. Firing then would fail the healthy sibling
-   * call as well (`failAllInflight`) for no fault of the child's. So the timer
-   * looks for evidence the child moved since it was armed and, finding some,
-   * extends itself instead, up to CAPTURE_DEADLINE_REARMS times.
-   */
-  function armCaptureDeadline(id: string | number, rearmsLeft = CAPTURE_DEADLINE_REARMS): void {
-    const repliesAtArm = childReplies;
-    // The client's other requests already at the child when this one was
-    // handed over: one of those, and only one of those, can be the call whose
-    // turn on the mutex this capture is waiting out.
-    const queuedAhead = [...inflight.keys()].filter((k) => k !== id);
-    const timer = setTimeout(() => {
-      captureDeadlines.delete(id);
-      if (session?.isClosed || respawning || !inflight.has(id)) return;
-      const working =
-        childReplies !== repliesAtArm
-          ? "the child has answered another call since"
-          : queuedAhead.some((k) => inflight.has(k))
-            ? "an older request of the client's is still holding the child's tool mutex"
-            : null;
-      if (working && rearmsLeft > 0) {
-        log.warn(
-          `session[${name}]: a screenshot has been outstanding for ${SCREENSHOT_DEADLINE_MS}ms, ` +
-            `but ${working}, so it has not started yet — giving it another ` +
-            `${SCREENSHOT_DEADLINE_MS}ms rather than replacing a child that is working ` +
-            `(${rearmsLeft} extension${rearmsLeft === 1 ? "" : "s"} left)`,
-        );
-        armCaptureDeadline(id, rearmsLeft - 1);
-        return;
-      }
-      log.error(
-        `session[${name}] (${chromeTag()}): a screenshot has been outstanding for ` +
-          `${SCREENSHOT_DEADLINE_MS}ms` +
-          (working ? " past every extension it was given" : " with nothing else running") +
-          `; the child holds its tool mutex for the whole wait, so the child is being replaced ` +
-          `rather than leaving every other call queued behind it`,
-      );
-      void respawnChild("screenshot capture never returned (tool mutex stuck)");
-    }, SCREENSHOT_DEADLINE_MS);
-    timer.unref?.();
-    captureDeadlines.set(id, timer);
   }
 
   // Client -> child pump. Cache initialize; track requests; fail fast while a
