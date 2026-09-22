@@ -767,11 +767,13 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       const f = msg as Frame;
       // A reply to a request the GATEWAY issued. The client never sent it and
       // must never see it. Matched on the id's PREFIX, not on a live `injected`
-      // entry: a reply that arrives after its own timeout has already been
-      // settled and deleted, and pushing it at `http.send` would raise "no
-      // connection established for request ID", logged as an http send failure
-      // — a line that reads like the client link broke, in exactly the case
-      // this needs to stay diagnosable.
+      // entry, because there is a gap in which no entry exists but this pump is
+      // still the current generation: `respawnChild` calls `clearChildState()`
+      // — which settles and deletes every injected entry — BEFORE `await
+      // child?.close()`, and only bumps `childGen` afterwards. A reply from the
+      // dying child in that gap would otherwise fall through to `http.send`
+      // carrying an id the client never sent, and be logged as an http send
+      // failure: a line that reads like the client link broke.
       if (f && typeof f.id === "string" && f.id.startsWith(injectPrefix)) {
         injected.get(f.id)?.(f);
         return;
@@ -1324,6 +1326,13 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
    * true)` is a tab nothing has ever composited: the issue's own headline trap,
    * reproduced through the guard meant to respect the client.
    *
+   * There are TWO windows, not one, and they are checked on the same footing:
+   * the client's frame can queue behind the injected `list_pages` or behind the
+   * injected `select_page` — the latter is a real `Page.bringToFront` round trip
+   * on a live child. So the epoch is consulted before the select reply is
+   * judged, never after: a reply saying the gateway's own target is selected is
+   * no longer the truth once a frame that reselects is queued behind it.
+   *
    * Every branch is fail-open, and none of them reports back: the capture is
    * forwarded either way. Nothing rescues one that blocks anyway — see
    * docs/adr/0006 and issue #90.
@@ -1334,7 +1343,17 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       // Re-read per pass: a pass that lost to the client's own choice has to
       // judge the next one against that newer choice, not the original.
       const epoch = selectionEpoch;
-      const clientChoseSince = (): boolean => selectionEpoch !== epoch;
+      const clientChoseSince = (): boolean => {
+        if (selectionEpoch === epoch) return false;
+        log.warn(
+          `session[${name}]: the client picked a page itself while this capture was being set up` +
+            (last
+              ? `, and it has kept doing so — leaving its choice standing and forwarding the ` +
+                `capture without bringing a tab to the front`
+              : `; reading the page list again so the tab brought to the front is the one it chose`),
+        );
+        return true;
+      };
 
       const before = pageEntries((await callChild("list_pages", {}))?.result);
       const target = before?.find((p) => p.selected);
@@ -1347,16 +1366,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         );
         return;
       }
-      if (clientChoseSince()) {
-        log.warn(
-          `session[${name}]: the client picked a page itself while this capture was being set up` +
-            (last
-              ? `, and it has kept doing so — leaving its choice standing and forwarding the ` +
-                `capture without bringing a tab to the front`
-              : `; reading the page list again so the tab brought to the front is the one it chose`),
-        );
-        continue;
-      }
+      if (clientChoseSince()) continue;
 
       const after = await selectToFront(target.id as number);
       if (!after) {
@@ -1374,10 +1384,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         continue;
       }
 
-      const now = after.find((p) => p.selected);
-      if (now && (now.id === target.id || now.url === target.url)) return;
       if (clientChoseSince()) continue;
-      // The id landed somewhere other than the page it was read from. Put the
+
+      // Judged by ID alone. Matching on the URL as well used to read as success
+      // when the client's own pipelined `new_page` had opened a SECOND tab at
+      // the same URL; "did anything change under us" is the epoch's question,
+      // asked just above, and this one is only "is the tab I aimed at the tab
+      // that is selected".
+      const now = after.find((p) => p.selected);
+      if (now?.id === target.id) return;
+      // It landed somewhere other than the page the id was read from. Put the
       // client's own selection back, by the id that very reply printed.
       const restore = after.find((p) => p.url === target.url && Number.isInteger(p.id));
       log.warn(

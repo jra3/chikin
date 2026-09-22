@@ -36,6 +36,7 @@ import { appendFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 appendFileSync("__PIDFILE__", process.pid + "\\n");
 const CLOSE = "__CLOSEFILE__"; // one-shot: the selected tab closes under the next select_page
 const DELAY = "__DELAYFILE__"; // list_pages dawdles for the ms this file names
+const SELDELAY = "__SELDELAYFILE__"; // and so does select_page, AFTER it has acted
 const trace = (line) => appendFileSync("__TRACEFILE__", line + "\\n");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A dawdle file's contents are its duration; an empty one means 300ms.
@@ -93,6 +94,9 @@ async function tool(name, args) {
     if (!page) return threw("No page found");
     selected = page.id;
     if (args.bringToFront) front = page.id;
+    // On a live child this is where Page.bringToFront's CDP round trip sits, so
+    // it is a window a client frame can be queued behind just like the other.
+    await dawdle(SELDELAY);
     return said("Selected page " + page.id + ".");
   }
   if (name === "new_page") {
@@ -168,6 +172,7 @@ const fakeCdm = join(tmp, "fake-cdm.mjs");
 const pidFile = join(tmp, "children.pids");
 const closeFile = join(tmp, "close-selected");
 const delayFile = join(tmp, "delay-list-pages");
+const selDelayFile = join(tmp, "delay-select-page");
 const traceFile = join(tmp, "calls.trace");
 // Paths are baked into the script rather than passed as env vars:
 // StdioClientTransport spawns children with a curated default environment, so
@@ -177,6 +182,7 @@ writeFileSync(
   FAKE_CDM.replace("__PIDFILE__", pidFile)
     .replace("__CLOSEFILE__", closeFile)
     .replace("__DELAYFILE__", delayFile)
+    .replace("__SELDELAYFILE__", selDelayFile)
     .replace("__TRACEFILE__", traceFile),
   { mode: 0o755 },
 );
@@ -418,39 +424,45 @@ test("a page the client itself picked during the activation is not put back", { 
   );
 });
 
-test("the documented trap pipelined alongside the capture still gets its image", {
-  timeout: CAPTURE_TIMEOUT_MS,
-}, async () => {
-  const { client, close } = await connect("inst-shot11", "shot-pipelined-trap");
-  try {
-    await client.callTool({ name: "list_pages", arguments: {} }); // attach the browser
-    // `new_page(background: true)` selects a tab nothing has composited — the
-    // workflow the issue names — and here it arrives DURING the activation, so
-    // the gateway learns about it only as a moved selection epoch. Standing
-    // down there would hand the capture the trap itself.
-    writeFileSync(delayFile, "300");
-    const shot = client.callTool({ name: "take_screenshot", arguments: {} });
-    await new Promise((r) => setTimeout(r, 150));
-    const opened = await client.callTool({
-      name: "new_page",
-      arguments: { url: "https://pipelined.example/", background: true },
-    });
-    rmSync(delayFile, { force: true });
-    assert.equal(selectedUrl(opened), "https://pipelined.example/");
+// `new_page(background: true)` selects a tab nothing has composited — the
+// workflow the issue names — and here it arrives DURING the activation, so the
+// gateway learns of it only as a moved selection epoch. There are two windows
+// it can land in, and standing down in either hands the capture the trap
+// itself; the second is a real Page.bringToFront round trip on a live child.
+for (const [window, dawdleFile, session] of [
+  ["the injected list_pages", delayFile, "inst-shot11"],
+  ["the injected select_page", selDelayFile, "inst-shot12"],
+] as const) {
+  test(`the documented trap pipelined into ${window} still gets its image`, {
+    timeout: CAPTURE_TIMEOUT_MS,
+  }, async () => {
+    const { client, close } = await connect(session, `shot-trap-${session}`);
+    try {
+      await client.callTool({ name: "list_pages", arguments: {} }); // attach the browser
+      writeFileSync(dawdleFile, "300");
+      const shot = client.callTool({ name: "take_screenshot", arguments: {} });
+      await new Promise((r) => setTimeout(r, 150));
+      const opened = await client.callTool({
+        name: "new_page",
+        arguments: { url: "https://pipelined.example/", background: true },
+      });
+      rmSync(dawdleFile, { force: true });
+      assert.equal(selectedUrl(opened), "https://pipelined.example/");
 
-    const done = await shot;
-    assert.equal((done.content as { type: string }[])[0]?.type, "image", textOf(done));
-    const after = await client.callTool({ name: "list_pages", arguments: {} });
-    assert.equal(
-      selectedUrl(after),
-      "https://pipelined.example/",
-      "the capture was taken of the page the client had just opened, and left it selected",
-    );
-  } finally {
-    rmSync(delayFile, { force: true });
-    await close();
-  }
-});
+      const done = await shot;
+      assert.equal((done.content as { type: string }[])[0]?.type, "image", textOf(done));
+      const after = await client.callTool({ name: "list_pages", arguments: {} });
+      assert.equal(
+        selectedUrl(after),
+        "https://pipelined.example/",
+        "the capture was taken of the page the client had just opened, and left it selected",
+      );
+    } finally {
+      rmSync(dawdleFile, { force: true });
+      await close();
+    }
+  });
+}
 
 test("a capture queued behind a long call still returns, and no injected reply leaks", {
   timeout: CAPTURE_TIMEOUT_MS,
