@@ -85,9 +85,64 @@ const CDP_FAIL_RE = /fetch failed|ECONNREFUSED|ERR_CONNECTION_REFUSED|socket han
 // (startChild below), so such an error could never respawn-loop.
 const NO_BROWSER_URL = "http://127.0.0.1:1";
 
+// --- Screenshot foreground activation (issue #89) ---------------------------
+// Chrome runs HEADFUL under Xvfb (entrypoint.sh), so only the ACTIVE tab of a
+// window is composited. `Page.captureScreenshot` defaults to `fromSurface:
+// true` and chrome-devtools-mcp never activates the tab it captures —
+// `bringToFront` appears nowhere but `select_page`, in 1.1.1 and still in
+// 1.9.0, so a version bump is not the fix. A capture aimed at any other tab
+// therefore waits on a compositor frame that may never arrive, until
+// Puppeteer's 180s protocolTimeout gives up.
+//
+// The wait is not confined to that one call. The child holds its per-session
+// tool mutex for the whole of it, so `list_pages`, `take_snapshot` and
+// `select_page` all queue behind it: ONE background capture freezes the session
+// for three minutes, which is why the symptom reads as "chikin hangs" rather
+// than "screenshots are slow". The documented workflow walks straight into it —
+// `new_page(background: true)` selects the new page while leaving another tab
+// in front, and nothing since activates it.
+//
+// So the gateway brings the target to the front itself, immediately before
+// forwarding the capture. Every branch of that is fail-open: whatever does not
+// work out, the capture is forwarded exactly as it was before this existed.
+//
+// Nothing here BOUNDS a child call that blocks anyway. A stuck call still holds
+// the mutex until Puppeteer gives up, and that residual is knowingly accepted —
+// docs/adr/0006 says why a wall-clock deadline was built and backed out, and
+// issue #90 carries what a real guard would have to satisfy.
+const FOREGROUND_TOOLS = new Set(["take_screenshot"]);
+// Client tools that change WHICH page the child's tools act on. Forwarding one
+// moves `selectionEpoch`, which is how an activation already in flight finds
+// out that the client has since made a choice of its own.
+const SELECTION_TOOLS = new Set(["select_page", "new_page", "close_page"]);
+// Reads of the page list the activation will make before giving up. Three
+// covers both reasons a pass can be wasted — an id retired under it, and the
+// client choosing a page for itself while it was in flight — without letting a
+// client that keeps pipelining hold a capture forever.
+const ACTIVATION_PASSES = 3;
+
 export interface ReportedPages {
   pages: string[];
   selected?: string;
+}
+
+/**
+ * The same view with upstream's own page ids kept, for the one caller that has
+ * to ACT on a page rather than judge one (the screenshot activation, #89).
+ *
+ * `id` is what `select_page` takes, and it is NOT the entry's position in the
+ * list: `McpContext.createPagesSnapshot` stamps each new page object with
+ * `#nextPageId++` from 1 and never renumbers or reuses one, so the first tab a
+ * client closes puts every later row permanently out of step with its own id —
+ * and `getPageById` throws `No page found` for the retired number rather than
+ * handing back a neighbour. Read the id upstream printed; never count the
+ * rows. It is optional so that a channel which stopped carrying ids degrades
+ * to no activation at all rather than to activating the wrong page.
+ */
+export interface PageEntry {
+  id?: number;
+  url: string;
+  selected: boolean;
 }
 
 // The child's own view of the browser, taken from its own tool reply.
@@ -118,23 +173,33 @@ export interface ReportedPages {
 // configuration — which is why the branch is preferred whenever the object is
 // actually present. `cdm-outputschema.test.ts` watches the upstream half.
 export function reportedPages(result: unknown): ReportedPages | null {
-  return pagesFromStructuredContent(result) ?? pagesFromText(result);
+  const entries = pageEntries(result);
+  if (!entries) return null;
+  return { pages: entries.map((e) => e.url), selected: entries.find((e) => e.selected)?.url };
+}
+
+/** Both channels, ids intact. Same precedence and same "null means unusable". */
+export function pageEntries(result: unknown): PageEntry[] | null {
+  return entriesFromStructuredContent(result) ?? entriesFromText(result);
 }
 
 // Only runs when the child was spawned with --experimentalStructuredContent —
 // see reportedPages. Preferred when present because it needs no parsing at all.
-function pagesFromStructuredContent(result: unknown): ReportedPages | null {
+function entriesFromStructuredContent(result: unknown): PageEntry[] | null {
   const list = (result as { structuredContent?: { pages?: unknown } })?.structuredContent?.pages;
   if (!Array.isArray(list)) return null;
-  const pages: string[] = [];
-  let selected: string | undefined;
+  const entries: PageEntry[] = [];
   for (const entry of list) {
     const url = (entry as { url?: unknown })?.url;
     if (typeof url !== "string" || !url) continue;
-    pages.push(url);
-    if ((entry as { selected?: unknown })?.selected === true) selected = url;
+    const id = (entry as { id?: unknown })?.id;
+    entries.push({
+      id: typeof id === "number" ? id : undefined,
+      url,
+      selected: (entry as { selected?: unknown })?.selected === true,
+    });
   }
-  return pages.length ? { pages, selected } : null;
+  return entries.length ? entries : null;
 }
 
 const looksLikeUrl = (s: string) => /^[a-z][a-z0-9+.-]*:/i.test(s);
@@ -158,21 +223,22 @@ const looksLikeUrl = (s: string) => /^[a-z][a-z0-9+.-]*:/i.test(s);
 //
 // The scan walks tokens instead of running one backtracking regex over the
 // line. `<title>` is the visited page's own document.title, so it is as hostile
-// as the page is, and pagesFromText runs synchronously on the event loop the
+// as the page is, and entriesFromText runs synchronously on the event loop the
 // whole fleet shares — every step here has to stay linear in the line's length.
-function parsePageLine(line: string): { url: string; selected: boolean } | null {
+function parsePageLine(line: string): PageEntry | null {
   // Greedy `.*` plus an explicit trim, never `(.*?)\s*$`: the lazy form retries
   // at every offset and re-splits each whitespace run it crosses, which is
   // quadratic in a title carrying one (26s on a 200k-space title, measured).
-  const head = /^\s*\d+:\s+(.*)$/.exec(line);
+  const head = /^\s*(\d+):\s+(.*)$/.exec(line);
   if (!head) return null;
+  const id = Number(head[1]);
   // isolatedContext is always appended last, and its value is a caller-chosen
   // name that may itself contain spaces, so strip it to end of line. Found by
   // scanning from the RIGHT: that is where upstream puts it, so a title quoting
   // the word loses to the real one, and unlike /\s+isolatedContext=/ the scan
   // cannot backtrack over a whitespace run (12s on the same 200k title).
-  const iso = head[1].lastIndexOf("isolatedContext=");
-  const rest = (iso > 0 && /\s/.test(head[1][iso - 1]) ? head[1].slice(0, iso) : head[1]).trim();
+  const iso = head[2].lastIndexOf("isolatedContext=");
+  const rest = (iso > 0 && /\s/.test(head[2][iso - 1]) ? head[2].slice(0, iso) : head[2]).trim();
   if (!rest) return null;
 
   // Peel the machine-generated tail right to left: `[selected]`, plus whatever
@@ -196,28 +262,27 @@ function parsePageLine(line: string): { url: string; selected: boolean } | null 
   if (label.endsWith(")")) {
     const open = label.lastIndexOf(" (");
     const url = open < 0 ? "" : label.slice(open + 2, -1);
-    if (url && !/\s/.test(url) && looksLikeUrl(url)) return { url, selected };
+    if (url && !/\s/.test(url) && looksLikeUrl(url)) return { id, url, selected };
   }
 
   // Bare form: the label is the URL itself. A label that had a tail peeled off
   // it has to still look like a URL, or a title's first word would be promoted
   // to a URL carrying a selection it never had.
-  if (end === 1 && (tokens.length === 1 || looksLikeUrl(label))) return { url: label, selected };
+  if (end === 1 && (tokens.length === 1 || looksLikeUrl(label))) return { id, url: label, selected };
 
   // Unrecognised shape: take the first token rather than drop the line, since
   // dropping it blinds the watchdog instead of failing loudly.
-  return { url: tokens[0], selected: /\s\[selected\]$/.test(rest) };
+  return { id, url: tokens[0], selected: /\s\[selected\]$/.test(rest) };
 }
 
-function pagesFromText(result: unknown): ReportedPages | null {
+function entriesFromText(result: unknown): PageEntry[] | null {
   const content = (result as { content?: Array<{ type?: string; text?: string }> })?.content;
   if (!Array.isArray(content)) return null;
   const text = content
     .filter((c) => c?.type === "text" && typeof c.text === "string")
     .map((c) => c.text as string)
     .join("\n");
-  const pages: string[] = [];
-  let selected: string | undefined;
+  const entries: PageEntry[] = [];
   let inPages = false;
   for (const line of text.split("\n")) {
     if (/^##\s/.test(line)) {
@@ -229,10 +294,9 @@ function pagesFromText(result: unknown): ReportedPages | null {
     if (!inPages) continue;
     const parsed = parsePageLine(line);
     if (!parsed) continue;
-    pages.push(parsed.url);
-    if (parsed.selected) selected = parsed.url;
+    entries.push(parsed);
   }
-  return pages.length ? { pages, selected } : null;
+  return entries.length ? entries : null;
 }
 
 // The whole wedge decision, kept pure so it can be tested without a browser.
@@ -514,6 +578,75 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   let cdpFailStreak = 0;
   // tools/list request ids whose replies need the synthetic chikin_reset appended
   const toolsListIds = new Set<string | number>();
+  // Moves whenever a CLIENT frame that can change which page the child's tools
+  // act on is handed over. Only the screenshot activation reads it, to tell
+  // "the selection is still the one I read" from "the client has chosen since"
+  // — see bringSelectedToFront.
+  let selectionEpoch = 0;
+  // Requests the GATEWAY issued to the child on its own behalf (the screenshot
+  // activation, issue #89) — never the client's. They are kept out of
+  // `inflight` so a respawn never answers the client for a frame it did not
+  // send, and their ids carry a per-session random prefix: a client is free to
+  // choose its own JSON-RPC ids, and one that happened to pick the gateway's
+  // would have its reply swallowed here.
+  const injected = new Map<string, (f: Frame | null) => void>();
+  const injectPrefix = `chikin/${randomUUID()}/`;
+  let injectedSeq = 0;
+
+  /**
+   * Everything the gateway tracks on behalf of the child that is going away.
+   * Called at both child swaps: anything left behind would be judged against,
+   * or answered by, a child that never saw it. Also at session close — an
+   * injected call carries no clock of its own, so close is the last thing that
+   * can settle one the child was never going to answer.
+   */
+  function clearChildState(): void {
+    pendingNavs.clear();
+    toolsListIds.clear();
+    navStrikes = 0;
+    navSuperseded = 0;
+    for (const settle of [...injected.values()]) settle(null);
+    injected.clear();
+  }
+
+  /**
+   * Call a tool on the child on the GATEWAY's own behalf and wait for its
+   * reply. Exactly three things settle it: the reply, `clearChildState()` at a
+   * child swap, and `clearChildState()` at session close. Null means one of
+   * those last two, or that there was nothing to ask in the first place — no
+   * child, or a respawn already in flight — or that the send itself threw.
+   * Callers must read null as "carry on without it".
+   *
+   * There is deliberately NO wall clock on the wait. The child serializes every
+   * tool call, so a clock started at send cannot see that mutex and can only
+   * ever fire on a call that was merely QUEUED behind an ordinary long one —
+   * and firing bought nothing, because the capture was then forwarded into the
+   * same FIFO behind the same injected `list_pages`. The client waited exactly
+   * as long either way; the only thing the timer cost was the activation. That
+   * is ADR 0006's own argument, applied to this fix as well as to what it
+   * replaced.
+   */
+  function callChild(tool: string, args: Record<string, unknown>): Promise<Frame | null> {
+    const c = child;
+    if (!c || respawning) return Promise.resolve(null);
+    const id = `${injectPrefix}${++injectedSeq}`;
+    return new Promise<Frame | null>((resolve) => {
+      const settle = (f: Frame | null): void => {
+        injected.delete(id);
+        resolve(f);
+      };
+      injected.set(id, settle);
+      c.send({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: tool, arguments: args },
+      } as JSONRPCMessage).catch((e) => {
+        log.warn(`session[${name}]: injected ${tool} send failed`, String(e));
+        settle(null);
+      });
+    });
+  }
 
   // Ground truth from the browser itself: the URLs of its real page targets.
   // null = unknown (CDP unreachable / no ip yet) — callers must not strike on it.
@@ -632,6 +765,19 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       deps.registry.touch(name);
       cdpFailStreak = 0; // the child is demonstrably talking to Chrome again
       const f = msg as Frame;
+      // A reply to a request the GATEWAY issued. The client never sent it and
+      // must never see it. Matched on the id's PREFIX, not on a live `injected`
+      // entry, because there is a gap in which no entry exists but this pump is
+      // still the current generation: `respawnChild` calls `clearChildState()`
+      // — which settles and deletes every injected entry — BEFORE `await
+      // child?.close()`, and only bumps `childGen` afterwards. A reply from the
+      // dying child in that gap would otherwise fall through to `http.send`
+      // carrying an id the client never sent, and be logged as an http send
+      // failure: a line that reads like the client link broke.
+      if (f && typeof f.id === "string" && f.id.startsWith(injectPrefix)) {
+        injected.get(f.id)?.(f);
+        return;
+      }
       if (f && f.id !== undefined) {
         inflight.delete(f.id);
         // Append the gateway's synthetic tools to tools/list replies.
@@ -812,10 +958,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       log.warn(`session[${name}] (${chromeTag()}): child gone (${why}); respawning`);
       failAllInflight(`chikin browser restarted (${why}); retry the request`);
       // Those requests got error replies; nothing left to verify or decorate.
-      pendingNavs.clear();
-      toolsListIds.clear();
-      navStrikes = 0;
-      navSuperseded = 0;
+      clearChildState();
       try {
         await child?.close();
       } catch {
@@ -905,10 +1048,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     let spawned: StdioClientTransport | null = null;
     try {
       failAllInflight("chikin browser attaching; retry the request");
-      pendingNavs.clear();
-      toolsListIds.clear();
-      navStrikes = 0;
-      navSuperseded = 0;
+      clearChildState();
       spawned = await startChild(gen, ip);
       await replayInitialize(spawned, gen);
       respawning = false;
@@ -1090,6 +1230,11 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       if (tracked) failRequest(f.id as string | number, "chikin browser restarting; retry the request");
       return;
     }
+    // On THIS side of the send, never after: the epoch's whole meaning is "a
+    // client frame is already queued at the child", which is only true of
+    // frames handed over before ours.
+    if (tracked && f.method === "tools/call" && SELECTION_TOOLS.has(f.params?.name ?? ""))
+      selectionEpoch++;
     const gen = childGen; // bind this send to the child it used
     child.send(msg).catch((e) => {
       const why = String(e);
@@ -1115,7 +1260,160 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       return;
     }
     if (session.isClosed) return;
+    dispatch(msg, f);
+  }
+
+  /**
+   * Forward a client frame, first taking whatever gateway-side step the tool it
+   * carries needs. A screenshot needs its page in front (issue #89); everything
+   * else goes straight through.
+   *
+   * Activation REORDERS this frame, and that is an accepted cost rather than a
+   * harmless one. A screenshot is held for one or two injected round trips
+   * while every other frame forwards at once, so a client that pipelines a
+   * page-changing call alongside its capture can have that call reach the
+   * child's mutex first and get back an image of the newer page — where before
+   * the capture ran first. `selectionEpoch` does not cover it: that tracks the
+   * tools which change which page is SELECTED, not the ones (`navigate_page`,
+   * `click`, `fill`, `press_key`) that change what the selected page shows.
+   * The window is two round trips on an unloaded child, and the alternative —
+   * queueing every frame behind an activation — costs more than it buys.
+   */
+  function dispatch(msg: JSONRPCMessage, f: Frame): void {
+    if (f?.method === "tools/call" && FOREGROUND_TOOLS.has(f.params?.name ?? "")) {
+      void activateThenForward(msg, f);
+      return;
+    }
     forwardToChild(msg, f);
+  }
+
+  async function activateThenForward(msg: JSONRPCMessage, f: Frame): Promise<void> {
+    try {
+      await bringSelectedToFront();
+    } catch (e) {
+      // Fail-open: an unactivated capture is the old behaviour, a dropped one
+      // is a new bug.
+      log.warn(`session[${name}]: screenshot activation failed`, String(e));
+    }
+    if (session.isClosed) return;
+    forwardToChild(msg, f);
+  }
+
+  /**
+   * Put the child's selected page in front, so the capture that follows has a
+   * compositor frame to read (issue #89).
+   *
+   * The selection is ASKED FOR rather than remembered. Upstream retires a page
+   * id the moment its tab goes away and never reissues it, so an id learned
+   * from an earlier reply can name nothing at all by now — and a tab can close
+   * without the client asking for it (`window.close()`, a popup finishing its
+   * OAuth hop). A retired id makes `select_page` throw `No page found` BEFORE
+   * it asks for a page block, so the error reply carries no selection to read;
+   * that outcome is retried once against a freshly read id rather than passed
+   * over in silence.
+   *
+   * Both injected calls run on the child's own tool mutex, so nothing of the
+   * client's can overtake them — but a client that pipelines its own
+   * `select_page` / `new_page` / `close_page` alongside the screenshot can be
+   * queued between them, and re-selecting the page read before that would
+   * silently revert a choice the client has already been told succeeded.
+   * `selectionEpoch` is how that is noticed: it moves when such a frame is
+   * handed to the child. The answer is to READ AGAIN rather than to stand
+   * down — a fresh `list_pages` queues behind the client's own frame on that
+   * same mutex, so it reports the client's newer selection, and fronting that
+   * is what the client wanted. Standing down instead left the capture on
+   * whatever the client had just selected, which for `new_page(background:
+   * true)` is a tab nothing has ever composited: the issue's own headline trap,
+   * reproduced through the guard meant to respect the client.
+   *
+   * There are TWO windows, not one, and they are checked on the same footing:
+   * the client's frame can queue behind the injected `list_pages` or behind the
+   * injected `select_page` — the latter is a real `Page.bringToFront` round trip
+   * on a live child. So the epoch is consulted before the select reply is
+   * judged, never after: a reply saying the gateway's own target is selected is
+   * no longer the truth once a frame that reselects is queued behind it.
+   *
+   * Every branch is fail-open, and none of them reports back: the capture is
+   * forwarded either way. Nothing rescues one that blocks anyway — see
+   * docs/adr/0006 and issue #90.
+   */
+  async function bringSelectedToFront(): Promise<void> {
+    for (let pass = 0; pass < ACTIVATION_PASSES; pass++) {
+      const last = pass === ACTIVATION_PASSES - 1;
+      // Re-read per pass: a pass that lost to the client's own choice has to
+      // judge the next one against that newer choice, not the original.
+      const epoch = selectionEpoch;
+      const clientChoseSince = (): boolean => {
+        if (selectionEpoch === epoch) return false;
+        log.warn(
+          `session[${name}]: the client picked a page itself while this capture was being set up` +
+            (last
+              ? `, and it has kept doing so — leaving its choice standing and forwarding the ` +
+                `capture without bringing a tab to the front`
+              : `; reading the page list again so the tab brought to the front is the one it chose`),
+        );
+        return true;
+      };
+
+      const before = pageEntries((await callChild("list_pages", {}))?.result);
+      const target = before?.find((p) => p.selected);
+      if (!target || !Number.isInteger(target.id)) {
+        log.warn(
+          `session[${name}]: could not tell which page is selected, so this screenshot is being ` +
+            `taken without bringing it to the front — if that tab is not the foreground one the ` +
+            `capture can block until Puppeteer's 180s protocolTimeout, holding the session's tool ` +
+            `mutex for the whole wait`,
+        );
+        return;
+      }
+      if (clientChoseSince()) continue;
+
+      const after = await selectToFront(target.id as number);
+      if (!after) {
+        // An error reply — `No page found` for an id upstream has retired, or a
+        // tool it has renamed — which carries no page block to read. The tab is
+        // NOT in front, and saying so here is the only word the operator gets:
+        // nothing downstream notices.
+        log.warn(
+          `session[${name}]: bringing page ${target.id} (${target.url}) to the front failed` +
+            (last
+              ? "; forwarding the capture without it, which can block until Puppeteer's 180s " +
+                "protocolTimeout with the session's tool mutex held"
+              : "; reading the page list again, in case that id named a tab that has closed"),
+        );
+        continue;
+      }
+
+      if (clientChoseSince()) continue;
+
+      // Judged by ID alone. Matching on the URL as well used to read as success
+      // when the client's own pipelined `new_page` had opened a SECOND tab at
+      // the same URL; "did anything change under us" is the epoch's question,
+      // asked just above, and this one is only "is the tab I aimed at the tab
+      // that is selected".
+      const now = after.find((p) => p.selected);
+      if (now?.id === target.id) return;
+      // It landed somewhere other than the page the id was read from. Put the
+      // client's own selection back, by the id that very reply printed.
+      const restore = after.find((p) => p.url === target.url && Number.isInteger(p.id));
+      log.warn(
+        `session[${name}]: the selected page changed while bringing it to the front ` +
+          `(${target.url} -> ${now?.url ?? "nothing selected"})` +
+          (restore ? "; restoring it" : "; it is no longer open, leaving the child's own choice"),
+      );
+      if (!restore) return;
+      await selectToFront(restore.id as number);
+      return;
+    }
+  }
+
+  /**
+   * One injected `select_page ... bringToFront`. null means it did not land: an
+   * error reply, which upstream renders with no page block at all because the
+   * handler throws before asking for one, or a child that went away under it.
+   */
+  async function selectToFront(pageId: number): Promise<PageEntry[] | null> {
+    return pageEntries((await callChild("select_page", { pageId, bringToFront: true }))?.result);
   }
 
   // Client -> child pump. Cache initialize; track requests; fail fast while a
@@ -1163,7 +1461,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         return;
       }
     }
-    forwardToChild(msg, f);
+    dispatch(msg, f);
   };
 
   http.onclose = () => void session.close("http transport closed");
@@ -1172,6 +1470,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     name,
     http,
     async () => {
+      clearChildState();
       try {
         await child?.close();
       } catch {

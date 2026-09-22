@@ -7,6 +7,7 @@ import {
   isBrowserWork,
   browserUnavailableMessage,
   reportedPages,
+  pageEntries,
   navVerdict,
   shouldJudgeNav,
 } from "../src/bridge.js";
@@ -398,6 +399,67 @@ test("the text parse reads the '## Pages' section only", () => {
     ),
   );
   assert.deepEqual(got, { pages: ["https://example.com/"], selected: "https://example.com/" });
+});
+
+// --- page ids: what the screenshot activation acts on (issue #89) ----------
+// The activation re-selects the page the child already has selected, to bring
+// it to the front before a capture. It has to name that page by upstream's own
+// id, and getting that wrong does not fail loudly — it silently moves the
+// client to a different page.
+
+test("pageEntries reads the id upstream PRINTED, never the row's position", () => {
+  // Upstream's ids are a counter stamped once per page and never reused, so a
+  // row's position and its id part company as soon as any tab closes; the
+  // "## Pages" block also omits chrome-extension:// pages while their ids come
+  // out of the same counter. Either way the selected page here is row 1 of the
+  // block and id 2 of the browser, and counting rows would select somebody
+  // else's tab.
+  const got = pageEntries(
+    navReply(
+      "## Pages\n" +
+        "0: https://example.com/\n" +
+        "2: https://example.org/ [selected]\n" +
+        "## Extension Pages\n" +
+        "1: chrome-extension://abc/popup.html\n",
+    ),
+  );
+  assert.deepEqual(got, [
+    { id: 0, url: "https://example.com/", selected: false },
+    { id: 2, url: "https://example.org/", selected: true },
+  ]);
+});
+
+test("pageEntries keeps the ids the structured channel carries", () => {
+  const got = pageEntries({
+    content: [],
+    structuredContent: {
+      pages: [
+        { id: 0, url: "https://example.com/", selected: false },
+        { id: 3, url: "https://example.org/", selected: true },
+      ],
+    },
+  });
+  assert.deepEqual(got, [
+    { id: 0, url: "https://example.com/", selected: false },
+    { id: 3, url: "https://example.org/", selected: true },
+  ]);
+});
+
+test("an entry with no usable id is kept, but carries none to act on", () => {
+  // A channel that stopped carrying ids must cost the ACTIVATION (which then
+  // declines to guess) without also blinding the nav watchdog, which only ever
+  // needed the URLs.
+  const result = {
+    content: [],
+    structuredContent: { pages: [{ url: "https://example.com/", selected: true }] },
+  };
+  assert.deepEqual(pageEntries(result), [
+    { id: undefined, url: "https://example.com/", selected: true },
+  ]);
+  assert.deepEqual(reportedPages(result), {
+    pages: ["https://example.com/"],
+    selected: "https://example.com/",
+  });
 });
 
 // A strike must mean "the child is bound to a target the browser no longer has",
