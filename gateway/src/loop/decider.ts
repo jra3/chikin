@@ -45,6 +45,8 @@ export interface Decision {
   consequential: boolean;
   reason: string;
   ms: number;
+  /** The model that actually answered, when the provider says (a router names its pick). */
+  model?: string;
 }
 
 export interface Decider {
@@ -159,5 +161,97 @@ export class HaikuDecider implements Decider {
     const out = response.parsed_output;
     if (!out) throw new DeciderError(`decision model answer did not parse (stop_reason ${response.stop_reason})`);
     return { ...out, ms: Math.round(performance.now() - t0) };
+  }
+}
+
+/**
+ * The same decision through OpenRouter's OpenAI-compatible chat completions,
+ * which is where TypeSafe's Jev is hosted (`typesafe/jev-router`) alongside
+ * `anthropic/claude-haiku-5.5` and the rest. Same rules, same prompt, same
+ * schema; the answer is validated against `DECISION_SCHEMA` before it is used.
+ *
+ * Note what `typesafe/jev-router` is on OpenRouter: a ROUTER that picks a
+ * downstream model per request (it served `openai/gpt-6-luna` when probed on
+ * 2026-10-11), not TypeSafe's System One choice API that jev-ultrafast calls.
+ * The served model is reported back on every decision so a trace says which
+ * model actually chose.
+ *
+ * Plain `fetch`, not an SDK: OpenRouter is a different provider, and its
+ * request is one POST. For Anthropic models directly, `HaikuDecider` above
+ * goes through the official SDK.
+ */
+export interface OpenRouterDeciderOptions {
+  apiKey: string;
+  model: string;
+  timeoutMs?: number;
+  /** Injected in tests; the global fetch otherwise. */
+  fetch?: typeof fetch;
+  baseUrl?: string;
+}
+
+const OPENROUTER_SCHEMA = z.toJSONSchema(DECISION_SCHEMA);
+
+export class OpenRouterDecider implements Decider {
+  constructor(private readonly opts: OpenRouterDeciderOptions) {}
+
+  async decide(input: DecisionInput, signal?: AbortSignal): Promise<Decision> {
+    const doFetch = this.opts.fetch ?? fetch;
+    const t0 = performance.now();
+    const body = JSON.stringify({
+      model: this.opts.model,
+      // Not 512 as for Haiku direct: a router may hand the step to a reasoning
+      // model whose reasoning counts against this budget. typesafe/jev-router
+      // did, on 2026-10-11, and spent 512 tokens without writing the answer
+      // (finish_reason "length"). Billing is per token used, not per budget.
+      max_tokens: 2048,
+      messages: [
+        { role: "system", content: RULES },
+        { role: "user", content: decisionPrompt(input) },
+      ],
+      response_format: { type: "json_schema", json_schema: { name: "decision", strict: true, schema: OPENROUTER_SCHEMA } },
+      reasoning: { effort: "low" },
+    });
+    let res: Response | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const timeout = AbortSignal.timeout(this.opts.timeoutMs ?? 15_000);
+      try {
+        res = await doFetch(`${this.opts.baseUrl ?? "https://openrouter.ai/api/v1"}/chat/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.opts.apiKey}`,
+            "Content-Type": "application/json",
+            "X-Title": "chikin",
+          },
+          body,
+          signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+        });
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        if (attempt === 1) throw new DeciderError(`decision model call failed: ${String(e instanceof Error ? e.message : e)}`);
+        continue;
+      }
+      // One retry for the statuses that mean "try again", as the SDK does.
+      if ((res.status === 429 || res.status >= 500) && attempt === 0) continue;
+      break;
+    }
+    if (!res) throw new DeciderError("decision model call failed: no response");
+    const j = (await res.json().catch(() => null)) as {
+      model?: string;
+      error?: { message?: string };
+      choices?: { finish_reason?: string; message?: { content?: string | null; refusal?: string | null } }[];
+    } | null;
+    if (!res.ok) throw new DeciderError(`decision model call failed (${res.status}): ${j?.error?.message ?? res.statusText}`);
+    const choice = j?.choices?.[0];
+    if (choice?.message?.refusal || choice?.finish_reason === "content_filter")
+      throw new DeciderRefusedError(`the decision model declined${choice.message?.refusal ? `: ${choice.message.refusal}` : ""}`);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(choice?.message?.content ?? "");
+    } catch {
+      throw new DeciderError(`decision model answer was not JSON (finish_reason ${choice?.finish_reason ?? "none"})`);
+    }
+    const out = DECISION_SCHEMA.safeParse(parsed);
+    if (!out.success) throw new DeciderError(`decision model answer did not match the schema: ${out.error.message}`);
+    return { ...out.data, ms: Math.round(performance.now() - t0), model: j?.model };
   }
 }

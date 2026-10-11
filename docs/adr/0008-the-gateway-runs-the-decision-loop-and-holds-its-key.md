@@ -52,7 +52,14 @@ and whose session closure already holds every piece the loop needs
 - **The caller's own model drives the loop (status quo, kept).** `chikin_snapshot`
   and `chikin_act` remain for any caller that would rather decide each step
   itself. `chikin_achieve` adds a mode; it does not replace one.
-- **TypeSafe's hosted Jev as the decider (deferred).** Faster on Browser Use's
-  numbers, but it is a second vendor and a classifier that cannot write a
-  fill's text. The `Decider` interface (`gateway/src/loop/decider.ts`) is the
-  seam if Haiku's latency is not good enough.
+- **OpenRouter as a second provider (added).** `CHIKIN_OPENROUTER_API_KEY` sends
+  the same decision to any OpenRouter model, used only when no Anthropic key is
+  set. TypeSafe's Jev is hosted there, but only as `typesafe/jev-router`. That
+  is a router that hands each request to a downstream model: GPT-6 Luna or
+  DeepSeek V4.1 Flash in the 2026-10-11 runs. It is not the System One choice
+  API jev-ultrafast calls, so it does not deliver Jev's 178 ms classifier
+  latency. Each trace step names the model that actually answered.
+- **TypeSafe's own choice API (deferred).** It needs a third key and a
+  different request shape (choice heads), and cannot write a fill's text. The
+  `Decider` interface (`gateway/src/loop/decider.ts`) is the seam if a
+  classifier ever beats a generative model here on measured latency.

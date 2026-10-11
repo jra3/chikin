@@ -50,6 +50,8 @@ export interface TraceStep {
   page_changed: boolean | null;
   decide_ms: number;
   act_ms: number;
+  /** The model that made this decision, when the provider reports it. */
+  model?: string;
   note?: string;
 }
 
@@ -179,6 +181,7 @@ export async function runLoop(opts: LoopOptions): Promise<LoopResult> {
       consequential: decision.consequential,
       decide_ms: decision.ms,
       act_ms: 0,
+      ...(decision.model ? { model: decision.model } : {}),
       page_changed: null,
     };
 

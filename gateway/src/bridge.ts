@@ -2,7 +2,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
-import { config } from "./config.js";
+import { config, deciderModel, deciderProvider } from "./config.js";
 import { Session } from "./session.js";
 import { log } from "./log.js";
 import { isValidHandle, HANDLE_RULE } from "./names.js";
@@ -22,7 +22,7 @@ import {
 } from "./snapshot/index.js";
 import { act, ActPageGoneError, ActRequestError, resolveRow } from "./snapshot/act.js";
 import Anthropic from "@anthropic-ai/sdk";
-import { HaikuDecider, type Decider } from "./loop/decider.js";
+import { HaikuDecider, OpenRouterDecider, type Decider } from "./loop/decider.js";
 import { normaliseOrigins, runLoop, type LoopResult, type TraceStep } from "./loop/achieve.js";
 
 export interface BridgeDeps {
@@ -37,11 +37,13 @@ export interface BridgeDeps {
 let configuredDecider: Decider | null = null;
 function deciderFor(deps: BridgeDeps): Decider | null {
   if (deps.decider) return deps.decider;
-  if (!config.deciderApiKey) return null;
-  configuredDecider ??= new HaikuDecider({
-    client: new Anthropic({ apiKey: config.deciderApiKey }),
-    model: config.deciderModel,
-  });
+  const provider = deciderProvider();
+  const model = deciderModel();
+  if (!provider || !model) return null;
+  configuredDecider ??=
+    provider === "anthropic"
+      ? new HaikuDecider({ client: new Anthropic({ apiKey: config.deciderApiKey }), model })
+      : new OpenRouterDecider({ apiKey: config.openrouterApiKey, model });
   return configuredDecider;
 }
 
@@ -515,7 +517,8 @@ function stepLine(s: TraceStep): string {
   const text = s.text ? ` text=${JSON.stringify(s.text)}` : "";
   const changed = s.page_changed === null ? "" : s.page_changed ? ", page changed" : ", page unchanged";
   const note = s.note ? ` (${s.note})` : "";
-  return `${s.step}. ${what}${text} -> ${s.outcome}${changed}${note} [decide ${s.decide_ms}ms, act ${s.act_ms}ms] ${s.reason}`;
+  const by = s.model ? ` by ${s.model}` : "";
+  return `${s.step}. ${what}${text} -> ${s.outcome}${changed}${note} [decide ${s.decide_ms}ms${by}, act ${s.act_ms}ms] ${s.reason}`;
 }
 
 // Gateway-owned tools that drive the browser over the gateway's own CDP socket.
@@ -1550,7 +1553,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     const args = f.params?.arguments ?? {};
     const decider = deciderFor(deps);
     if (!decider) {
-      replyTool(f.id, "chikin_achieve is not configured on this gateway (no CHIKIN_ANTHROPIC_API_KEY).", true);
+      replyTool(f.id, "chikin_achieve is not configured on this gateway (no CHIKIN_ANTHROPIC_API_KEY or CHIKIN_OPENROUTER_API_KEY).", true);
       return;
     }
     const goal = typeof args.goal === "string" ? args.goal.trim() : "";

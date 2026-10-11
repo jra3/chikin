@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Anthropic from "@anthropic-ai/sdk";
-import { HaikuDecider, DeciderError, DeciderRefusedError, RULES, type MessagesClient } from "../src/loop/decider.js";
+import { HaikuDecider, OpenRouterDecider, DeciderError, DeciderRefusedError, RULES, type MessagesClient } from "../src/loop/decider.js";
 
 /**
  * The decider's request and its handling of what comes back (#103), against a
@@ -76,4 +76,65 @@ test("the prompt carries recent actions with their outcomes", async () => {
     recent: [{ action: "Search", kind: "fill", text: "socks", outcome: "done", page_changed: true }],
   });
   assert.match((calls[0].params as any).messages[0].content, /1\. fill "Search" text="socks" -> done, page changed/);
+});
+
+// --- OpenRouter -------------------------------------------------------------
+
+function fakeFetch(replies: ({ status: number; body: unknown } | Error)[]) {
+  const calls: { url: string; init: RequestInit }[] = [];
+  const f = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    const r = replies.shift();
+    if (!r) throw new Error("fake fetch ran out");
+    if (r instanceof Error) throw r;
+    return new Response(JSON.stringify(r.body), { status: r.status, statusText: "x" });
+  }) as unknown as typeof fetch;
+  return { f, calls };
+}
+const ok = (content: string, model = "openai/gpt-6-luna") => ({
+  status: 200,
+  body: { model, choices: [{ finish_reason: "stop", message: { content } }] },
+});
+
+test("OpenRouter: the request carries the rules, the prompt and a strict schema; the served model is reported", async () => {
+  const { f, calls } = fakeFetch([ok('{"choice":"e2","text":"Alan Turing","consequential":false,"reason":"type it"}')]);
+  const d = new OpenRouterDecider({ apiKey: "sk-or-test", model: "typesafe/jev-router", fetch: f });
+  const out = await d.decide(input);
+  assert.deepEqual([out.choice, out.text, out.model], ["e2", "Alan Turing", "openai/gpt-6-luna"]);
+  assert.equal(calls[0].url, "https://openrouter.ai/api/v1/chat/completions");
+  assert.equal((calls[0].init.headers as Record<string, string>).Authorization, "Bearer sk-or-test");
+  const body = JSON.parse(String(calls[0].init.body));
+  assert.equal(body.model, "typesafe/jev-router");
+  assert.equal(body.messages[0].content, RULES);
+  assert.match(body.messages[1].content, /^Goal:\nfind socks\n/);
+  assert.equal(body.response_format.type, "json_schema");
+  assert.equal(body.response_format.json_schema.strict, true);
+  assert.equal(body.response_format.json_schema.schema.additionalProperties, false);
+  assert.ok(body.max_tokens >= 2048, "room for a routed reasoning model to reason AND answer");
+});
+
+test("OpenRouter: an answer outside the schema, or not JSON, is DeciderError", async () => {
+  for (const content of ['{"choice":"e2"}', "click e2 please"]) {
+    const { f } = fakeFetch([ok(content)]);
+    await assert.rejects(new OpenRouterDecider({ apiKey: "k", model: "m", fetch: f }).decide(input), DeciderError);
+  }
+});
+
+test("OpenRouter: a refusal or content filter is DeciderRefusedError", async () => {
+  const { f } = fakeFetch([{ status: 200, body: { choices: [{ finish_reason: "content_filter", message: { content: null } }] } }]);
+  await assert.rejects(new OpenRouterDecider({ apiKey: "k", model: "m", fetch: f }).decide(input), DeciderRefusedError);
+});
+
+test("OpenRouter: one retry on 429/5xx, then the status is reported; a 401 is not retried", async () => {
+  const twice = fakeFetch([{ status: 503, body: {} }, { status: 503, body: { error: { message: "down" } } }]);
+  await assert.rejects(
+    new OpenRouterDecider({ apiKey: "k", model: "m", fetch: twice.f }).decide(input),
+    (e: unknown) => e instanceof DeciderError && /\(503\): down/.test(e.message),
+  );
+  assert.equal(twice.calls.length, 2);
+  const retryThenOk = fakeFetch([{ status: 429, body: {} }, ok('{"choice":"DONE","text":null,"consequential":false,"reason":"x"}')]);
+  assert.equal((await new OpenRouterDecider({ apiKey: "k", model: "m", fetch: retryThenOk.f }).decide(input)).choice, "DONE");
+  const auth = fakeFetch([{ status: 401, body: { error: { message: "No auth" } } }]);
+  await assert.rejects(new OpenRouterDecider({ apiKey: "k", model: "m", fetch: auth.f }).decide(input), /\(401\): No auth/);
+  assert.equal(auth.calls.length, 1);
 });

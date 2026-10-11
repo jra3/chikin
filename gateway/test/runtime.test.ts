@@ -83,11 +83,32 @@ test("seed volume on the host + SEED_VOLUME unset is warned about", () => {
 
 test("chikin_achieve's key is reported as present or absent, never as itself (#103)", () => {
   const secret = "sk-ant-test-0123456789abcdef";
-  const on = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: secret, ANTHROPIC_API_KEY: "", CHIKIN_DECIDER_MODEL: "claude-haiku-5-5" });
+  const on = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: secret, ANTHROPIC_API_KEY: "", CHIKIN_DECIDER_MODEL: "" });
   const cfg = on.cfg as Record<string, unknown>;
   assert.equal(cfg.achieve, true);
   assert.equal(cfg.deciderModel, "claude-haiku-5-5");
   assert.ok(!JSON.stringify(on).includes(secret), "/healthz and the dashboard are unauthenticated");
-  const off = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "", ANTHROPIC_API_KEY: "sk-ant-shell-key" }).cfg as Record<string, unknown>;
+  const off = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "", CHIKIN_OPENROUTER_API_KEY: "", ANTHROPIC_API_KEY: "sk-ant-shell-key" }).cfg as Record<string, unknown>;
   assert.equal(off.achieve, false);
+});
+
+test("OpenRouter is the decider only without an Anthropic key, with its own default model", () => {
+  const secret = "sk-or-v1-test-0123456789";
+  const or = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "", CHIKIN_OPENROUTER_API_KEY: secret, CHIKIN_DECIDER_MODEL: "" });
+  const cfg = or.cfg as Record<string, unknown>;
+  assert.equal(cfg.achieve, true);
+  assert.equal(cfg.deciderProvider, "openrouter");
+  assert.equal(cfg.deciderModel, "anthropic/claude-haiku-5.5");
+  assert.ok(!JSON.stringify(or).includes(secret));
+
+  const both = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "sk-ant-x", CHIKIN_OPENROUTER_API_KEY: secret, CHIKIN_DECIDER_MODEL: "" }).cfg as Record<string, unknown>;
+  assert.equal(both.deciderProvider, "anthropic", "the direct key wins");
+  assert.equal(both.deciderModel, "claude-haiku-5-5");
+
+  const jev = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "", CHIKIN_OPENROUTER_API_KEY: secret, CHIKIN_DECIDER_MODEL: "typesafe/jev-router" }).cfg as Record<string, unknown>;
+  assert.equal(jev.deciderModel, "typesafe/jev-router");
+
+  const shell = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "", CHIKIN_OPENROUTER_API_KEY: "", OPENROUTER_API_KEY: secret }).cfg as Record<string, unknown>;
+  assert.equal(shell.achieve, false, "a shell's own OPENROUTER_API_KEY does not switch it on");
+  assert.equal(shell.deciderModel, null);
 });

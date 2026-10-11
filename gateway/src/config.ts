@@ -179,7 +179,13 @@ export const config = {
   // The key is a paid credential; it never leaves this process except to the
   // Anthropic API, and /healthz reports only whether it is set.
   deciderApiKey: str("CHIKIN_ANTHROPIC_API_KEY", ""),
-  deciderModel: str("CHIKIN_DECIDER_MODEL", "claude-haiku-5-5"),
+  // Or through OpenRouter, where TypeSafe's Jev is hosted. Used only when no
+  // Anthropic key is set. Same scoping reason as the key above.
+  openrouterApiKey: str("CHIKIN_OPENROUTER_API_KEY", ""),
+  // Empty means the provider's default: claude-haiku-5-5 direct, or
+  // anthropic/claude-haiku-5.5 on OpenRouter (typesafe/jev-router is the
+  // other one worth trying there).
+  deciderModelSetting: str("CHIKIN_DECIDER_MODEL", ""),
 
   containerPrefix: "chikin-chrome-",
   volumePrefix: "chikin-profile-",
@@ -252,4 +258,18 @@ export function volumeLabels(name: string): Record<string, string> {
  */
 export function vncUrl(name: string): string {
   return `http://${containerName(name)}.${config.network}:${config.vncPort}`;
+}
+
+/** Which provider answers chikin_achieve's decisions, if any. Anthropic wins when both keys are set. */
+export function deciderProvider(): "anthropic" | "openrouter" | null {
+  if (config.deciderApiKey) return "anthropic";
+  if (config.openrouterApiKey) return "openrouter";
+  return null;
+}
+
+/** The decision model in effect: the setting, else the provider's default. */
+export function deciderModel(): string | null {
+  const p = deciderProvider();
+  if (!p) return null;
+  return config.deciderModelSetting || (p === "anthropic" ? "claude-haiku-5-5" : "anthropic/claude-haiku-5.5");
 }

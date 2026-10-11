@@ -109,10 +109,12 @@ test("each plumbed knob forwards its own name, not a neighbour's", () => {
 // decision model behind chikin_achieve (#103) that silently switches on a paid
 // feature. The gateway's copy must be chikin-scoped, and must not be filled
 // from the generic name either.
-test("the decision model's key reaches the gateway only under a chikin-scoped name", () => {
+test("the decision model's keys reach the gateway only under chikin-scoped names", () => {
   const env = composeGatewayEnv();
-  assert.ok(env.has("CHIKIN_ANTHROPIC_API_KEY"), "the scoped knob is passed through");
-  assert.ok(!env.has("ANTHROPIC_API_KEY"), "a bare ANTHROPIC_API_KEY would be the shell's");
-  for (const [k, v] of env)
-    assert.ok(!/\$\{ANTHROPIC_API_KEY\b/.test(v), `${k} is filled from the shell's generic ANTHROPIC_API_KEY`);
+  for (const generic of ["ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"]) {
+    assert.ok(env.has(`CHIKIN_${generic}`), `the scoped CHIKIN_${generic} is passed through`);
+    assert.ok(!env.has(generic), `a bare ${generic} would be the shell's`);
+    for (const [k, v] of env)
+      assert.ok(!new RegExp(`\\$\\{${generic}\\b`).test(v), `${k} is filled from the shell's generic ${generic}`);
+  }
 });
