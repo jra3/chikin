@@ -16,7 +16,7 @@
  * a selector a model wrote.
  */
 
-import { CdpClient, CdpError } from "./cdp-client.js";
+import { CdpClient, CdpError, CdpTransportError } from "./cdp-client.js";
 import { SNAPSHOT_JS } from "./snapshot-script.js";
 import { pageSocketUrl, readState, StalePageError, type CdpTarget, type PageState, type SnapshotAction } from "./index.js";
 
@@ -36,6 +36,14 @@ export class ActUnconfirmedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ActUnconfirmedError";
+  }
+}
+
+/** The page the row was read from could not be reached (closed, or the browser was swapped). Nothing was input. */
+export class ActPageGoneError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ActPageGoneError";
   }
 }
 
@@ -111,6 +119,13 @@ const settleJs = (action: SnapshotAction): string =>
   JSON.stringify(action) +
   ")";
 
+/**
+ * Deadline for each input command and each read after one. Short, because a
+ * click that opens alert()/confirm() leaves its mouseReleased unanswered until
+ * the dialog is dismissed, and the caller should hear that in seconds.
+ */
+const INPUT_TIMEOUT_MS = 5000;
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -157,11 +172,11 @@ async function isFresh(client: CdpClient, state: PageState, row: SnapshotAction)
  * the old context is gone and the new one has no body; that is retried for up
  * to `ms`, and anything still unreadable after it is reported as it is.
  */
-export async function observeAfter(client: CdpClient, ms = 3000): Promise<PageState> {
+export async function observeAfter(client: CdpClient, ms = 3000, readTimeoutMs?: number): Promise<PageState> {
   const deadline = Date.now() + ms;
   for (;;) {
     try {
-      return await readState(client);
+      return await readState(client, readTimeoutMs);
     } catch (e) {
       const transient = e instanceof StalePageError || e instanceof CdpError;
       if (!transient || Date.now() >= deadline) throw e;
@@ -183,7 +198,9 @@ export type ActOutcome =
   // `state: null`: the input happened but the page was not readable in time
   // (still loading). It must still read as DONE — a caller told to retry
   // would click twice.
-  | { done: true; state: PageState | null }
+  // `reason`: the input itself was interrupted after it was sent, so it may
+  // not have completed (a JavaScript dialog is the usual cause).
+  | { done: true; state: PageState | null; reason?: string }
   | { done: false; error: ActRefusedError | ActUnconfirmedError; state: PageState | null };
 
 /**
@@ -191,11 +208,24 @@ export type ActOutcome =
  * page as it is now, so the caller re-decides without another round trip.
  * Once input has been sent it never throws either, whatever the read after it
  * does: an error there would look retryable, and a retried click is a second
- * click. Before any input, transport failures throw.
+ * click. Before any input, transport failures throw; a page that cannot be
+ * reached at all throws `ActPageGoneError`.
  */
 export async function act(opts: ActOptions): Promise<ActOutcome> {
   const { row } = opts;
-  const client = await CdpClient.connect(pageSocketUrl(opts.ip, opts.cdpPort, opts.page.id));
+  let client: CdpClient;
+  try {
+    client = await CdpClient.connect(pageSocketUrl(opts.ip, opts.cdpPort, opts.page.id));
+  } catch (e) {
+    if (e instanceof CdpTransportError)
+      throw new ActPageGoneError(`The page row '${row.id}' was read from is gone (closed, or the browser was replaced); nothing was done.`);
+    throw e;
+  }
+  let inputSent = false;
+  const input = (method: string, params: Record<string, unknown>) => {
+    inputSent = true;
+    return client.send(method, params, INPUT_TIMEOUT_MS);
+  };
   const refuse = async (error: ActRefusedError | ActUnconfirmedError): Promise<ActOutcome> => {
     let state: PageState | null = null;
     try {
@@ -212,7 +242,7 @@ export async function act(opts: ActOptions): Promise<ActOutcome> {
     if (row.kind === "wait") {
       await sleep(100);
     } else if (row.kind === "scroll") {
-      await client.send("Input.dispatchMouseEvent", {
+      await input("Input.dispatchMouseEvent", {
         type: "mouseWheel",
         x: Math.round(opts.state.w / 2),
         y: Math.round(opts.state.h / 2),
@@ -220,7 +250,15 @@ export async function act(opts: ActOptions): Promise<ActOutcome> {
         deltaY: row.delta ?? 0,
       });
     } else {
-      const target = await evaluate(client, targetJs(row));
+      if (row.kind === "select") inputSent = true;
+      let target;
+      try {
+        target = await evaluate(client, targetJs(row));
+      } catch (e) {
+        if (row.kind === "select")
+          return { done: false, error: new ActUnconfirmedError(`The select on row '${row.id}' was interrupted; read the page before retrying.`), state: null };
+        throw e;
+      }
       if (target.threw) {
         if (row.kind === "select")
           return await refuse(new ActUnconfirmedError(`The select on row '${row.id}' was interrupted; read the page before retrying.`));
@@ -233,18 +271,18 @@ export async function act(opts: ActOptions): Promise<ActOutcome> {
       if (row.kind !== "select") {
         const { x, y } = target.value as { x: number; y: number };
         for (const type of ["mousePressed", "mouseReleased"])
-          await client.send("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: 1 });
+          await input("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: 1 });
         if (row.kind === "fill") {
           // The browsers are Linux containers: select-all is Ctrl (modifier 2).
-          await client.send("Input.dispatchKeyEvent", {
+          await input("Input.dispatchKeyEvent", {
             type: "keyDown",
             key: "a",
             code: "KeyA",
             modifiers: 2,
             commands: ["selectAll"],
           });
-          await client.send("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", modifiers: 2 });
-          await client.send("Input.insertText", { text: opts.text ?? "" });
+          await input("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", modifiers: 2 });
+          await input("Input.insertText", { text: opts.text ?? "" });
         }
       }
     }
@@ -261,10 +299,13 @@ export async function act(opts: ActOptions): Promise<ActOutcome> {
       }
     }
     try {
-      return { done: true, state: await observeAfter(client) };
+      return { done: true, state: await observeAfter(client, 3000, INPUT_TIMEOUT_MS) };
     } catch {
       return { done: true, state: null };
     }
+  } catch (e) {
+    if (!inputSent) throw e;
+    return { done: true, state: null, reason: String(e instanceof Error ? e.message : e) };
   } finally {
     client.close();
   }

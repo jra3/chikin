@@ -19,7 +19,7 @@ import {
   type CdpTarget,
   type PageState,
 } from "./snapshot/index.js";
-import { act, ActRequestError, resolveRow } from "./snapshot/act.js";
+import { act, ActPageGoneError, ActRequestError, resolveRow } from "./snapshot/act.js";
 
 export interface BridgeDeps {
   provisioner: Provisioner;
@@ -1309,8 +1309,13 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       .catch((e) => log.warn(`session[${name}]: table reply failed`, String(e)));
   }
 
-  /** Remember a read, stamped with the child counters it is only good for. */
-  function remember(page: CdpTarget, state: PageState): void {
+  /**
+   * Remember a read, stamped with the child counters it is only good for. A
+   * read begun under an earlier child (`gen`) is from a browser since replaced,
+   * and is dropped.
+   */
+  function remember(gen: number, page: CdpTarget, state: PageState): void {
+    if (gen !== childGen) return;
     lastRead = { page, state, navSeq: navNewest.seq, selEpoch: selectionEpoch };
   }
 
@@ -1335,6 +1340,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       replyTool(f.id, "`url` must be a string when provided.", true);
       return;
     }
+    const gen = childGen;
     const ip = currentIp;
     if (!ip) {
       replyTool(f.id, "chikin browser restarting; retry the request", true);
@@ -1352,7 +1358,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         targetId: ours,
         selected: navNewest.selected,
       });
-      remember(page, state);
+      remember(gen, page, state);
       replyTable(f.id, "", page, state, false);
     } catch (e) {
       if (e instanceof PageChoiceError || e instanceof StalePageError) {
@@ -1372,6 +1378,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
    */
   async function handleAct(f: Frame): Promise<void> {
     const args = f.params?.arguments ?? {};
+    const gen = childGen;
     const ip = currentIp;
     if (!ip) {
       replyTool(f.id, "chikin browser restarting; retry the request", true);
@@ -1396,18 +1403,28 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       }
       throw e;
     }
-    const outcome = await act({
-      ip,
-      cdpPort: config.cdpPort,
-      page: read.page,
-      state: read.state,
-      row,
-      text: typeof args.text === "string" ? args.text : undefined,
-    });
+    let outcome;
+    try {
+      outcome = await act({
+        ip,
+        cdpPort: config.cdpPort,
+        page: read.page,
+        state: read.state,
+        row,
+        text: typeof args.text === "string" ? args.text : undefined,
+      });
+    } catch (e) {
+      if (e instanceof ActPageGoneError) {
+        if (lastRead === read) lastRead = null;
+        replyTool(f.id, `${e.message} Call chikin_snapshot to read the page that is open now.`, true);
+        return;
+      }
+      throw e;
+    }
     if (outcome.done) {
       if (outcome.state) {
         const state = outcome.state;
-        remember(read.page, state);
+        remember(gen, read.page, state);
         const verb = { click: "clicked", fill: "filled", select: "selected", scroll: "scrolled", wait: "waited" }[row.kind];
         replyTable(f.id, `Done: ${verb} ${row.id} (${row.label.replace(/\s+/g, " ").trim()}). The page now:`, read.page, state, false, {
           executed: row.id,
@@ -1415,6 +1432,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         return;
       }
       lastRead = null;
+      if (outcome.reason) {
+        replyTool(
+          f.id,
+          `Sent: ${row.kind} ${row.id}, but the input may not have completed (${outcome.reason}). ` +
+            "A JavaScript dialog (alert/confirm/prompt) may be open; handle_dialog dismisses it. " +
+            "Do not repeat the action; call chikin_snapshot to see where it landed.",
+          false,
+        );
+        return;
+      }
       replyTool(
         f.id,
         `Done: ${row.kind} ${row.id}, but the page was not readable afterwards (still loading?). ` +
@@ -1424,7 +1451,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       return;
     }
     if (outcome.state) {
-      remember(read.page, outcome.state);
+      remember(gen, read.page, outcome.state);
       replyTable(f.id, `${outcome.error.message} The page now:`, read.page, outcome.state, true, { refused: row.id });
       return;
     }

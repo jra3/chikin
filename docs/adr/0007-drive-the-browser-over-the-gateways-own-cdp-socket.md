@@ -56,10 +56,14 @@ and a snapshot does not delay the client.
   an act never runs against a read still in flight.
 - **An input that landed is never reported as retryable.** Once input has been
   sent, a failure to read the page afterwards is reported as "done, read it
-  again", never as an error. A caller told to retry a click clicks twice. A
-  transport failure *between* the press and the release is the residual: it
-  surfaces as a retryable error, and the socket dying there means the container
-  is going away.
+  again", never as an error. A caller told to retry a click clicks twice. The
+  same holds for an input command that fails or times out after the first one
+  went out: each `Input.*` gets 5 s, because a click that opens `alert()` leaves
+  its release unanswered, and the reply says a dialog may be open
+  (`handle_dialog` dismisses it). A tab that cannot be reached before any input
+  (closed, or the browser swapped) clears the remembered read and asks for a
+  fresh `chikin_snapshot`; a read that completes after a child swap is not
+  remembered.
 - **The page's main world carries our state.** `window.__jevFast` (node identity
   and guard closures) lives where the page and `evaluate_script` can see it.
   That is upstream's capability class already: `evaluate_script` runs in the

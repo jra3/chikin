@@ -271,3 +271,68 @@ test("chikin_act: gated, needs a read, executes the stored row and answers with 
     await close();
   }
 });
+
+test("chikin_act: a closed page is not retried blind; the next snapshot reads what is open", async () => {
+  const { client, close } = await connect("inst-act-gone");
+  const original = chrome.pages[0];
+  try {
+    await client.callTool({ name: "chikin_identify", arguments: { handle: "act-gone" } });
+    const snap = await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    assert.notEqual(snap.isError, true, textOf(snap));
+
+    chrome.pages[0] = { ...original, id: "P9" };
+    const before = chrome.commands.length;
+    const gone = await client.callTool({ name: "chikin_act", arguments: { id: "e1" } });
+    assert.equal(gone.isError, true);
+    assert.match(textOf(gone), /gone/);
+    assert.match(textOf(gone), /Call chikin_snapshot/);
+    assert.doesNotMatch(textOf(gone), /retry/);
+    assert.equal(chrome.commands.length, before, "nothing reached any page");
+
+    const again = await client.callTool({ name: "chikin_act", arguments: { id: "e1" } });
+    assert.match(textOf(again), /call chikin_snapshot first/, "the dead tab is forgotten");
+
+    const fresh = await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    assert.notEqual(fresh.isError, true, textOf(fresh));
+    assert.equal((fresh.structuredContent as { page?: { id?: string } }).page?.id, "P9");
+  } finally {
+    chrome.pages[0] = original;
+    await close();
+  }
+});
+
+test("chikin_snapshot: a read that finishes after a reset is not remembered for the new browser", async () => {
+  const { client, close } = await connect("inst-snap-swap");
+  const page = chrome.pages[0];
+  const original = page.evaluate;
+  try {
+    await client.callTool({ name: "chikin_identify", arguments: { handle: "snap-swap" } });
+    const first = await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    assert.notEqual(first.isError, true, textOf(first));
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let held = false;
+    page.evaluate = (params) => {
+      held = true;
+      return gate.then(() => answer(params));
+    };
+    const pending = client.callTool({ name: "chikin_snapshot", arguments: {} });
+    while (!held) await new Promise((r) => setTimeout(r, 10));
+    page.evaluate = original;
+
+    const reset = await client.callTool({ name: "chikin_reset", arguments: {} });
+    assert.notEqual(reset.isError, true, textOf(reset));
+    release();
+    await pending;
+
+    const before = chrome.commands.length;
+    const act = await client.callTool({ name: "chikin_act", arguments: { id: "e1" } });
+    assert.equal(act.isError, true);
+    assert.match(textOf(act), /call chikin_snapshot first/, "the replaced browser's read was dropped");
+    assert.equal(chrome.commands.length, before);
+  } finally {
+    page.evaluate = original;
+    await close();
+  }
+});

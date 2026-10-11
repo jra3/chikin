@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { startFakeCdp, type FakeCdp } from "./fake-cdp.js";
-import { act, resolveRow, ActRefusedError, ActRequestError, ActUnconfirmedError } from "../src/snapshot/act.js";
+import { HANG, startFakeCdp, type FakeCdp } from "./fake-cdp.js";
+import { act, resolveRow, ActPageGoneError, ActRefusedError, ActRequestError, ActUnconfirmedError } from "../src/snapshot/act.js";
 import type { CdpTarget, PageState, SnapshotAction } from "../src/snapshot/index.js";
 
 /**
@@ -208,5 +208,32 @@ test("input sent but the page never becomes readable: still DONE, never an error
     assert.equal(out.done, true, "the click happened; reporting failure invites a second click");
     assert.equal(out.state, null);
     assert.equal(inputs(fake).length, 2);
+  });
+});
+
+test("a click whose release is never answered (alert() opened) is DONE with no state, well inside the 25s default", async () => {
+  const fake = await startFakeCdp([
+    { id: "P", url: STATE.url, evaluate: scripted(), input: (_m, p) => (p.type === "mouseReleased" ? HANG : undefined) },
+  ]);
+  try {
+    const t0 = Date.now();
+    const out = await run(fake, "e1");
+    const took = Date.now() - t0;
+    assert.equal(out.done, true, "the press went out; a retry would be a second click");
+    assert.equal(out.state, null);
+    assert.match(String(out.done && out.reason), /mouseReleased|timed out/);
+    assert.ok(took < 10_000, `answered in ${took}ms`);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("a page that cannot be reached is ActPageGoneError, before any input", async () => {
+  await withPage(scripted(), async (fake) => {
+    await assert.rejects(
+      act({ ip: fake.ip, cdpPort: fake.port, page: { ...PAGE, id: "closed" }, state: STATE, row: resolveRow(STATE, "e1", undefined) }),
+      (e: unknown) => e instanceof ActPageGoneError,
+    );
+    assert.deepEqual(inputs(fake), []);
   });
 });
