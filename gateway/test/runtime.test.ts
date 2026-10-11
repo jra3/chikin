@@ -80,3 +80,14 @@ test("seed volume on the host + SEED_VOLUME unset is warned about", () => {
     [],
   );
 });
+
+test("chikin_achieve's key is reported as present or absent, never as itself (#103)", () => {
+  const secret = "sk-ant-test-0123456789abcdef";
+  const on = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: secret, ANTHROPIC_API_KEY: "", CHIKIN_DECIDER_MODEL: "claude-haiku-5-5" });
+  const cfg = on.cfg as Record<string, unknown>;
+  assert.equal(cfg.achieve, true);
+  assert.equal(cfg.deciderModel, "claude-haiku-5-5");
+  assert.ok(!JSON.stringify(on).includes(secret), "/healthz and the dashboard are unauthenticated");
+  const off = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "", ANTHROPIC_API_KEY: "sk-ant-shell-key" }).cfg as Record<string, unknown>;
+  assert.equal(off.achieve, false);
+});

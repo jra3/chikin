@@ -173,6 +173,14 @@ export const config = {
   // Set CHIKIN_VOLUME_GC=0 to leave every existing volume alone.
   volumeGc: bool("CHIKIN_VOLUME_GC", true),
 
+  // The decision model behind chikin_achieve (#103). The tool is listed only
+  // when a key is set: an MCP client fixes its tool registry at session start,
+  // so a tool that can only ever answer "not configured" is worse than none.
+  // The key is a paid credential; it never leaves this process except to the
+  // Anthropic API, and /healthz reports only whether it is set.
+  deciderApiKey: str("CHIKIN_ANTHROPIC_API_KEY", ""),
+  deciderModel: str("CHIKIN_DECIDER_MODEL", "claude-haiku-5-5"),
+
   containerPrefix: "chikin-chrome-",
   volumePrefix: "chikin-profile-",
   // `bin/chikin-mcp` names each Claude Code instance `inst-<pid>`, so this

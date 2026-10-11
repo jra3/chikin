@@ -48,6 +48,10 @@ export interface RuntimeConfig {
   authEnabled: boolean;
   extraOrigins: string;
   cdmExtraArgs: string[];
+  /** Whether chikin_achieve is offered (#103): CHIKIN_ANTHROPIC_API_KEY is set. Never the key. */
+  achieve: boolean;
+  /** The model chikin_achieve asks for each decision. */
+  deciderModel: string;
 }
 
 export function runtimeConfig(): RuntimeConfig {
@@ -69,6 +73,8 @@ export function runtimeConfig(): RuntimeConfig {
     authEnabled: config.token !== "",
     extraOrigins: config.extraOrigins,
     cdmExtraArgs: config.cdmExtraArgs,
+    achieve: config.deciderApiKey !== "",
+    deciderModel: config.deciderModel,
   };
 }
 

@@ -80,6 +80,19 @@ real cross-site link click, which must answer with the new page's table.
 BASE=http://localhost:18096 node act-guards.mjs inst-actguards
 ```
 
+`achieve.mjs` measures `chikin_achieve` (#103) on real goals with a real
+decision model. It uses three goals: a Wikipedia search, a Hacker News page,
+and an httpbin pizza order. The order ends at a final submit, so it must come
+back `needs_confirmation`. Each goal is one call. The script prints the trace,
+the decision and act time per step, and a summary table. It needs the scratch
+gateway started with `-e CHIKIN_ANTHROPIC_API_KEY=<key>`, and spends a few
+cents of Haiku per run. Without a key the gateway reports `achieve: false` and
+the script prints `SKIP`.
+
+```bash
+BASE=http://localhost:18096 node achieve.mjs inst-achieve
+```
+
 A scratch gateway for these, from a locally built image, on a port nothing else
 holds (`ss -ltn`), with reaping and the volume sweep off and no seed volume:
 
