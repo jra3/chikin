@@ -137,7 +137,7 @@ The gateway also injects **`chikin_snapshot`**: one atomic read of the selected 
 { "name": "chikin_snapshot", "arguments": { "url": "https://example.org/x" } }  // a named open page (origin + path)
 ```
 
-It is gated like any browser tool (identify first), provisions the browser on first use, and counts as browser activity. It only reads: act with the usual `click` / `fill` tools afterwards. When more than one open page fits, or none does, it refuses and lists what is open rather than guessing; between navigations a client's own `select_page` moves the child's selection without telling the gateway, so pass `url` when in doubt. Shadow DOM and frames are not traversed (the in-page script is Browser Use's [jev-ultrafast](https://github.com/browser-use/jev-ultrafast) observation script, verbatim).
+It is gated like any browser tool (identify first), provisions the browser on first use, and counts as browser activity. It only reads: act with the usual `click` / `fill` tools afterwards. When more than one open page fits, or none does, it refuses and lists what is open rather than guessing (a selection that no longer matches falls back to the only open page, if there is just one); between navigations a client's own `select_page` moves the child's selection without telling the gateway, so pass `url` when in doubt. Shadow DOM and frames are not traversed (the in-page script is Browser Use's [jev-ultrafast](https://github.com/browser-use/jev-ultrafast) observation script, verbatim).
 
 ### Watch a browser / solve a captcha
 
