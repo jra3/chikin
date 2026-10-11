@@ -21,7 +21,7 @@ against the repo in section 1.4.
 
 ## 1. What Jev Ultrafast actually does
 
-The runtime is ~370 lines of Python plus 107 lines of in-page JavaScript:
+The runtime is ~590 lines of Python plus 107 lines of in-page JavaScript:
 `jev_ultrafast/{agent,browser,model,questions}.py` and `snapshot.js`. The
 README's table of files is accurate. Chrome is reached through
 `browser-harness==0.1.13` (`pyproject.toml`), a sibling Browser Use package
@@ -207,10 +207,10 @@ personal data.
 - **Gateway-owned tools exist**: `chikin_identify` / `chikin_reset` are appended
   to `tools/list` replies (`bridge.ts:783-786`), classified before forwarding
   (`classifyClientFrame`, `:430`), handled by the gateway and answered with
-  `replyTool` (`:1173-1210`); they never reach the child. `chikin_achieve` is a
-  third one of these.
+  `replyTool` (`:1162`; `handleIdentify` `:1176`, `handleReset` `:1101`); they
+  never reach the child. `chikin_achieve` is a third one of these.
 - **The gateway can already reach the Browser's CDP over HTTP**: `realPages()`
-  fetches `http://${currentIp}:${config.cdpPort}/json/list` (`bridge.ts:699-714`),
+  fetches `http://${currentIp}:${config.cdpPort}/json/list` (`bridge.ts:653-669`),
   and `chromeVersion()` reads `/json/version`. `currentIp` is the container's
   `chikin-net` address from `provisioner.resolveIp` (`provisioner.ts:597-606`),
   which is the pinned reverse-dial rule in CLAUDE.md (resolved IP, never a bare
@@ -219,14 +219,14 @@ personal data.
   but Node >= 22 ships a global `WebSocket`, so a direct CDP session needs no
   new package. The CDP lane (`cdp.ts`) is a proxy, not a client; it does not
   help here.
-- **Injected child calls exist**: `callChild(tool, args)` (`bridge.ts:625-648`)
+- **Injected child calls exist**: `callChild(tool, args)` (`bridge.ts:629-648`)
   sends a `tools/call` on the child's stdio with a gateway-prefixed id, settled
   only by the reply or `clearChildState()`. That is how `FOREGROUND_TOOLS`
   activation works.
 - **Lazy provisioning**: a session holds no container until the first frame
   `isBrowserWork()` accepts (`bridge.ts:1503-1515`); `ensureBrowser()` is the
   shared attach (`:1088-1096`); on `FleetFullError` the tool gets a retryable
-  error, never a 429 (`attachThenForward`, `:1258-1268`).
+  error, never a 429 (`attachThenForward`, `:1255-1264`).
 - **Activity clocks**: `registry.touch` on any frame; `touchBrowserActivity`
   only for forwarded `tools/call` (`:1504`). The reaper reads the latter.
 - **SSE keepalive**: `startSseKeepalive` writes `: keepalive` every
