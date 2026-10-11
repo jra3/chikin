@@ -253,7 +253,7 @@ export class JevDecider implements Decider {
     const state = {
       page: { url: page.url, title: page.title, text: page.text },
       elements: elements as never,
-      recent_actions: input.recent.slice(-10).map((r) => ({ action: r.action, kind: r.kind, text: r.text, page_changed: r.page_changed })),
+      recent_actions: input.recent.slice(-10).map((r) => ({ action: r.action, kind: r.kind, text: r.text, outcome: r.outcome, page_changed: r.page_changed })),
     };
 
     const result = await this.ask(state, questions, signal);
@@ -293,7 +293,7 @@ export class JevDecider implements Decider {
           goal: input.goal,
           field: { label: row.label, role: row.role, value: row.value },
           page: { title: page.title, text: page.text.slice(0, 6000) },
-          recent_actions: input.recent.slice(-6).map((r) => ({ action: r.action, text: r.text })),
+          recent_actions: input.recent.slice(-6).map((r) => ({ action: r.action, text: r.text, outcome: r.outcome })),
         },
         signal,
       );

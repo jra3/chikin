@@ -148,3 +148,13 @@ test("OpenRouterTextHelper: exactly {text}, null allowed, anything else refused"
   for (const bad of ['{"text":""}', '{"text":"x","why":"y"}', '"Zurich"', "not json"])
     await assert.rejects(helper(bad).valueFor({}), DeciderError);
 });
+
+test("a refused step reaches Jev and the text model with its outcome, so it does not read as done", async () => {
+  const recent = [{ action: "e1", kind: "fill", text: "socks", outcome: "refused", page_changed: null }];
+  const seen: Record<string, any>[] = [];
+  const text: TextHelper = { valueFor: async (ctx) => (seen.push(ctx), { text: "socks" }) };
+  const { c, calls } = client((q) => ({ operation: pick("TYPE_TEXT", Object.keys((q.operation as any).criteria)), type_text_target: pick("1", ["1"]), click_target: pick("1", ["1", "2"]), select_target: pick("3:1", ["3:1", "3:2"]) }));
+  await new JevDecider({ client: c, model: "jev-latest", text }).decide({ ...input, recent });
+  assert.deepEqual((calls[0].state as any).recent_actions, [{ action: "e1", kind: "fill", text: "socks", outcome: "refused", page_changed: null }]);
+  assert.deepEqual(seen[0].recent_actions, [{ action: "e1", text: "socks", outcome: "refused" }]);
+});
