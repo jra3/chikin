@@ -183,9 +183,15 @@ export const config = {
   // Anthropic key is set. Same scoping reason as the key above.
   openrouterApiKey: str("CHIKIN_OPENROUTER_API_KEY", ""),
   // Empty means the provider's default: claude-haiku-5-5 direct, or
-  // anthropic/claude-haiku-5.5 on OpenRouter (typesafe/jev-router is the
-  // other one worth trying there).
+  // jev-latest on OpenRouter. On OpenRouter, any `jev-*` means TypeSafe's Jev
+  // through its System One API (2-6x faster end to end than Haiku in the
+  // 2026-10-11 live runs, same outcomes); any other id is an OpenRouter chat
+  // model. `typesafe/jev-router` is one of those: a router to other LLMs.
   deciderModelSetting: str("CHIKIN_DECIDER_MODEL", ""),
+  // With an OpenRouter key and a `jev-*` decider model, TypeSafe's Jev chooses
+  // each row through its own System One API, and this model writes the text a
+  // fill needs (Jev cannot generate text). Empty: anthropic/claude-haiku-5.5.
+  textModelSetting: str("CHIKIN_TEXT_MODEL", ""),
 
   containerPrefix: "chikin-chrome-",
   volumePrefix: "chikin-profile-",
@@ -271,5 +277,15 @@ export function deciderProvider(): "anthropic" | "openrouter" | null {
 export function deciderModel(): string | null {
   const p = deciderProvider();
   if (!p) return null;
-  return config.deciderModelSetting || (p === "anthropic" ? "claude-haiku-5-5" : "anthropic/claude-haiku-5.5");
+  return config.deciderModelSetting || (p === "anthropic" ? "claude-haiku-5-5" : "jev-latest");
+}
+
+/** Whether decisions go to TypeSafe's Jev System One API (through OpenRouter). */
+export function deciderIsJev(): boolean {
+  return deciderProvider() === "openrouter" && /^jev-/.test(deciderModel() ?? "");
+}
+
+/** The model that writes fill text when Jev decides, or null when it does not. */
+export function textModel(): string | null {
+  return deciderIsJev() ? config.textModelSetting || "anthropic/claude-haiku-5.5" : null;
 }

@@ -165,7 +165,7 @@ export async function runLoop(opts: LoopOptions): Promise<LoopResult> {
 
     let decision;
     try {
-      decision = await opts.decider.decide({ goal: opts.goal, table: renderSnapshot(state), recent: recent() }, opts.signal);
+      decision = await opts.decider.decide({ goal: opts.goal, table: renderSnapshot(state), recent: recent(), page: state }, opts.signal);
     } catch (e) {
       const halt = interrupted();
       if (halt) return halt;

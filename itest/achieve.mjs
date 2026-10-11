@@ -1,5 +1,8 @@
 // Does chikin_achieve reach real goals on real pages, and how fast? (#103)
 //
+// Run it once per decider (CHIKIN_DECIDER_MODEL on the scratch gateway) to
+// compare them: jev-latest, anthropic/claude-haiku-5.5, typesafe/jev-router.
+//
 // Usage: BASE=http://localhost:18096 node achieve.mjs [browser-name]
 //
 // The unit tests drive the loop with a scripted decider. Only a real decision

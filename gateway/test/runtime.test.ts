@@ -98,7 +98,8 @@ test("OpenRouter is the decider only without an Anthropic key, with its own defa
   const cfg = or.cfg as Record<string, unknown>;
   assert.equal(cfg.achieve, true);
   assert.equal(cfg.deciderProvider, "openrouter");
-  assert.equal(cfg.deciderModel, "anthropic/claude-haiku-5.5");
+  assert.equal(cfg.deciderModel, "jev-latest", "Jev is the OpenRouter default");
+  assert.equal(cfg.textModel, "anthropic/claude-haiku-5.5");
   assert.ok(!JSON.stringify(or).includes(secret));
 
   const both = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "sk-ant-x", CHIKIN_OPENROUTER_API_KEY: secret, CHIKIN_DECIDER_MODEL: "" }).cfg as Record<string, unknown>;
@@ -111,4 +112,12 @@ test("OpenRouter is the decider only without an Anthropic key, with its own defa
   const shell = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "", CHIKIN_OPENROUTER_API_KEY: "", OPENROUTER_API_KEY: secret }).cfg as Record<string, unknown>;
   assert.equal(shell.achieve, false, "a shell's own OPENROUTER_API_KEY does not switch it on");
   assert.equal(shell.deciderModel, null);
+});
+
+test("jev-* on the OpenRouter key means Jev decides, with a text model for fills", () => {
+  const cfg = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "", CHIKIN_OPENROUTER_API_KEY: "sk-or-x", CHIKIN_DECIDER_MODEL: "jev-latest", CHIKIN_TEXT_MODEL: "" }).cfg as Record<string, unknown>;
+  assert.equal(cfg.deciderModel, "jev-latest");
+  assert.equal(cfg.textModel, "anthropic/claude-haiku-5.5");
+  const router = runtimeWithEnv({ CHIKIN_ANTHROPIC_API_KEY: "", CHIKIN_OPENROUTER_API_KEY: "sk-or-x", CHIKIN_DECIDER_MODEL: "typesafe/jev-router" }).cfg as Record<string, unknown>;
+  assert.equal(router.textModel, null, "the router is a chat model; it writes its own text");
 });

@@ -52,14 +52,15 @@ and whose session closure already holds every piece the loop needs
 - **The caller's own model drives the loop (status quo, kept).** `chikin_snapshot`
   and `chikin_act` remain for any caller that would rather decide each step
   itself. `chikin_achieve` adds a mode; it does not replace one.
-- **OpenRouter as a second provider (added).** `CHIKIN_OPENROUTER_API_KEY` sends
-  the same decision to any OpenRouter model, used only when no Anthropic key is
-  set. TypeSafe's Jev is hosted there, but only as `typesafe/jev-router`. That
-  is a router that hands each request to a downstream model: GPT-6 Luna or
-  DeepSeek V4.1 Flash in the 2026-10-11 runs. It is not the System One choice
-  API jev-ultrafast calls, so it does not deliver Jev's 178 ms classifier
-  latency. Each trace step names the model that actually answered.
-- **TypeSafe's own choice API (deferred).** It needs a third key and a
-  different request shape (choice heads), and cannot write a fill's text. The
-  `Decider` interface (`gateway/src/loop/decider.ts`) is the seam if a
-  classifier ever beats a generative model here on measured latency.
+- **OpenRouter as a second provider, and Jev through it (added).**
+  `CHIKIN_OPENROUTER_API_KEY` is used only when no Anthropic key is set.
+  OpenRouter serves TypeSafe's own System One endpoint (`/api/v1/systemone`).
+  So the TypeSafe SDK, pointed at `https://openrouter.ai/api` with that key, is
+  the default decider there (`jev-latest`). It is a port of jev-ultrafast's
+  operation and target questions, with a small text model for fill values and
+  one Jev yes/no question for the consequential check. In the 2026-10-11 live
+  runs it reached the same outcomes as Haiku 5.5, 2 to 6 times faster end to
+  end. Click decisions took 0.3 to 0.7 s including the consequential check.
+  Fills took about 1 to 2 s, dominated by the text model. Any non-`jev-*` id is
+  sent as an OpenRouter chat model instead. That includes `typesafe/jev-router`,
+  which is a router to other LLMs (GPT-6 Luna, DeepSeek V4.1 Flash), not Jev.

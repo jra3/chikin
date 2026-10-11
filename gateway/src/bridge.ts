@@ -2,7 +2,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
-import { config, deciderModel, deciderProvider } from "./config.js";
+import { config, deciderIsJev, deciderModel, deciderProvider, textModel } from "./config.js";
 import { Session } from "./session.js";
 import { log } from "./log.js";
 import { isValidHandle, HANDLE_RULE } from "./names.js";
@@ -23,6 +23,7 @@ import {
 import { act, ActPageGoneError, ActRequestError, resolveRow } from "./snapshot/act.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { HaikuDecider, OpenRouterDecider, type Decider } from "./loop/decider.js";
+import { jevOverOpenRouter } from "./loop/jev.js";
 import { normaliseOrigins, runLoop, type LoopResult, type TraceStep } from "./loop/achieve.js";
 
 export interface BridgeDeps {
@@ -43,7 +44,9 @@ function deciderFor(deps: BridgeDeps): Decider | null {
   configuredDecider ??=
     provider === "anthropic"
       ? new HaikuDecider({ client: new Anthropic({ apiKey: config.deciderApiKey }), model })
-      : new OpenRouterDecider({ apiKey: config.openrouterApiKey, model });
+      : deciderIsJev()
+        ? jevOverOpenRouter(config.openrouterApiKey, model, textModel() as string)
+        : new OpenRouterDecider({ apiKey: config.openrouterApiKey, model });
   return configuredDecider;
 }
 

@@ -19,6 +19,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import * as z from "zod/v4";
+import type { PageState } from "../snapshot/index.js";
 
 /** One past step as the model sees it. */
 export interface RecentAction {
@@ -34,6 +35,8 @@ export interface DecisionInput {
   /** The page as `renderSnapshot` draws it: header, numbered rows, visible text. */
   table: string;
   recent: RecentAction[];
+  /** The same page as data, for a decider that asks about rows rather than reading text (Jev). */
+  page?: PageState;
 }
 
 export interface Decision {
