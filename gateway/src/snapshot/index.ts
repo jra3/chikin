@@ -56,6 +56,18 @@ export interface Snapshot {
   omitted_actions: number;
 }
 
+/**
+ * Everything the in-page script returned, internals included. `marker`,
+ * `page_key` and `guards` never reach the caller: they are what `chikin_act`
+ * compares against to decide whether a row still means what it meant when it
+ * was read (./act.ts).
+ */
+export interface PageState extends Snapshot {
+  marker: unknown;
+  page_key: unknown;
+  guards: Record<string, unknown>;
+}
+
 /** More than one open page fits, or none does; the message lists what is open. */
 export class PageChoiceError extends Error {
   constructor(message: string) {
@@ -94,16 +106,22 @@ export function sameDoc(a: string, b: string): boolean {
 }
 
 /**
- * Which open page to read. Pure, so the three ways it refuses are unit-tested.
+ * Which open page to read. Pure, so the ways it refuses are unit-tested.
  *
- * Order: the caller's explicit `url`; else the page the child last reported
- * selected (the nav watchdog's `navNewest`, so it is only as fresh as the last
- * nav reply); else the only page open. Anything that leaves more than one
- * candidate, or none, is refused by name rather than guessed — `/json/activate`
- * was rejected for the same ambiguity in ADR 0006, and a snapshot of the wrong
- * tab is worse than no snapshot.
+ * Order: the caller's explicit `url`; else the tab the gateway itself last read
+ * (`targetId`), while it is still open — the bridge only offers it when the
+ * child has neither navigated nor changed its selection since, so a click of
+ * ours that navigated keeps us on that tab instead of hunting for its old URL;
+ * else the page the child last reported selected (the nav watchdog's
+ * `navNewest`, only as fresh as the last nav reply); else the only page open.
+ * Anything that leaves more than one candidate, or none, is refused by name
+ * rather than guessed — `/json/activate` was rejected for the same ambiguity
+ * in ADR 0006, and a snapshot of the wrong tab is worse than no snapshot.
  */
-export function choosePage(pages: CdpTarget[], prefer: { url?: string; selected?: string }): CdpTarget {
+export function choosePage(
+  pages: CdpTarget[],
+  prefer: { url?: string; targetId?: string; selected?: string },
+): CdpTarget {
   const open = () => pages.map((p) => `  ${p.url}${p.title ? ` (${p.title})` : ""}`).join("\n") || "  (none)";
   const pick = (want: string, how: string): CdpTarget => {
     const hits = pages.filter((p) => sameDoc(p.url, want));
@@ -114,6 +132,10 @@ export function choosePage(pages: CdpTarget[], prefer: { url?: string; selected?
     );
   };
   if (prefer.url) return pick(prefer.url, "url");
+  if (prefer.targetId) {
+    const same = pages.find((p) => p.id === prefer.targetId);
+    if (same) return same;
+  }
   if (prefer.selected && (pages.length !== 1 || pages.some((p) => sameDoc(p.url, prefer.selected!)))) {
     return pick(prefer.selected, "the selected page");
   }
@@ -129,36 +151,60 @@ export interface TakeSnapshotOptions {
   cdpPort: number;
   /** Explicit page, by URL (origin + path). */
   url?: string;
+  /** The tab the gateway last read, when nothing has moved the child since. */
+  targetId?: string;
   /** The child's last reported selected page, when the caller has one. */
   selected?: string;
   /** Per-call deadline for the in-page read. Jev's harness allows 25s. */
   evaluateTimeoutMs?: number;
 }
 
-/** Read one page. Throws `PageChoiceError`, `StalePageError`, or a CDP/transport error. */
-export async function takeSnapshot(opts: TakeSnapshotOptions): Promise<{ page: CdpTarget; snapshot: Snapshot }> {
-  const page = choosePage(await listPages(opts.ip, opts.cdpPort), opts);
+/** The websocket for one page target, built from its id. */
+export function pageSocketUrl(ip: string, cdpPort: number, targetId: string): string {
   // Built from the id, not from the `webSocketDebuggerUrl` Chrome printed: that
   // URL echoes whatever Host header reached it, and the CDP lane rewrites the
   // same field for drivers on the far side of the network split.
-  const client = await CdpClient.connect(`ws://${opts.ip}:${opts.cdpPort}/devtools/page/${page.id}`);
+  return `ws://${ip}:${cdpPort}/devtools/page/${targetId}`;
+}
+
+/**
+ * Run the snapshot script once on an open connection. Throws `StalePageError`
+ * when the document moved under the read, which a caller that just caused a
+ * navigation may retry.
+ */
+export async function readState(client: CdpClient, timeoutMs = 25_000): Promise<PageState> {
+  const r = (await client.send("Runtime.evaluate", { expression: SNAPSHOT_JS, returnByValue: true }, timeoutMs)) as {
+    result?: { value?: unknown };
+    exceptionDetails?: unknown;
+  };
+  if (r.exceptionDetails) throw new StalePageError("Document changed during the read; try again.");
+  const value = r.result?.value;
+  if (value === null || value === undefined) throw new StalePageError("Document is navigating; try again.");
+  const o = value as Record<string, unknown>;
+  return {
+    ...publicSnapshot(value),
+    marker: o.marker ?? null,
+    page_key: o.page_key ?? null,
+    guards: (o.guards && typeof o.guards === "object" ? o.guards : {}) as Record<string, unknown>,
+  };
+}
+
+/** Read one page. Throws `PageChoiceError`, `StalePageError`, or a CDP/transport error. */
+export async function takeSnapshot(
+  opts: TakeSnapshotOptions,
+): Promise<{ page: CdpTarget; snapshot: Snapshot; state: PageState }> {
+  const page = choosePage(await listPages(opts.ip, opts.cdpPort), opts);
+  const client = await CdpClient.connect(pageSocketUrl(opts.ip, opts.cdpPort, page.id));
   try {
-    const r = (await client.send(
-      "Runtime.evaluate",
-      { expression: SNAPSHOT_JS, returnByValue: true },
-      opts.evaluateTimeoutMs ?? 25_000,
-    )) as { result?: { value?: unknown }; exceptionDetails?: unknown };
-    if (r.exceptionDetails) throw new StalePageError("Document changed during the read; try again.");
-    const value = r.result?.value;
-    if (value === null || value === undefined) throw new StalePageError("Document is navigating; try again.");
-    return { page, snapshot: publicSnapshot(value) };
+    const state = await readState(client, opts.evaluateTimeoutMs);
+    return { page, snapshot: publicSnapshot(state), state };
   } finally {
     client.close();
   }
 }
 
-/** Drop the freshness internals (`marker`, `page_key`, `guards`): they are for the act slice, not the caller. */
-function publicSnapshot(v: unknown): Snapshot {
+/** Drop the freshness internals (`marker`, `page_key`, `guards`): they are for `chikin_act`, not the caller. */
+export function publicSnapshot(v: unknown): Snapshot {
   const o = v as Record<string, unknown>;
   const str = (k: string) => (typeof o[k] === "string" ? (o[k] as string) : "");
   const num = (k: string) => (typeof o[k] === "number" ? (o[k] as number) : 0);

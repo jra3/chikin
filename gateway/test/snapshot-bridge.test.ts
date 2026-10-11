@@ -84,9 +84,9 @@ const PAGE_STATE = {
   text: "Cart total: $10",
   scroll: { y: 0, height: 780 },
   actions: [{ id: "e1", node: 1, kind: "click", role: "button", label: "Continue", value: "" }],
-  marker: [],
-  page_key: [],
-  guards: {},
+  marker: ["m"],
+  page_key: ["k"],
+  guards: { "1": ["g"] } as Record<string, unknown>,
   omitted_actions: 0,
 };
 
@@ -102,8 +102,18 @@ const provisioner = {
 const registry = new Registry();
 const app = createApp({ registry, provisioner: provisioner as never });
 let server: Server;
+// The fake page answers each in-page probe chikin_act sends by what it asks:
+// the guard check (unchanged), the target resolve (a centre to click), the
+// settle wait (nothing), and everything else is the snapshot script itself.
+const answer = (params: Record<string, unknown>): unknown => {
+  const expr = String(params.expression ?? "");
+  if (expr.includes("c.guard(c.nodes.get(")) return [PAGE_STATE.page_key, PAGE_STATE.guards["1"]];
+  if (expr.includes("elementFromPoint")) return { x: 40, y: 20 };
+  if (expr.includes("requestAnimationFrame(ready)")) return undefined;
+  return PAGE_STATE;
+};
 const chrome = await startFakeCdp(
-  [{ id: "P1", url: "https://example.org/checkout", title: "Checkout", evaluate: () => PAGE_STATE }],
+  [{ id: "P1", url: "https://example.org/checkout", title: "Checkout", evaluate: answer }],
   chromePort,
 );
 test.before(async () => {
@@ -197,6 +207,15 @@ test("chikin_snapshot: a reset forgets the replaced child's selection; a stale o
     assert.equal((lone.structuredContent as { page?: { id?: string } }).page?.id, "P1");
 
     chrome.pages.push({ id: "P2", url: "https://example.org/other", title: "Other" });
+    // Nothing moved the child since that read, so the gateway stays on the tab
+    // it read (#99) rather than hunting for the child's stale URL.
+    const kept = await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    assert.notEqual(kept.isError, true, textOf(kept));
+    assert.equal((kept.structuredContent as { page?: { id?: string } }).page?.id, "P1");
+
+    // A child navigation hands the choice back to the child's report, which
+    // names a URL no open page has: refused, never guessed between two pages.
+    await client.callTool({ name: "navigate_page", arguments: { url: "https://example.org/gone" } });
     const stale = await client.callTool({ name: "chikin_snapshot", arguments: {} });
     assert.equal(stale.isError, true);
     assert.match(textOf(stale), /No open page matches the selected page https:\/\/example\.org\/gone/);
@@ -208,6 +227,112 @@ test("chikin_snapshot: a reset forgets the replaced child's selection; a stale o
     assert.match(textOf(after), /no page is selected yet/, "the replaced child's selection is forgotten");
   } finally {
     chrome.pages.splice(1);
+    await close();
+  }
+});
+
+test("chikin_act: gated, needs a read, executes the stored row and answers with the page after", async () => {
+  const { client, close } = await connect("inst-act");
+  try {
+    const blocked = await client.callTool({ name: "chikin_act", arguments: { id: "e1" } });
+    assert.equal(blocked.isError, true);
+    assert.match(textOf(blocked), /chikin_identify/, "gated like any browser tool");
+    await client.callTool({ name: "chikin_identify", arguments: { handle: "act-test" } });
+
+    const early = await client.callTool({ name: "chikin_act", arguments: { id: "e1" } });
+    assert.equal(early.isError, true);
+    assert.match(textOf(early), /call chikin_snapshot first/);
+    assert.ok(ensured.includes("inst-act"), "it is browser work, so it provisions like any browser tool");
+
+    await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    const before = chrome.commands.length;
+    const unknown = await client.callTool({ name: "chikin_act", arguments: { id: "e99" } });
+    assert.equal(unknown.isError, true);
+    assert.match(textOf(unknown), /No row 'e99'/);
+    assert.equal(chrome.commands.length, before, "an unknown id never reaches the browser");
+
+    const t0 = registry.getActivity("inst-act")?.lastBrowserActivity ?? 0;
+    await new Promise((r) => setTimeout(r, 5));
+    const done = await client.callTool({ name: "chikin_act", arguments: { id: "e1" } });
+    assert.notEqual(done.isError, true, textOf(done));
+    assert.match(textOf(done), /^Done: clicked e1 \(Continue\)\. The page now:\n\n# Checkout/);
+    assert.equal((done.structuredContent as { executed?: string }).executed, "e1");
+    const input = chrome.commands.slice(before).filter((c) => c.method === "Input.dispatchMouseEvent");
+    assert.deepEqual(
+      input.map((c) => [c.params.type, c.params.x, c.params.y]),
+      [
+        ["mousePressed", 40, 20],
+        ["mouseReleased", 40, 20],
+      ],
+      "a real press and release at the centre the page resolved just now",
+    );
+    assert.ok((registry.getActivity("inst-act")?.lastBrowserActivity ?? 0) > t0, "stamped as browser activity");
+  } finally {
+    await close();
+  }
+});
+
+test("chikin_act: a closed page is not retried blind; the next snapshot reads what is open", async () => {
+  const { client, close } = await connect("inst-act-gone");
+  const original = chrome.pages[0];
+  try {
+    await client.callTool({ name: "chikin_identify", arguments: { handle: "act-gone" } });
+    const snap = await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    assert.notEqual(snap.isError, true, textOf(snap));
+
+    chrome.pages[0] = { ...original, id: "P9" };
+    const before = chrome.commands.length;
+    const gone = await client.callTool({ name: "chikin_act", arguments: { id: "e1" } });
+    assert.equal(gone.isError, true);
+    assert.match(textOf(gone), /gone/);
+    assert.match(textOf(gone), /Call chikin_snapshot/);
+    assert.doesNotMatch(textOf(gone), /retry/);
+    assert.equal(chrome.commands.length, before, "nothing reached any page");
+
+    const again = await client.callTool({ name: "chikin_act", arguments: { id: "e1" } });
+    assert.match(textOf(again), /call chikin_snapshot first/, "the dead tab is forgotten");
+
+    const fresh = await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    assert.notEqual(fresh.isError, true, textOf(fresh));
+    assert.equal((fresh.structuredContent as { page?: { id?: string } }).page?.id, "P9");
+  } finally {
+    chrome.pages[0] = original;
+    await close();
+  }
+});
+
+test("chikin_snapshot: a read that finishes after a reset is not remembered for the new browser", async () => {
+  const { client, close } = await connect("inst-snap-swap");
+  const page = chrome.pages[0];
+  const original = page.evaluate;
+  try {
+    await client.callTool({ name: "chikin_identify", arguments: { handle: "snap-swap" } });
+    const first = await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    assert.notEqual(first.isError, true, textOf(first));
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let held = false;
+    page.evaluate = (params) => {
+      held = true;
+      return gate.then(() => answer(params));
+    };
+    const pending = client.callTool({ name: "chikin_snapshot", arguments: {} });
+    while (!held) await new Promise((r) => setTimeout(r, 10));
+    page.evaluate = original;
+
+    const reset = await client.callTool({ name: "chikin_reset", arguments: {} });
+    assert.notEqual(reset.isError, true, textOf(reset));
+    release();
+    await pending;
+
+    const before = chrome.commands.length;
+    const act = await client.callTool({ name: "chikin_act", arguments: { id: "e1" } });
+    assert.equal(act.isError, true);
+    assert.match(textOf(act), /call chikin_snapshot first/, "the replaced browser's read was dropped");
+    assert.equal(chrome.commands.length, before);
+  } finally {
+    page.evaluate = original;
     await close();
   }
 });

@@ -9,7 +9,17 @@ import { isValidHandle, HANDLE_RULE } from "./names.js";
 import type { Registry } from "./registry.js";
 import type { Provisioner } from "./provisioner.js";
 import { FleetFullError, ProvisionError } from "./provisioner.js";
-import { PageChoiceError, StalePageError, renderSnapshot, sameDoc, takeSnapshot } from "./snapshot/index.js";
+import {
+  PageChoiceError,
+  StalePageError,
+  publicSnapshot,
+  renderSnapshot,
+  sameDoc,
+  takeSnapshot,
+  type CdpTarget,
+  type PageState,
+} from "./snapshot/index.js";
+import { act, ActPageGoneError, ActRequestError, resolveRow } from "./snapshot/act.js";
 
 export interface BridgeDeps {
   provisioner: Provisioner;
@@ -406,9 +416,10 @@ const SNAPSHOT_TOOL = {
     "Read the selected page as an indexed action table: one numbered row (e1, e2, …) per " +
     "visible, enabled control with its role, label and current value, plus the visible text, " +
     "in a single atomic read. Cheaper and faster than take_snapshot for deciding what to do " +
-    "next; act with the usual click/fill tools afterwards. Reads the page the last navigation " +
-    "selected; pass `url` to name another open page. Refuses rather than guesses when more " +
-    "than one open page fits.",
+    "next. Act on a row with chikin_act, passing its id; the ids are NOT take_snapshot uids, " +
+    "so upstream click/fill cannot use them. Reads the page this tool or chikin_act last read, " +
+    "else the page the last navigation selected; pass `url` to name another open page. " +
+    "Refuses rather than guesses when more than one open page fits.",
   inputSchema: {
     type: "object",
     properties: {
@@ -420,6 +431,34 @@ const SNAPSHOT_TOOL = {
     additionalProperties: false,
   },
 };
+
+// Synthetic gateway-owned tool (#99): execute one row of the last
+// chikin_snapshot on the page it was read from, refusing a row whose target
+// changed or is covered, and answer with the page as it is afterwards.
+const ACT_TOOL = {
+  name: "chikin_act",
+  description:
+    "Do one row of the last chikin_snapshot (or chikin_act) table: click it, type into it " +
+    "(fill rows take `text`, which replaces the field's value), choose a dropdown option, scroll, " +
+    "or wait. Before any input the gateway checks the row still means what it meant when read " +
+    "and that nothing covers it; if not, nothing is done and you get an error carrying the page " +
+    "as it is now. On success the reply is the page after the action, as a fresh table with new " +
+    "ids — use those for the next call. Ids are renumbered on every read.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: 'Row id from the most recent table, e.g. "e3", "scroll_down", "wait".' },
+      text: { type: "string", description: "Text to put in the field. Required for fill rows, refused for any other." },
+    },
+    required: ["id"],
+    additionalProperties: false,
+  },
+};
+
+// Gateway-owned tools that drive the browser over the gateway's own CDP socket.
+// They are gated, provisioned and activity-stamped exactly like a forwarded
+// browser tool, but answered here and never seen by the child.
+const OWNED_BROWSER_TOOLS = new Set([SNAPSHOT_TOOL.name, ACT_TOOL.name]);
 
 // Prepended to the upstream chrome-devtools-mcp `instructions` so a caller with
 // zero prior knowledge of chikin learns the contract up front, before ever
@@ -435,7 +474,7 @@ const CHIKIN_INSTRUCTIONS =
 // are gateway-owned and handled without a browser.
 const ALWAYS_ALLOWED_TOOLS = new Set([IDENTIFY_TOOL.name, RESET_TOOL.name]);
 
-export type FrameAction = "forward" | "identify" | "reset" | "block" | "snapshot";
+export type FrameAction = "forward" | "identify" | "reset" | "block" | "owned";
 
 // Pure routing/gate decision for a client->child frame, given whether the
 // session has identified. Extracted as a seam so the gate can be unit-tested
@@ -450,14 +489,14 @@ export function classifyClientFrame(
   if (tool === IDENTIFY_TOOL.name) return "identify";
   if (tool === RESET_TOOL.name) return "reset";
   if (!identified && !ALWAYS_ALLOWED_TOOLS.has(tool ?? "")) return "block";
-  if (tool === SNAPSHOT_TOOL.name) return "snapshot";
+  if (OWNED_BROWSER_TOOLS.has(tool ?? "")) return "owned";
   return "forward";
 }
 
 /**
  * Does this client frame actually drive the BROWSER? True only for a
  * `tools/call` the gate forwards to chrome-devtools-mcp, or answers itself
- * over its own CDP connection (`chikin_snapshot`, #96) — so the client
+ * over its own CDP connection (`chikin_snapshot`/`chikin_act`, #96/#99) — so the client
  * bridge's keepalive `ping`, `initialize`, `tools/list`, notifications, the
  * gateway-owned `chikin_identify`/`chikin_reset`, and calls blocked by the
  * identify gate are all excluded.
@@ -473,7 +512,7 @@ export function isBrowserWork(
 ): boolean {
   if (!f || f.method !== "tools/call") return false;
   const action = classifyClientFrame(f, identified);
-  return action === "forward" || action === "snapshot";
+  return action === "forward" || action === "owned";
 }
 
 /**
@@ -600,6 +639,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // "the selection is still the one I read" from "the client has chosen since"
   // — see bringSelectedToFront.
   let selectionEpoch = 0;
+  // The page the gateway's own tools last read, with its full state (the guard
+  // internals chikin_act compares against) and the child's nav/selection
+  // counters at that moment. While both counters are unchanged nothing the
+  // child did can have moved the session to another tab, so the next read
+  // stays on this one even if our own click navigated it to a new URL. Cleared
+  // on every child swap: a reset recreates the tabs, a respawn forgets them.
+  let lastRead: { page: CdpTarget; state: PageState; navSeq: number; selEpoch: number } | null = null;
+  // One gateway-owned browser call at a time, so an act never runs against a
+  // snapshot that is still being taken or replaced.
+  let ownedChain: Promise<void> = Promise.resolve();
   // Requests the GATEWAY issued to the child on its own behalf (the screenshot
   // activation, issue #89) — never the client's. They are kept out of
   // `inflight` so a respawn never answers the client for a frame it did not
@@ -800,7 +849,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         // Append the gateway's synthetic tools to tools/list replies.
         if (toolsListIds.has(f.id)) {
           toolsListIds.delete(f.id);
-          if (Array.isArray(f.result?.tools)) f.result.tools.push(RESET_TOOL, IDENTIFY_TOOL, SNAPSHOT_TOOL);
+          if (Array.isArray(f.result?.tools)) f.result.tools.push(RESET_TOOL, IDENTIFY_TOOL, SNAPSHOT_TOOL, ACT_TOOL);
         }
         // Layer 1 of the self-directing design: fold chikin's contract into the
         // initialize result's `instructions` before the client sees it. This is
@@ -936,6 +985,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     currentIp = ip;
     cdpFailStreak = 0;
     navNewest = { seq: navNewest.seq };
+    lastRead = null;
     // Connect by IP (not container name): Chrome's DevTools HTTP endpoint
     // rejects a DNS-name Host header but accepts an IP; socat in the container
     // bridges to Chrome's loopback CDP port.
@@ -1226,18 +1276,63 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     );
   }
 
+  /** Queue a gateway-owned browser call behind any already running on this session. */
+  function runOwned(f: Frame): void {
+    const handler = f.params?.name === ACT_TOOL.name ? handleAct : handleSnapshot;
+    ownedChain = ownedChain.then(() => handler(f)).catch((e) => {
+      log.warn(`session[${name}]: ${f.params?.name} failed`, String(e));
+      replyTool(f.id, `${f.params?.name} failed (${String(e)}); retry the request`, true);
+    });
+  }
+
+  /** Reply with a page table: the rendered text a model reads plus the same data structured. */
+  function replyTable(
+    id: string | number | undefined,
+    lead: string,
+    page: CdpTarget,
+    state: PageState,
+    isError: boolean,
+    extra: Record<string, unknown> = {},
+  ): void {
+    if (id === undefined || session.isClosed) return;
+    const snapshot = publicSnapshot(state);
+    http
+      .send({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [{ type: "text", text: (lead ? lead + "\n\n" : "") + renderSnapshot(snapshot) }],
+          structuredContent: { ...extra, page: { id: page.id, url: snapshot.url, title: snapshot.title }, ...snapshot },
+          isError,
+        },
+      } as JSONRPCMessage)
+      .catch((e) => log.warn(`session[${name}]: table reply failed`, String(e)));
+  }
+
   /**
-   * `chikin_snapshot` (#96): read the selected page over the gateway's own CDP
-   * socket and answer on the gateway's behalf. Reached through `dispatch`, so
-   * the lazy attach has already run and `currentIp` names a live browser; the
-   * activity stamp happened in the pump, by the same `isBrowserWork` predicate
-   * that claimed the slot. Nothing here touches the child, so a capture stuck
-   * on its mutex neither delays this read nor is delayed by it.
+   * Remember a read, stamped with the child counters it is only good for. A
+   * read begun under an earlier child (`gen`) is from a browser since replaced,
+   * and is dropped.
+   */
+  function remember(gen: number, page: CdpTarget, state: PageState): void {
+    if (gen !== childGen) return;
+    lastRead = { page, state, navSeq: navNewest.seq, selEpoch: selectionEpoch };
+  }
+
+  /**
+   * `chikin_snapshot` (#96): read a page over the gateway's own CDP socket and
+   * answer on the gateway's behalf. Reached through `dispatch`, so the lazy
+   * attach has already run and `currentIp` names a live browser; the activity
+   * stamp happened in the pump, by the same `isBrowserWork` predicate that
+   * claimed the slot. Nothing here touches the child, so a capture stuck on its
+   * mutex neither delays this read nor is delayed by it.
    *
-   * `navNewest.selected` is the child's last REPORTED selection, from its last
-   * nav reply — not a live query, which would be a child call. Between navs a
-   * client's `select_page` moves the child's selection without moving ours, so
-   * the tool says which page it read and takes `url` to name another.
+   * Which page: `url` if given; else the tab this session's own tools last read,
+   * if the child has neither navigated nor changed selection since (`lastRead`);
+   * else `navNewest.selected`, the child's last REPORTED selection from its last
+   * nav reply — not a live query, which would be a child call. A client's
+   * `select_page` moves `selectionEpoch`, so it does hand the choice back to the
+   * child's view, but that view is only as fresh as the last nav.
    */
   async function handleSnapshot(f: Frame): Promise<void> {
     const url = f.params?.arguments?.url;
@@ -1245,38 +1340,125 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       replyTool(f.id, "`url` must be a string when provided.", true);
       return;
     }
+    const gen = childGen;
     const ip = currentIp;
     if (!ip) {
       replyTool(f.id, "chikin browser restarting; retry the request", true);
       return;
     }
+    const ours =
+      lastRead && lastRead.navSeq === navNewest.seq && lastRead.selEpoch === selectionEpoch
+        ? lastRead.page.id
+        : undefined;
     try {
-      const { page, snapshot } = await takeSnapshot({
+      const { page, state } = await takeSnapshot({
         ip,
         cdpPort: config.cdpPort,
         url,
+        targetId: ours,
         selected: navNewest.selected,
       });
-      if (f.id === undefined || session.isClosed) return;
-      http
-        .send({
-          jsonrpc: "2.0",
-          id: f.id,
-          result: {
-            content: [{ type: "text", text: renderSnapshot(snapshot) }],
-            structuredContent: { page: { id: page.id, url: page.url, title: page.title }, ...snapshot },
-            isError: false,
-          },
-        } as JSONRPCMessage)
-        .catch((e) => log.warn(`session[${name}]: snapshot reply failed`, String(e)));
+      remember(gen, page, state);
+      replyTable(f.id, "", page, state, false);
     } catch (e) {
       if (e instanceof PageChoiceError || e instanceof StalePageError) {
         replyTool(f.id, e.message, true);
         return;
       }
-      log.warn(`session[${name}]: chikin_snapshot failed`, String(e));
-      replyTool(f.id, `chikin_snapshot failed (${String(e)}); retry the request`, true);
+      throw e;
     }
+  }
+
+  /**
+   * `chikin_act` (#99): one row of the last read, on the page it was read from.
+   * The row is looked up in the state the gateway stored, so the node it acts
+   * on is the page's own identity for an element it observed, never a selector
+   * from the caller. Any outcome that leaves a readable page answers with it,
+   * and becomes the read the next call's ids refer to.
+   */
+  async function handleAct(f: Frame): Promise<void> {
+    const args = f.params?.arguments ?? {};
+    const gen = childGen;
+    const ip = currentIp;
+    if (!ip) {
+      replyTool(f.id, "chikin browser restarting; retry the request", true);
+      return;
+    }
+    const read = lastRead;
+    if (!read) {
+      replyTool(
+        f.id,
+        "Nothing to act on: call chikin_snapshot first. chikin_act executes a row of the most recent table.",
+        true,
+      );
+      return;
+    }
+    let row;
+    try {
+      row = resolveRow(read.state, args.id, args.text);
+    } catch (e) {
+      if (e instanceof ActRequestError) {
+        replyTool(f.id, e.message, true);
+        return;
+      }
+      throw e;
+    }
+    let outcome;
+    try {
+      outcome = await act({
+        ip,
+        cdpPort: config.cdpPort,
+        page: read.page,
+        state: read.state,
+        row,
+        text: typeof args.text === "string" ? args.text : undefined,
+      });
+    } catch (e) {
+      if (e instanceof ActPageGoneError) {
+        if (lastRead === read) lastRead = null;
+        replyTool(f.id, `${e.message} Call chikin_snapshot to read the page that is open now.`, true);
+        return;
+      }
+      throw e;
+    }
+    if (outcome.done) {
+      if (outcome.state) {
+        const state = outcome.state;
+        remember(gen, read.page, state);
+        const verb = { click: "clicked", fill: "filled", select: "selected", scroll: "scrolled", wait: "waited" }[row.kind];
+        replyTable(f.id, `Done: ${verb} ${row.id} (${row.label.replace(/\s+/g, " ").trim()}). The page now:`, read.page, state, false, {
+          executed: row.id,
+        });
+        return;
+      }
+      lastRead = null;
+      if (outcome.reason) {
+        replyTool(
+          f.id,
+          `Sent: ${row.kind} ${row.id}, but the input may not have completed (${outcome.reason}). ` +
+            "A JavaScript dialog (alert/confirm/prompt) may be open; handle_dialog dismisses it. " +
+            "Do not repeat the action; call chikin_snapshot to see where it landed.",
+          false,
+        );
+        return;
+      }
+      replyTool(
+        f.id,
+        `Done: ${row.kind} ${row.id}, but the page was not readable afterwards (still loading?). ` +
+          "Do not repeat the action; call chikin_snapshot to see where it landed.",
+        false,
+      );
+      return;
+    }
+    if (outcome.state) {
+      remember(gen, read.page, outcome.state);
+      replyTable(f.id, `${outcome.error.message} The page now:`, read.page, outcome.state, true, { refused: row.id });
+      return;
+    }
+    // The refusal stands, but the page could not be read for it: the old ids
+    // are not to be trusted any more either.
+    lastRead = null;
+    replyTool(f.id, `${outcome.error.message} The page could not be read afterwards; call chikin_snapshot.`, true);
   }
 
   // Everything past the identify gate: track the request, record nav state, and
@@ -1351,8 +1533,8 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
    * queueing every frame behind an activation — costs more than it buys.
    */
   function dispatch(msg: JSONRPCMessage, f: Frame): void {
-    if (f?.method === "tools/call" && f.params?.name === SNAPSHOT_TOOL.name) {
-      void handleSnapshot(f);
+    if (f?.method === "tools/call" && OWNED_BROWSER_TOOLS.has(f.params?.name ?? "")) {
+      runOwned(f);
       return;
     }
     if (

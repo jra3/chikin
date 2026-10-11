@@ -21,8 +21,10 @@ export interface FakePage {
   url: string;
   title?: string;
   type?: string;
-  /** What `Runtime.evaluate` answers. Called per command, so a test can vary it. */
+  /** What `Runtime.evaluate` answers. Called per command, so a test can vary it; a promise is answered when it settles. */
   evaluate?: (params: Record<string, unknown>) => unknown;
+  /** Called per `Input.*` command; return `HANG` to leave it unanswered (as a click that opened alert() does). */
+  input?: (method: string, params: Record<string, unknown>) => unknown;
 }
 
 export interface FakeCdp {
@@ -142,11 +144,18 @@ export async function startFakeCdp(pages: FakePage[], port = 0): Promise<FakeCdp
         commands.push({ page: page.id, method: msg.method, params });
         const reply = (body: Record<string, unknown>) => socket.write(frame(JSON.stringify({ id: msg.id, ...body })));
         if (msg.method === "Runtime.evaluate") {
+          const answer = (out: unknown) => {
+            if (out instanceof Error) reply({ result: { exceptionDetails: { text: out.message } } });
+            else if (out === HANG) return; // never answer: the client's deadline is under test
+            else reply({ result: { result: { type: typeof out, value: out } } });
+          };
           const out = page.evaluate ? page.evaluate(params) : null;
-          if (out instanceof Error) reply({ result: { exceptionDetails: { text: out.message } } });
-          else if (out === HANG) return; // never answer: the client's deadline is under test
-          else reply({ result: { result: { type: typeof out, value: out } } });
-        } else reply({ error: { code: -32601, message: `'${msg.method}' wasn't found` } });
+          if (out instanceof Promise) void out.then(answer);
+          else answer(out);
+        } else if (msg.method.startsWith("Input.")) {
+          if (page.input?.(msg.method, params) !== HANG) reply({ result: {} });
+        }
+        else reply({ error: { code: -32601, message: `'${msg.method}' wasn't found` } });
       }
       if (closed) socket.end();
     });

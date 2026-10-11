@@ -538,7 +538,11 @@ test("a superseded nav with nothing to compare is not judged", () => {
 test("gate: chikin_snapshot is blocked before identify and routed to the gateway after", () => {
   const snap = { method: "tools/call", params: { name: "chikin_snapshot" } };
   assert.equal(classifyClientFrame(snap, false), "block", "it needs a browser, so it needs identity");
-  assert.equal(classifyClientFrame(snap, true), "snapshot", "never forwarded to the child");
+  assert.equal(classifyClientFrame(snap, true), "owned", "never forwarded to the child");
+  const act = { method: "tools/call", params: { name: "chikin_act" } };
+  assert.equal(classifyClientFrame(act, false), "block");
+  assert.equal(classifyClientFrame(act, true), "owned");
+  assert.equal(isBrowserWork(act, true), true, "acting is browser work too");
 });
 
 test("chikin_snapshot IS browser work: it claims the slot and moves the activity clock", () => {

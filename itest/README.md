@@ -67,7 +67,20 @@ BASE=http://localhost:18096 node snapshot.mjs inst-snap1                  # thre
 BASE=http://localhost:18096 node snapshot.mjs inst-snap1 https://a.test/ # your own
 ```
 
-A scratch gateway for it, from a locally built image, on a port nothing else
+`act-guards.mjs` asks whether `chikin_act`'s guards hold in a real browser
+(#99). It runs the cases Browser Use wrote for the same in-page script
+(jev-ultrafast `scripts/check_guards.py`). The tests move, relabel, disable,
+hide, replace and cover a target, and change its form's values. Each case is
+driven through the gateway's own tools: `evaluate_script` sets up and mutates
+the page, then `chikin_snapshot` and `chikin_act` read and act. A refusal is
+only believed when the page's own click counter did not move. It ends with a
+real cross-site link click, which must answer with the new page's table.
+
+```bash
+BASE=http://localhost:18096 node act-guards.mjs inst-actguards
+```
+
+A scratch gateway for these, from a locally built image, on a port nothing else
 holds (`ss -ltn`), with reaping and the volume sweep off and no seed volume:
 
 ```bash
