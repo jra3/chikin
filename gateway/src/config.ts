@@ -173,6 +173,26 @@ export const config = {
   // Set CHIKIN_VOLUME_GC=0 to leave every existing volume alone.
   volumeGc: bool("CHIKIN_VOLUME_GC", true),
 
+  // The decision model behind chikin_achieve (#103). The tool is listed only
+  // when a key is set: an MCP client fixes its tool registry at session start,
+  // so a tool that can only ever answer "not configured" is worse than none.
+  // Each key is a paid credential; it never leaves this process except to its
+  // own provider's API, and /healthz reports only whether one is set.
+  deciderApiKey: str("CHIKIN_ANTHROPIC_API_KEY", ""),
+  // Or through OpenRouter, where TypeSafe's Jev is hosted. Used only when no
+  // Anthropic key is set. Same scoping reason as the key above.
+  openrouterApiKey: str("CHIKIN_OPENROUTER_API_KEY", ""),
+  // Empty means the provider's default: claude-haiku-5-5 direct, or
+  // jev-latest on OpenRouter. On OpenRouter, any `jev-*` means TypeSafe's Jev
+  // through its System One API (2-6x faster end to end than Haiku in the
+  // 2026-10-11 live runs, same outcomes); any other id is an OpenRouter chat
+  // model. `typesafe/jev-router` is one of those: a router to other LLMs.
+  deciderModelSetting: str("CHIKIN_DECIDER_MODEL", ""),
+  // With an OpenRouter key and a `jev-*` decider model, TypeSafe's Jev chooses
+  // each row through its own System One API, and this model writes the text a
+  // fill needs (Jev cannot generate text). Empty: anthropic/claude-haiku-5.5.
+  textModelSetting: str("CHIKIN_TEXT_MODEL", ""),
+
   containerPrefix: "chikin-chrome-",
   volumePrefix: "chikin-profile-",
   // `bin/chikin-mcp` names each Claude Code instance `inst-<pid>`, so this
@@ -244,4 +264,28 @@ export function volumeLabels(name: string): Record<string, string> {
  */
 export function vncUrl(name: string): string {
   return `http://${containerName(name)}.${config.network}:${config.vncPort}`;
+}
+
+/** Which provider answers chikin_achieve's decisions, if any. Anthropic wins when both keys are set. */
+export function deciderProvider(): "anthropic" | "openrouter" | null {
+  if (config.deciderApiKey) return "anthropic";
+  if (config.openrouterApiKey) return "openrouter";
+  return null;
+}
+
+/** The decision model in effect: the setting, else the provider's default. */
+export function deciderModel(): string | null {
+  const p = deciderProvider();
+  if (!p) return null;
+  return config.deciderModelSetting || (p === "anthropic" ? "claude-haiku-5-5" : "jev-latest");
+}
+
+/** Whether decisions go to TypeSafe's Jev System One API (through OpenRouter). */
+export function deciderIsJev(): boolean {
+  return deciderProvider() === "openrouter" && /^jev-/.test(deciderModel() ?? "");
+}
+
+/** The model that writes fill text when Jev decides, or null when it does not. */
+export function textModel(): string | null {
+  return deciderIsJev() ? config.textModelSetting || "anthropic/claude-haiku-5.5" : null;
 }

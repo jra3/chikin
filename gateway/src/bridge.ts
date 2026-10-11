@@ -2,7 +2,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
-import { config } from "./config.js";
+import { config, deciderIsJev, deciderModel, deciderProvider, textModel } from "./config.js";
 import { Session } from "./session.js";
 import { log } from "./log.js";
 import { isValidHandle, HANDLE_RULE } from "./names.js";
@@ -13,6 +13,7 @@ import {
   PageChoiceError,
   StalePageError,
   publicSnapshot,
+  readPage,
   renderSnapshot,
   sameDoc,
   takeSnapshot,
@@ -20,10 +21,33 @@ import {
   type PageState,
 } from "./snapshot/index.js";
 import { act, ActPageGoneError, ActRequestError, resolveRow } from "./snapshot/act.js";
+import Anthropic from "@anthropic-ai/sdk";
+import { HaikuDecider, OpenRouterDecider, type Decider } from "./loop/decider.js";
+import { jevOverOpenRouter } from "./loop/jev.js";
+import { normaliseOrigins, runLoop, type LoopResult, type TraceStep } from "./loop/achieve.js";
 
 export interface BridgeDeps {
   provisioner: Provisioner;
   registry: Registry;
+  /** chikin_achieve's decision model. Absent: built from config when a key is set. */
+  decider?: Decider;
+}
+
+// One decider per process, built on first use, so a gateway without a key never
+// constructs an API client at all.
+let configuredDecider: Decider | null = null;
+function deciderFor(deps: BridgeDeps): Decider | null {
+  if (deps.decider) return deps.decider;
+  const provider = deciderProvider();
+  const model = deciderModel();
+  if (!provider || !model) return null;
+  configuredDecider ??=
+    provider === "anthropic"
+      ? new HaikuDecider({ client: new Anthropic({ apiKey: config.deciderApiKey }), model })
+      : deciderIsJev()
+        ? jevOverOpenRouter(config.openrouterApiKey, model, textModel() as string)
+        : new OpenRouterDecider({ apiKey: config.openrouterApiKey, model });
+  return configuredDecider;
 }
 
 // JSON-RPC frame shape we care about (id + method/params routing). The MCP SDK
@@ -455,10 +479,55 @@ const ACT_TOOL = {
   },
 };
 
+// Synthetic gateway-owned tool (#103): the goal-level loop. Listed only when a
+// decision model is configured (see config.deciderApiKey).
+const ACHIEVE_TOOL = {
+  name: "chikin_achieve",
+  description:
+    "Run a goal on the current page to completion in one call. A fast model inside the gateway " +
+    "reads the page as a chikin_snapshot table, picks the next row, does it with chikin_act's " +
+    "guards, and repeats until it reports DONE or BLOCKED or a budget runs out. Returns the " +
+    "outcome, a step-by-step trace, and the page as it ends. State everything the goal needs, " +
+    "including any text to type: values the goal does not give are never invented, the loop " +
+    "stops instead. A step that commits something hard to undo (buy, send, delete, final " +
+    "submit) stops with needs_confirmation unless allow_consequential is true; confirm it by " +
+    "doing that row with chikin_act, then call chikin_achieve again. DONE is the model's claim; " +
+    "check the returned page if it matters. Navigate to the starting page first.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      goal: { type: "string", description: "What to accomplish, with every value needed (search terms, form values, choices)." },
+      max_steps: { type: "integer", minimum: 1, maximum: 60, description: "Decision budget. Default 25." },
+      max_seconds: { type: "integer", minimum: 5, maximum: 600, description: "Wall-clock budget. Default 120." },
+      allowed_origins: {
+        type: "array",
+        items: { type: "string" },
+        description: 'Stop before acting on any page outside these origins, e.g. ["https://example.com"].',
+      },
+      allow_consequential: {
+        type: "boolean",
+        description: "Let the loop do steps that commit something hard to undo. Default false.",
+      },
+    },
+    required: ["goal"],
+    additionalProperties: false,
+  },
+};
+
+/** One trace step as a line a model can read. */
+function stepLine(s: TraceStep): string {
+  const what = s.label ? `${s.kind} ${s.choice} "${s.label}"` : s.choice;
+  const text = s.text ? ` text=${JSON.stringify(s.text)}` : "";
+  const changed = s.page_changed === null ? "" : s.page_changed ? ", page changed" : ", page unchanged";
+  const note = s.note ? ` (${s.note})` : "";
+  const by = s.model ? ` by ${s.model}` : "";
+  return `${s.step}. ${what}${text} -> ${s.outcome}${changed}${note} [decide ${s.decide_ms}ms${by}, act ${s.act_ms}ms] ${s.reason}`;
+}
+
 // Gateway-owned tools that drive the browser over the gateway's own CDP socket.
 // They are gated, provisioned and activity-stamped exactly like a forwarded
 // browser tool, but answered here and never seen by the child.
-const OWNED_BROWSER_TOOLS = new Set([SNAPSHOT_TOOL.name, ACT_TOOL.name]);
+const OWNED_BROWSER_TOOLS = new Set([SNAPSHOT_TOOL.name, ACT_TOOL.name, ACHIEVE_TOOL.name]);
 
 // Prepended to the upstream chrome-devtools-mcp `instructions` so a caller with
 // zero prior knowledge of chikin learns the contract up front, before ever
@@ -649,6 +718,9 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // One gateway-owned browser call at a time, so an act never runs against a
   // snapshot that is still being taken or replaced.
   let ownedChain: Promise<void> = Promise.resolve();
+  // Running chikin_achieve loops by request id, so notifications/cancelled can
+  // stop one between steps.
+  const activeLoops = new Map<string | number, AbortController>();
   // Requests the GATEWAY issued to the child on its own behalf (the screenshot
   // activation, issue #89) — never the client's. They are kept out of
   // `inflight` so a respawn never answers the client for a frame it did not
@@ -849,7 +921,10 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         // Append the gateway's synthetic tools to tools/list replies.
         if (toolsListIds.has(f.id)) {
           toolsListIds.delete(f.id);
-          if (Array.isArray(f.result?.tools)) f.result.tools.push(RESET_TOOL, IDENTIFY_TOOL, SNAPSHOT_TOOL, ACT_TOOL);
+          if (Array.isArray(f.result?.tools)) {
+            f.result.tools.push(RESET_TOOL, IDENTIFY_TOOL, SNAPSHOT_TOOL, ACT_TOOL);
+            if (deciderFor(deps)) f.result.tools.push(ACHIEVE_TOOL);
+          }
         }
         // Layer 1 of the self-directing design: fold chikin's contract into the
         // initialize result's `instructions` before the client sees it. This is
@@ -1278,7 +1353,15 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
 
   /** Queue a gateway-owned browser call behind any already running on this session. */
   function runOwned(f: Frame): void {
-    const handler = f.params?.name === ACT_TOOL.name ? handleAct : handleSnapshot;
+    let handler: (f: Frame) => Promise<void> = f.params?.name === ACT_TOOL.name ? handleAct : handleSnapshot;
+    if (f.params?.name === ACHIEVE_TOOL.name) {
+      const abort = new AbortController();
+      if (f.id !== undefined) activeLoops.set(f.id, abort);
+      handler = (fr) =>
+        handleAchieve(fr, abort.signal).finally(() => {
+          if (fr.id !== undefined && activeLoops.get(fr.id) === abort) activeLoops.delete(fr.id);
+        });
+    }
     ownedChain = ownedChain.then(() => handler(f)).catch((e) => {
       log.warn(`session[${name}]: ${f.params?.name} failed`, String(e));
       replyTool(f.id, `${f.params?.name} failed (${String(e)}); retry the request`, true);
@@ -1459,6 +1542,144 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     // are not to be trusted any more either.
     lastRead = null;
     replyTool(f.id, `${outcome.error.message} The page could not be read afterwards; call chikin_snapshot.`, true);
+  }
+
+  /**
+   * `chikin_achieve` (#103): the read-decide-act loop, run inside the owned-call
+   * queue, so for its whole duration it is the only gateway-owned driver of the
+   * page. Every step stamps browser activity (a ten-minute loop must not read
+   * as ten idle minutes), reports progress when the caller asked for it, and
+   * checks for cancellation. The loop's final read becomes the session's table,
+   * so a needs_confirmation row can be done with chikin_act by its id.
+   */
+  async function handleAchieve(f: Frame, signal: AbortSignal): Promise<void> {
+    const args = f.params?.arguments ?? {};
+    const decider = deciderFor(deps);
+    if (!decider) {
+      replyTool(f.id, "chikin_achieve is not configured on this gateway (no CHIKIN_ANTHROPIC_API_KEY or CHIKIN_OPENROUTER_API_KEY).", true);
+      return;
+    }
+    const goal = typeof args.goal === "string" ? args.goal.trim() : "";
+    if (!goal) {
+      replyTool(f.id, "`goal` is required: what to accomplish, with every value needed.", true);
+      return;
+    }
+    const intIn = (v: unknown, def: number, lo: number, hi: number) =>
+      typeof v === "number" && Number.isInteger(v) ? Math.min(hi, Math.max(lo, v)) : def;
+    const maxSteps = intIn(args.max_steps, 25, 1, 60);
+    const maxSeconds = intIn(args.max_seconds, 120, 5, 600);
+    let allowedOrigins: string[] | undefined;
+    try {
+      allowedOrigins = normaliseOrigins(args.allowed_origins);
+    } catch (e) {
+      replyTool(f.id, String(e instanceof Error ? e.message : e), true);
+      return;
+    }
+    const ip = currentIp;
+    if (!ip) {
+      replyTool(f.id, "chikin browser restarting; retry the request", true);
+      return;
+    }
+    const t0 = Date.now();
+    const cancelledEarly = () => {
+      if (!signal.aborted) return false;
+      const result: LoopResult = { status: "cancelled", message: "Cancelled before the first step; nothing was done.", steps: [], state: null };
+      replyAchieve(f, result, t0, null, childGen);
+      return true;
+    };
+    if (cancelledEarly()) return;
+    const gen = childGen;
+    const ours =
+      lastRead && lastRead.navSeq === navNewest.seq && lastRead.selEpoch === selectionEpoch ? lastRead.page.id : undefined;
+    let page: CdpTarget;
+    let initial: PageState;
+    try {
+      ({ page, state: initial } = await takeSnapshot({ ip, cdpPort: config.cdpPort, targetId: ours, selected: navNewest.selected }));
+    } catch (e) {
+      if (e instanceof PageChoiceError || e instanceof StalePageError) {
+        replyTool(f.id, e.message, true);
+        return;
+      }
+      throw e;
+    }
+    if (cancelledEarly()) return;
+
+    const progressToken = (f.params?._meta as { progressToken?: string | number } | undefined)?.progressToken;
+    const seen: TraceStep[] = [];
+    let result: LoopResult;
+    try {
+      result = await runLoop({
+        goal,
+        maxSteps,
+        deadlineMs: maxSeconds * 1000,
+        allowedOrigins,
+        allowConsequential: args.allow_consequential === true,
+        decider,
+        initial,
+        signal,
+        halted: () => (session.isClosed ? "the session closed" : childGen !== gen ? "the browser restarted" : null),
+        driver: {
+          read: () => readPage(ip, config.cdpPort, page),
+          act: (state, row, text) => act({ ip, cdpPort: config.cdpPort, page, state, row, text }),
+        },
+        onStep: (s) => {
+          seen.push(s);
+          deps.registry.touchBrowserActivity(name);
+          if (progressToken === undefined || f.id === undefined) return;
+          http
+            .send(
+              {
+                jsonrpc: "2.0",
+                method: "notifications/progress",
+                params: { progressToken, progress: s.step, total: maxSteps, message: stepLine(s) },
+              } as JSONRPCMessage,
+              { relatedRequestId: f.id },
+            )
+            .catch(() => {
+              /* progress is a courtesy */
+            });
+        },
+      });
+    } catch (e) {
+      log.warn(`session[${name}]: chikin_achieve loop failed`, String(e));
+      result = {
+        status: "error",
+        message: `The loop failed (${String(e instanceof Error ? e.message : e)}); nothing more was done.`,
+        steps: seen,
+        state: null,
+      };
+    }
+    replyAchieve(f, result, t0, page, gen);
+  }
+
+  /** Reply to a chikin_achieve call with its outcome, its trace and, when it could be read, the page it stopped on. */
+  function replyAchieve(f: Frame, result: LoopResult, t0: number, page: CdpTarget | null, gen: number): void {
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    const head = `${result.status.toUpperCase()} after ${result.steps.length} step(s), ${secs}s: ${result.message}`;
+    const trace = result.steps.map(stepLine).join("\n");
+    const lead = `${head}${trace ? `\n\nTrace:\n${trace}` : ""}`;
+    const extra = {
+      status: result.status,
+      message: result.message,
+      steps: result.steps,
+      ...(result.proposed ? { proposed: result.proposed } : {}),
+    };
+    const isError = result.status === "error";
+    if (page && result.state && childGen === gen) {
+      remember(gen, page, result.state);
+      replyTable(f.id, `${lead}\n\nThe page now:`, page, result.state, isError, extra);
+      return;
+    }
+    if (page && lastRead?.page.id === page.id) lastRead = null;
+    if (f.id === undefined || session.isClosed) return;
+    const tail = page ? "\n\nThe page could not be read at the end; call chikin_snapshot." : "";
+    http
+      .send({
+        jsonrpc: "2.0",
+        id: f.id,
+        result: { content: [{ type: "text", text: `${lead}${tail}` }], structuredContent: extra, isError },
+      } as JSONRPCMessage)
+      .catch((e) => log.warn(`session[${name}]: achieve reply failed`, String(e)));
   }
 
   // Everything past the identify gate: track the request, record nav state, and
@@ -1729,6 +1950,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   http.onmessage = (msg) => {
     deps.registry.touch(name);
     const f = msg as Frame;
+    // A client cancelling a running chikin_achieve: stop it between steps. The
+    // child never saw that request, so this notification is not forwarded.
+    if (f && f.method === "notifications/cancelled") {
+      const requestId = (f.params as { requestId?: string | number } | undefined)?.requestId;
+      const loop = requestId !== undefined ? activeLoops.get(requestId) : undefined;
+      if (loop) {
+        loop.abort();
+        return;
+      }
+    }
     if (f && f.method === "initialize") {
       initFrame = msg;
       initId = f.id;
@@ -1778,6 +2009,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     name,
     http,
     async () => {
+      for (const loop of activeLoops.values()) loop.abort();
       clearChildState();
       try {
         await child?.close();

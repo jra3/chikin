@@ -1,4 +1,4 @@
-import { config } from "./config.js";
+import { config, deciderModel, deciderProvider, textModel } from "./config.js";
 import { log } from "./log.js";
 import type { Provisioner } from "./provisioner.js";
 
@@ -48,6 +48,14 @@ export interface RuntimeConfig {
   authEnabled: boolean;
   extraOrigins: string;
   cdmExtraArgs: string[];
+  /** Whether chikin_achieve is offered (#103): a decision-model key is set. Never the key. */
+  achieve: boolean;
+  /** Who answers its decisions: "anthropic", "openrouter", or null. */
+  deciderProvider: string | null;
+  /** The model chikin_achieve asks for each decision, or null when it is off. */
+  deciderModel: string | null;
+  /** The model writing fill text when Jev decides, else null. */
+  textModel: string | null;
 }
 
 export function runtimeConfig(): RuntimeConfig {
@@ -69,6 +77,10 @@ export function runtimeConfig(): RuntimeConfig {
     authEnabled: config.token !== "",
     extraOrigins: config.extraOrigins,
     cdmExtraArgs: config.cdmExtraArgs,
+    achieve: deciderProvider() !== null,
+    deciderProvider: deciderProvider(),
+    deciderModel: deciderModel(),
+    textModel: textModel(),
   };
 }
 

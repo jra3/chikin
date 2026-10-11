@@ -189,6 +189,16 @@ export async function readState(client: CdpClient, timeoutMs = 25_000): Promise<
   };
 }
 
+/** Read a page already chosen, by its target. */
+export async function readPage(ip: string, cdpPort: number, page: CdpTarget, timeoutMs?: number): Promise<PageState> {
+  const client = await CdpClient.connect(pageSocketUrl(ip, cdpPort, page.id));
+  try {
+    return await readState(client, timeoutMs);
+  } finally {
+    client.close();
+  }
+}
+
 /** Read one page. Throws `PageChoiceError`, `StalePageError`, or a CDP/transport error. */
 export async function takeSnapshot(
   opts: TakeSnapshotOptions,

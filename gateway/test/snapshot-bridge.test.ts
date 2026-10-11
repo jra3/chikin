@@ -68,6 +68,7 @@ process.env.PORT = String(port);
 process.env.CHROME_CDP_PORT = String(chromePort);
 process.env.CDM_COMMAND = fakeCdm;
 process.env.GATEWAY_TOKEN = "";
+process.env.CHIKIN_ANTHROPIC_API_KEY = "";
 process.env.NAV_VERIFY_DELAY_MS = "600000";
 
 const { createApp } = await import("../src/server.js");
@@ -153,6 +154,7 @@ test("chikin_snapshot: listed, gated, lazily provisioning, browser-active, and n
     assert.ok(t0 !== undefined);
     const tools = await client.listTools();
     assert.ok(tools.tools.some((t) => t.name === "chikin_snapshot"), "appended to tools/list beside chikin_identify");
+    assert.ok(!tools.tools.some((t) => t.name === "chikin_achieve"), "no decision model configured, so no chikin_achieve (#103)");
 
     const blocked = await client.callTool({ name: "chikin_snapshot", arguments: {} });
     assert.equal(blocked.isError, true);

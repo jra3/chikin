@@ -122,7 +122,7 @@ A session's browser name (`inst-<pid>`) says *which profile* it drives, not *wha
                  "description": "debugging the OAuth callback" } }  // optional free text
 ```
 
-- **Required first.** Any browser tool (`navigate_page`, `new_page`, …) called before identifying returns an instructive error naming `chikin_identify`, the handle format, and an example. `initialize`, `tools/list`, `chikin_identify`, and `chikin_reset` are never blocked; `chikin_snapshot` and `chikin_act` are gated like browser tools.
+- **Required first.** Any browser tool (`navigate_page`, `new_page`, …) called before identifying returns an instructive error naming `chikin_identify`, the handle format, and an example. `initialize`, `tools/list`, `chikin_identify`, and `chikin_reset` are never blocked; `chikin_snapshot`, `chikin_act` and `chikin_achieve` are gated like browser tools.
 - **`handle` is required, unique across live sessions.** A handle already held by another live session is rejected with a clear error — pick another. It's a display/correlation label only; the sticky profile stays keyed by the browser *name* (identifying is orthogonal to the profile, and must be re-done on each reconnect).
 - **Surfaces everywhere:** a **handle** column in the dashboard, the session's log lines, and the noVNC page title.
 
@@ -145,6 +145,26 @@ The gateway injects two tools for fast, goal-driven use (issue #95). **`chikin_s
 - **Gated like any browser tool.** Identify first. The first call provisions the browser, and every call counts as browser activity.
 - **Which page.** A read without `url` stays on the tab the gateway last read, until the child navigates or changes its selection. When more than one open page fits, or none does, it refuses and lists what is open (a stale selection falls back to the only open page, if there is just one).
 - **Limits.** Shadow DOM and frames are not traversed, and password fields never appear. The in-page scripts are Browser Use's [jev-ultrafast](https://github.com/browser-use/jev-ultrafast), verbatim.
+
+### Run a goal to the end (`chikin_achieve`)
+
+With a decision model configured (`CHIKIN_ANTHROPIC_API_KEY` or `CHIKIN_OPENROUTER_API_KEY`, see [Configuration](#configuration-fleet)), the gateway also offers **`chikin_achieve`**. The caller states a goal once. A fast loop inside the gateway then repeats three steps: read the page as a `chikin_snapshot` table, ask a fast model (Claude Haiku 5.5 by default, or TypeSafe's Jev on an OpenRouter key) which row moves the goal forward, and do that row with `chikin_act`'s guards. It stops at DONE, at BLOCKED, or when a budget runs out. The caller gets back one result: the outcome, a step-by-step trace, and the page as it ended. That is one tool call where driving the page yourself costs a big-model round trip per click (issue #95).
+
+```jsonc
+{ "name": "chikin_achieve", "arguments": {
+    "goal": "Search Wikipedia for \"Alan Turing\" and open his article.",
+    "max_steps": 20,                              // decision budget, default 25, at most 60
+    "max_seconds": 120,                           // wall-clock budget, default 120, at most 600
+    "allowed_origins": ["https://en.wikipedia.org"],  // stop before acting anywhere else
+    "allow_consequential": false } }              // default: stop before buy/send/delete/final submit
+```
+
+- **Navigate first.** It starts on the page you are on, chosen the way `chikin_snapshot` chooses.
+- **Put every value in the goal.** Text to type comes from the goal; a value the goal does not give is never invented, and the loop stops BLOCKED instead.
+- **Consequential steps wait for you.** When the model marks the next row as committing something hard to undo, the loop stops with `needs_confirmation` and names the row. Do it yourself with `chikin_act` and that id, then call `chikin_achieve` again. Pass `allow_consequential: true` to let it through.
+- **DONE is the model's claim**, returned with the page it rests on. Check that page when it matters.
+- **Stops on its own** after three actions in a row that leave the page unchanged, after two answers naming rows that are not there, when the model declines, when an input may not have completed (a JavaScript dialog), and when a row cannot be done because the tab is gone (nothing is input for that step). It never retries an input that landed.
+- **Long calls behave.** It sends one `notifications/progress` per step when the call carries a progress token, and a client cancel stops it between steps. Clients with a short request timeout should reset it on progress or raise it.
 
 ### Watch a browser / solve a captcha
 
@@ -335,6 +355,10 @@ Set in `.env` (see `.env.example`) or the environment.
 | `ATTACHED_IDLE_TTL_SEC` | `14400` | Seconds an **attached** browser may go with no real browser tool call before it is reclaimed anyway. Measured against actual forwarded `tools/call`s — *not* the client bridge's keepalive ping, which by design keeps the plain idle clock fresh — and shown as the dashboard's `browser idle` column. An open CDP socket counts as attached too, measured there against bytes the driver actually sends rather than a timer. Without this, a window that made one browser tool call and then went idle holds that fleet slot for its whole lifetime and the fleet saturates with browsers parked on `about:blank`. Eviction is survivable on the MCP side: the bridge reconnects transparently, though a disposable `inst-*` browser's profile is discarded with it (logged explicitly). A CDP driver gets no such courtesy — its websocket dies with the container and the script sees the failure. `0` = never reap an attached browser (pre-#57 behaviour). Keep it well above `IDLE_TTL_SEC`. |
 | `REAP_INTERVAL_SEC` | `30` | How often the reaper sweeps. |
 | `CHIKIN_CDP_LANE` | `1` | Serve the [CDP lane](#drive-a-browser-with-playwright-the-cdp-lane) at `/cdp/<name>/` — Playwright, puppeteer and other DevTools-protocol clients, with no MCP in the path. Same lazy provisioning, same golden seed, same `MAX_FLEET`. `0` answers 404 there and leaves the browsers' CDP reachable only through the MCP endpoint. |
+| `CHIKIN_ANTHROPIC_API_KEY` | *(empty)* | Turns on [`chikin_achieve`](#run-a-goal-to-the-end-chikin_achieve): a goal-level tool whose inner loop asks a Claude model which row to do next. Empty means the tool is not offered. A paid credential: one model call per step. `/healthz` reports `achieve: true/false`, never the key. Chikin-scoped so a shell's own `ANTHROPIC_API_KEY` cannot switch it on through compose. |
+| `CHIKIN_OPENROUTER_API_KEY` | *(empty)* | The same, through [OpenRouter](https://openrouter.ai/), used only when `CHIKIN_ANTHROPIC_API_KEY` is empty. It also reaches TypeSafe's Jev (see `CHIKIN_DECIDER_MODEL`). Each trace step names the model that actually answered. Chikin-scoped for the same reason. |
+| `CHIKIN_DECIDER_MODEL` | *(provider default)* | The model `chikin_achieve` asks for each decision. Empty means `claude-haiku-5-5` direct, or `jev-latest` on OpenRouter. Any `jev-*` makes TypeSafe's Jev choose each row through its own System One API, which OpenRouter serves. Any other id is an OpenRouter chat model, e.g. `anthropic/claude-haiku-5.5`. `typesafe/jev-router` is a different thing: a chat model that routes to other LLMs. |
+| `CHIKIN_TEXT_MODEL` | `anthropic/claude-haiku-5.5` | When Jev decides, the OpenRouter model that writes the text a fill needs, since Jev cannot generate text. Ignored otherwise. |
 | `CHIKIN_VOLUME_GC` | `1` | Sweep orphaned `chikin-profile-inst-*` volumes (disposable profiles whose container is gone) once at startup. Scoped by name — `golden`, `hermes` and named client profiles are never candidates. `0` disables. See [Profile volumes](#profile-volumes-and-cleaning-them-up). |
 | `PROVISION_TIMEOUT_SEC` | `90` | How long to wait for a new browser's CDP to come up. Nothing is provisioned when a client connects, so this bounds the **first browser tool call** — overrunning it fails that one call as a retryable tool error ("chikin could not start a browser"), leaving the session up with every tool registered. |
 | `WINDOW_SIZE` | `1920,1080` | Chrome window / Xvfb screen size for provisioned browsers. |

@@ -127,6 +127,16 @@ services:
       # 0 serves 404 there, leaving the browsers' CDP reachable only through
       # the MCP endpoint.
       CHIKIN_CDP_LANE: "${CHIKIN_CDP_LANE:-1}"
+      # chikin_achieve (#103): a goal-level tool whose fast inner loop asks a
+      # Claude model which row to do next. Listed only when a key is set; the
+      # key is a paid credential and /healthz reports only whether it is set.
+      CHIKIN_ANTHROPIC_API_KEY: "${CHIKIN_ANTHROPIC_API_KEY:-}"
+      # Or OpenRouter (where TypeSafe's Jev is hosted), used when no Anthropic key is set.
+      CHIKIN_OPENROUTER_API_KEY: "${CHIKIN_OPENROUTER_API_KEY:-}"
+      # Empty: claude-haiku-5-5 direct, jev-latest (TypeSafe Jev) on OpenRouter.
+      CHIKIN_DECIDER_MODEL: "${CHIKIN_DECIDER_MODEL:-}"
+      # Writes fill text when the decider is Jev (jev-*), which cannot generate text.
+      CHIKIN_TEXT_MODEL: "${CHIKIN_TEXT_MODEL:-}"
       CHROME_IMAGE: "ghcr.io/jra3/chikin:${CHIKIN_VERSION:-sha-e1b3e92}"
       # Golden-profile seed volume. Empty = off; set to chikin-seed and populate
       # it with bin/chikin-snapshot to have new browsers start logged in.

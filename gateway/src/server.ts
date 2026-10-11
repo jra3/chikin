@@ -1,3 +1,4 @@
+import type { Decider } from "./loop/decider.js";
 import express, { type Request, type Response, type NextFunction } from "express";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { config } from "./config.js";
@@ -18,6 +19,8 @@ import type { Duplex } from "node:stream";
 export interface ServerDeps {
   registry: Registry;
   provisioner: Provisioner;
+  /** chikin_achieve's decision model; tests inject a scripted one. */
+  decider?: Decider;
 }
 
 function authMiddleware(req: Request, res: Response, next: NextFunction): void {

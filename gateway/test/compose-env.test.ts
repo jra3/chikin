@@ -102,3 +102,19 @@ test("each plumbed knob forwards its own name, not a neighbour's", () => {
   }
   assert.deepEqual(mismatched, [], `env key forwards a differently-named var: ${mismatched.join(", ")}`);
 });
+
+// Compose interpolates `${VAR}` from the operator's SHELL as well as from .env,
+// so a gateway knob named after a credential other tools also use would pick
+// that credential up from whatever the operator happened to export. For the
+// decision model behind chikin_achieve (#103) that silently switches on a paid
+// feature. The gateway's copy must be chikin-scoped, and must not be filled
+// from the generic name either.
+test("the decision model's keys reach the gateway only under chikin-scoped names", () => {
+  const env = composeGatewayEnv();
+  for (const generic of ["ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"]) {
+    assert.ok(env.has(`CHIKIN_${generic}`), `the scoped CHIKIN_${generic} is passed through`);
+    assert.ok(!env.has(generic), `a bare ${generic} would be the shell's`);
+    for (const [k, v] of env)
+      assert.ok(!new RegExp(`\\$\\{${generic}\\b`).test(v), `${k} is filled from the shell's generic ${generic}`);
+  }
+});
