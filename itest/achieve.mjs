@@ -50,6 +50,10 @@ if (!GOALS) {
   console.error(`unknown suite '${SUITE}'; known: ${Object.keys(SUITES).join(", ")}`);
   process.exit(2);
 }
+if (!GOALS.length) {
+  console.error(`no goal in suite '${SUITE}' matches --only '${ONLY}'`);
+  process.exit(2);
+}
 
 const docker = (...args) => execFileSync("docker", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
 const textOf = (r) => (r.content ?? []).map((c) => c.text ?? "").join("\n");
@@ -65,10 +69,11 @@ async function openBrowser(name) {
   const close = async () => {
     try { await transport.terminateSession(); } catch {}
     try { await client.close(); } catch {}
-    if (!existed) {
-      try { docker("rm", "-f", `chikin-chrome-${name}`); } catch {}
-      try { docker("volume", "rm", `chikin-profile-${name}`); } catch {}
-    }
+    if (existed) return 0;
+    let removed = 0;
+    try { docker("rm", "-f", `chikin-chrome-${name}`); removed++; } catch {}
+    try { docker("volume", "rm", `chikin-profile-${name}`); removed++; } catch {}
+    return removed;
   };
   return { client, close };
 }
@@ -76,6 +81,7 @@ async function openBrowser(name) {
 let failures = 0;
 const rows = [];
 let n = 0;
+let removed = 0;
 {
   let client;
   const probe = async (body) => {
@@ -86,13 +92,14 @@ let n = 0;
   const call = (name, args) => client.callTool({ name, arguments: args });
   for (const g of GOALS) {
     console.log(`\n=== ${g.name}${g.limit ? `  (expected limit: ${g.limit})` : ""}`);
-    const browser = await openBrowser(`${NAME}-${++n}`);
-    client = browser.client;
+    let browser;
     let sc = {};
     let steps = [];
     let ms = 0;
     let ok = false;
     try {
+      browser = await openBrowser(`${NAME}-${++n}`);
+      client = browser.client;
       await call("navigate_page", { type: "url", url: g.start });
       // A slow site (the-internet on Heroku took ~30 s cold) can outlast
       // navigate_page's own 10 s timeout. Wait for a readable page before the
@@ -123,7 +130,7 @@ let n = 0;
     } catch (e) {
       console.log(`      !! ${String(e?.message ?? e).slice(0, 200)}`);
     } finally {
-      await browser.close();
+      if (browser) removed += await browser.close();
     }
     const verdict = ok ? "PASS" : g.limit ? "LIMIT" : "FAIL";
     if (verdict === "FAIL") failures++;
@@ -139,7 +146,7 @@ let n = 0;
     });
   }
   console.table(rows);
-  console.log(`removed the ${n} browser(s) and profile volume(s) this run created`);
+  console.log(`removed ${removed} browser container(s) and profile volume(s) this run created`);
 }
 console.log(failures ? `\n${failures} goal(s) missed (expected limits excluded)` : "\nall goals reached their expected outcome (expected limits excluded)");
 process.exit(failures ? 1 : 0);

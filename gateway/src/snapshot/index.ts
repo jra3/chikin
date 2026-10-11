@@ -219,9 +219,10 @@ export async function takeSnapshot(
     // click on one does nothing (#107). Bounded; a page that never completes
     // is read as it is.
     while (Date.now() < deadline) {
-      const r = (await client.send("Runtime.evaluate", { expression: "document.readyState", returnByValue: true }).catch(
-        () => null,
-      )) as { result?: { value?: unknown } } | null;
+      const probeMs = Math.min(opts.evaluateTimeoutMs ?? 25_000, Math.max(1, deadline - Date.now()));
+      const r = (await client
+        .send("Runtime.evaluate", { expression: "document.readyState", returnByValue: true }, probeMs)
+        .catch(() => null)) as { result?: { value?: unknown } } | null;
       if (r?.result?.value === "complete") break;
       await new Promise((res) => setTimeout(res, 100));
     }
