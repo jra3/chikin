@@ -176,8 +176,8 @@ export const config = {
   // The decision model behind chikin_achieve (#103). The tool is listed only
   // when a key is set: an MCP client fixes its tool registry at session start,
   // so a tool that can only ever answer "not configured" is worse than none.
-  // The key is a paid credential; it never leaves this process except to the
-  // Anthropic API, and /healthz reports only whether it is set.
+  // Each key is a paid credential; it never leaves this process except to its
+  // own provider's API, and /healthz reports only whether one is set.
   deciderApiKey: str("CHIKIN_ANTHROPIC_API_KEY", ""),
   // Or through OpenRouter, where TypeSafe's Jev is hosted. Used only when no
   // Anthropic key is set. Same scoping reason as the key above.

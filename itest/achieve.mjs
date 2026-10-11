@@ -5,8 +5,9 @@
 // The unit tests drive the loop with a scripted decider. Only a real decision
 // model on real pages can say whether a fast model picking rows from the table
 // gets there, so this needs a scratch gateway started WITH a key
-// (-e CHIKIN_ANTHROPIC_API_KEY=...; see README.md in this directory). It skips
-// cleanly, exit 0, when the gateway reports `achieve: false`.
+// (-e CHIKIN_ANTHROPIC_API_KEY or CHIKIN_OPENROUTER_API_KEY; see README.md
+// in this directory). It skips cleanly, exit 0, when the gateway reports
+// `achieve: false`.
 //
 // Each goal starts from a navigate_page and makes ONE chikin_achieve call. It
 // prints the trace, with decision and act time per step, and checks the outcome

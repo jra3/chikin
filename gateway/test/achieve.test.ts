@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { runLoop, normaliseOrigins, type LoopDriver, type LoopOptions } from "../src/loop/achieve.js";
-import { DeciderError, DeciderRefusedError, type Decider, type Decision, type DecisionInput } from "../src/loop/decider.js";
+import { DeciderError, DeciderRefusedError, OpenRouterDecider, type Decider, type Decision, type DecisionInput } from "../src/loop/decider.js";
 import { ActRefusedError, type ActOutcome } from "../src/snapshot/act.js";
 import type { PageState, SnapshotAction } from "../src/snapshot/index.js";
 
@@ -293,4 +293,29 @@ test("a halt reason (session closed, browser restarted) stops the loop before th
   assert.equal(r.status, "cancelled");
   assert.match(r.message, /the browser restarted/);
   assert.equal(seen.length, 1, "no second decision was asked for");
+});
+
+test("through OpenRouter, each step names the model the router actually served", async () => {
+  const served = ["openai/gpt-6-luna", "deepseek/deepseek-v4.1-flash", "openai/gpt-6-luna"];
+  const answers = [
+    '{"choice":"e1","text":"socks","consequential":false,"reason":"type it"}',
+    '{"choice":"e2","text":null,"consequential":false,"reason":"submit"}',
+    '{"choice":"DONE","text":null,"consequential":false,"reason":"results for socks are shown"}',
+  ];
+  const sentModels: string[] = [];
+  const f = (async (_url: string, init: RequestInit) => {
+    sentModels.push(JSON.parse(String(init.body)).model);
+    const i = sentModels.length - 1;
+    return new Response(
+      JSON.stringify({ model: served[i], choices: [{ finish_reason: "stop", message: { content: answers[i] } }] }),
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+  const decider = new OpenRouterDecider({ apiKey: "k", model: "typesafe/jev-router", fetch: f });
+  const { driver: d, acted } = driver();
+  const r = await runLoop(base({ decider, driver: d }));
+  assert.equal(r.status, "done");
+  assert.deepEqual(acted.map((a) => [a.id, a.text]), [["e1", "socks"], ["e2", undefined]]);
+  assert.deepEqual(sentModels, ["typesafe/jev-router", "typesafe/jev-router", "typesafe/jev-router"]);
+  assert.deepEqual(r.steps.map((s) => s.model), served);
 });

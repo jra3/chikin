@@ -119,7 +119,7 @@ const answer = (params: Record<string, unknown>): unknown => {
 };
 
 // The decider plays whatever the current test queued.
-type Answer = { choice: string; text?: string | null; consequential?: boolean; reason?: string } | ((signal?: AbortSignal) => Promise<{ choice: string }>);
+type Answer = { choice: string; text?: string | null; consequential?: boolean; reason?: string; model?: string } | ((signal?: AbortSignal) => Promise<{ choice: string }>);
 const script: Answer[] = [];
 const decider = {
   async decide(_input: unknown, signal?: AbortSignal) {
@@ -184,7 +184,7 @@ test("chikin_achieve: listed with a decider, runs to DONE in one call, reports p
     assert.equal(missing.isError, true);
     assert.match(textOf(missing), /`goal` is required/);
 
-    script.push({ choice: "e1", reason: "continue to confirm" }, { choice: "DONE", reason: "confirm page shown" });
+    script.push({ choice: "e1", reason: "continue to confirm", model: "openai/gpt-6-luna" }, { choice: "DONE", reason: "confirm page shown" });
     const progress: string[] = [];
     const t0 = registry.getActivity("inst-achieve")?.lastBrowserActivity ?? 0;
     const r = await client.callTool({ name: "chikin_achieve", arguments: { goal: "get to the confirm page" } }, CallToolResultSchema, {
@@ -193,6 +193,8 @@ test("chikin_achieve: listed with a decider, runs to DONE in one call, reports p
     assert.notEqual(r.isError, true, textOf(r));
     assert.match(textOf(r), /^DONE after 2 step\(s\)/);
     assert.match(textOf(r), /1\. click e1 "Continue" -> executed, page changed/);
+    assert.match(textOf(r), /\[decide \d+ms by openai\/gpt-6-luna, act \d+ms\]/, "the step names the model that served it");
+    assert.doesNotMatch(textOf(r), /2\. .* by /, "no model is named when the provider reported none");
     assert.match(textOf(r), /The page now:\n\n# Confirm/);
     const sc = r.structuredContent as { status?: string; steps?: unknown[] };
     assert.equal(sc.status, "done");
