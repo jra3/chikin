@@ -9,6 +9,7 @@ import { isValidHandle, HANDLE_RULE } from "./names.js";
 import type { Registry } from "./registry.js";
 import type { Provisioner } from "./provisioner.js";
 import { FleetFullError, ProvisionError } from "./provisioner.js";
+import { PageChoiceError, StalePageError, renderSnapshot, sameDoc, takeSnapshot } from "./snapshot/index.js";
 
 export interface BridgeDeps {
   provisioner: Provisioner;
@@ -346,18 +347,6 @@ export function shouldJudgeNav(
   return sameDoc(selected, newest.selected);
 }
 
-// Two URLs point at the same document if origin+path match (query/hash differ
-// across redirects too often to compare strictly).
-function sameDoc(a: string, b: string): boolean {
-  try {
-    const ua = new URL(a);
-    const ub = new URL(b);
-    return ua.origin === ub.origin && ua.pathname === ub.pathname;
-  } catch {
-    return a === b;
-  }
-}
-
 // Synthetic gateway-owned tool, appended to every tools/list reply. Lets the
 // model itself recover a wedged browser instead of waiting for the watchdog.
 const RESET_TOOL = {
@@ -407,6 +396,31 @@ const IDENTIFY_TOOL = {
   },
 };
 
+// Synthetic gateway-owned tool (#96): the indexed action table read over the
+// gateway's own CDP connection, never through the child. Gated like a browser
+// tool — it needs identity and a browser — but answered by the gateway, so it
+// neither waits on the child's tool mutex nor holds it.
+const SNAPSHOT_TOOL = {
+  name: "chikin_snapshot",
+  description:
+    "Read the selected page as an indexed action table: one numbered row (e1, e2, …) per " +
+    "visible, enabled control with its role, label and current value, plus the visible text, " +
+    "in a single atomic read. Cheaper and faster than take_snapshot for deciding what to do " +
+    "next; act with the usual click/fill tools afterwards. Reads the page the last navigation " +
+    "selected; pass `url` to name another open page. Refuses rather than guesses when more " +
+    "than one open page fits.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      url: {
+        type: "string",
+        description: "URL (origin and path) of the open page to read, when it is not the selected one.",
+      },
+    },
+    additionalProperties: false,
+  },
+};
+
 // Prepended to the upstream chrome-devtools-mcp `instructions` so a caller with
 // zero prior knowledge of chikin learns the contract up front, before ever
 // touching a browser tool. Layer 1 of the self-directing design.
@@ -421,7 +435,7 @@ const CHIKIN_INSTRUCTIONS =
 // are gateway-owned and handled without a browser.
 const ALWAYS_ALLOWED_TOOLS = new Set([IDENTIFY_TOOL.name, RESET_TOOL.name]);
 
-export type FrameAction = "forward" | "identify" | "reset" | "block";
+export type FrameAction = "forward" | "identify" | "reset" | "block" | "snapshot";
 
 // Pure routing/gate decision for a client->child frame, given whether the
 // session has identified. Extracted as a seam so the gate can be unit-tested
@@ -436,12 +450,14 @@ export function classifyClientFrame(
   if (tool === IDENTIFY_TOOL.name) return "identify";
   if (tool === RESET_TOOL.name) return "reset";
   if (!identified && !ALWAYS_ALLOWED_TOOLS.has(tool ?? "")) return "block";
+  if (tool === SNAPSHOT_TOOL.name) return "snapshot";
   return "forward";
 }
 
 /**
  * Does this client frame actually drive the BROWSER? True only for a
- * `tools/call` the gate forwards to chrome-devtools-mcp — so the client
+ * `tools/call` the gate forwards to chrome-devtools-mcp, or answers itself
+ * over its own CDP connection (`chikin_snapshot`, #96) — so the client
  * bridge's keepalive `ping`, `initialize`, `tools/list`, notifications, the
  * gateway-owned `chikin_identify`/`chikin_reset`, and calls blocked by the
  * identify gate are all excluded.
@@ -456,7 +472,8 @@ export function isBrowserWork(
   identified: boolean,
 ): boolean {
   if (!f || f.method !== "tools/call") return false;
-  return classifyClientFrame(f, identified) === "forward";
+  const action = classifyClientFrame(f, identified);
+  return action === "forward" || action === "snapshot";
 }
 
 /**
@@ -783,7 +800,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         // Append the gateway's synthetic tools to tools/list replies.
         if (toolsListIds.has(f.id)) {
           toolsListIds.delete(f.id);
-          if (Array.isArray(f.result?.tools)) f.result.tools.push(RESET_TOOL, IDENTIFY_TOOL);
+          if (Array.isArray(f.result?.tools)) f.result.tools.push(RESET_TOOL, IDENTIFY_TOOL, SNAPSHOT_TOOL);
         }
         // Layer 1 of the self-directing design: fold chikin's contract into the
         // initialize result's `instructions` before the client sees it. This is
@@ -1208,6 +1225,59 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     );
   }
 
+  /**
+   * `chikin_snapshot` (#96): read the selected page over the gateway's own CDP
+   * socket and answer on the gateway's behalf. Reached through `dispatch`, so
+   * the lazy attach has already run and `currentIp` names a live browser; the
+   * activity stamp happened in the pump, by the same `isBrowserWork` predicate
+   * that claimed the slot. Nothing here touches the child, so a capture stuck
+   * on its mutex neither delays this read nor is delayed by it.
+   *
+   * `navNewest.selected` is the child's last REPORTED selection, from its last
+   * nav reply — not a live query, which would be a child call. Between navs a
+   * client's `select_page` moves the child's selection without moving ours, so
+   * the tool says which page it read and takes `url` to name another.
+   */
+  async function handleSnapshot(f: Frame): Promise<void> {
+    const url = f.params?.arguments?.url;
+    if (url !== undefined && typeof url !== "string") {
+      replyTool(f.id, "`url` must be a string when provided.", true);
+      return;
+    }
+    const ip = currentIp;
+    if (!ip) {
+      replyTool(f.id, "chikin browser restarting; retry the request", true);
+      return;
+    }
+    try {
+      const { page, snapshot } = await takeSnapshot({
+        ip,
+        cdpPort: config.cdpPort,
+        url,
+        selected: navNewest.selected,
+      });
+      if (f.id === undefined || session.isClosed) return;
+      http
+        .send({
+          jsonrpc: "2.0",
+          id: f.id,
+          result: {
+            content: [{ type: "text", text: renderSnapshot(snapshot) }],
+            structuredContent: { page: { id: page.id, url: page.url, title: page.title }, ...snapshot },
+            isError: false,
+          },
+        } as JSONRPCMessage)
+        .catch((e) => log.warn(`session[${name}]: snapshot reply failed`, String(e)));
+    } catch (e) {
+      if (e instanceof PageChoiceError || e instanceof StalePageError) {
+        replyTool(f.id, e.message, true);
+        return;
+      }
+      log.warn(`session[${name}]: chikin_snapshot failed`, String(e));
+      replyTool(f.id, `chikin_snapshot failed (${String(e)}); retry the request`, true);
+    }
+  }
+
   // Everything past the identify gate: track the request, record nav state, and
   // hand the frame to the child. Split out of the pump below so the lazy-attach
   // path can re-enter it with the very same frame once the browser is up.
@@ -1280,6 +1350,10 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
    * queueing every frame behind an activation — costs more than it buys.
    */
   function dispatch(msg: JSONRPCMessage, f: Frame): void {
+    if (f?.method === "tools/call" && f.params?.name === SNAPSHOT_TOOL.name) {
+      void handleSnapshot(f);
+      return;
+    }
     if (
       f?.method === "tools/call" &&
       FOREGROUND_TOOLS.has(f.params?.name ?? "") &&
