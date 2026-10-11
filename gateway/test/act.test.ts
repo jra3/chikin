@@ -145,11 +145,31 @@ test("scroll: a wheel event at the viewport centre with the row's delta", async 
   });
 });
 
-test("wait: no input at all", async () => {
-  await withPage(scripted(), async (fake) => {
+test("wait: no input; returns as soon as the page changes", async () => {
+  let markerReads = 0;
+  const changesOnThirdLook = (params: Record<string, unknown>): unknown => {
+    const expr = String(params.expression ?? "");
+    // the freshness check is the first marker read; changes appear on the third
+    if (expr.includes("return state?.marker ?? null")) return ++markerReads >= 3 ? ["marker-2"] : STATE.marker;
+    return scripted()(params);
+  };
+  await withPage(changesOnThirdLook, async (fake) => {
+    const t0 = Date.now();
     const out = await run(fake, "wait");
     assert.equal(out.done, true);
     assert.deepEqual(inputs(fake), []);
+    assert.ok(Date.now() - t0 < 1000, "it stopped waiting when the page changed");
+    assert.equal(markerReads, 3);
+  });
+});
+
+test("wait: a page that never changes is waited on for the bound, then read", async () => {
+  await withPage(scripted(), async (fake) => {
+    const t0 = Date.now();
+    const out = await run(fake, "wait");
+    const took = Date.now() - t0;
+    assert.equal(out.done, true);
+    assert.ok(took >= 1900 && took < 3500, `bounded at about 2 s, took ${took} ms`);
   });
 });
 

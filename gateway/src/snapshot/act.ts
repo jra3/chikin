@@ -127,6 +127,9 @@ const settleJs = (action: SnapshotAction): string =>
 const INPUT_TIMEOUT_MS = 5000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** The longest a `wait` row waits for the page to change. */
+export const WAIT_MAX_MS = 2000;
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
 async function evaluate(client: CdpClient, expression: string, awaitPromise = false): Promise<{ value: unknown; threw: boolean }> {
@@ -240,7 +243,17 @@ export async function act(opts: ActOptions): Promise<ActOutcome> {
       return await refuse(new ActRefusedError(`The page changed since row '${row.id}' was read; nothing was done.`));
 
     if (row.kind === "wait") {
-      await sleep(100);
+      // Wait for the page to CHANGE, not for a fixed beat: a decider that
+      // chose wait is saying "something is loading", and 100 ms (jev-ultrafast's
+      // beat) spent most of a 25-step budget on a 5 s spinner while giving a
+      // wavering decider a fresh chance to click something else every beat
+      // (#105). Bounded, so a wait on a page that never changes still returns.
+      const until = Date.now() + WAIT_MAX_MS;
+      while (Date.now() < until) {
+        await sleep(100);
+        const now = await evaluate(client, MARKER_JS).catch(() => null);
+        if (!now || now.threw || !same(now.value, opts.state.marker)) break;
+      }
     } else if (row.kind === "scroll") {
       await input("Input.dispatchMouseEvent", {
         type: "mouseWheel",
