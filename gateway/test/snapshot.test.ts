@@ -93,12 +93,19 @@ test("choosePage: a stale selection falls back to a lone page, but not to one of
 // --- the read, on the wire --------------------------------------------------
 
 test("takeSnapshot: dials the page by id, evaluates the script once, strips the internals", async () => {
-  const fake = await startFakeCdp([{ id: "P1", url: "https://example.org/checkout", title: "Checkout", evaluate: () => PAGE_STATE }]);
+  const fake = await startFakeCdp([
+    { id: "P1", url: "https://example.org/checkout", title: "Checkout", evaluate: (p) => (p.expression === "document.readyState" ? "complete" : PAGE_STATE) },
+  ]);
   try {
     const { page: read, snapshot } = await takeSnapshot({ ip: fake.ip, cdpPort: fake.port });
     assert.equal(read.id, "P1");
     assert.deepEqual(fake.upgrades, ["/devtools/page/P1"], "dialled by id, not by the printed ws url");
-    assert.equal(fake.commands.length, 1, "one command: the whole read is one Runtime.evaluate");
+    assert.deepEqual(
+      fake.commands.map((c) => (c.params.expression === "document.readyState" ? "readyState" : c.method)),
+      ["readyState", "Runtime.evaluate"],
+      "a readiness probe, then the whole read in one Runtime.evaluate",
+    );
+    fake.commands.splice(0, 1);
     assert.equal(fake.commands[0].method, "Runtime.evaluate");
     assert.equal(fake.commands[0].params.expression, SNAPSHOT_JS);
     assert.equal(fake.commands[0].params.returnByValue, true);
@@ -125,13 +132,13 @@ test("takeSnapshot: only type:page targets are candidates", async () => {
   }
 });
 
-test("takeSnapshot: a thrown script is a stale page, not a crash; so is a null body", async () => {
+test("takeSnapshot: a page that never settles is a stale page, not a crash", async () => {
   let answer: unknown = new Error("Cannot read properties of null");
   const fake = await startFakeCdp([{ id: "P", url: "https://example.org/", evaluate: () => answer }]);
   try {
-    await assert.rejects(takeSnapshot({ ip: fake.ip, cdpPort: fake.port }), (e: unknown) => e instanceof StalePageError && /changed during/.test(e.message));
+    await assert.rejects(takeSnapshot({ ip: fake.ip, cdpPort: fake.port, settleMs: 0 }), (e: unknown) => e instanceof StalePageError && /changed during/.test(e.message));
     answer = null;
-    await assert.rejects(takeSnapshot({ ip: fake.ip, cdpPort: fake.port }), (e: unknown) => e instanceof StalePageError && /navigating/.test(e.message));
+    await assert.rejects(takeSnapshot({ ip: fake.ip, cdpPort: fake.port, settleMs: 250 }), (e: unknown) => e instanceof StalePageError && /navigating/.test(e.message));
     assert.equal(fake.upgrades.length, 2, "each attempt opened and closed its own socket");
   } finally {
     await fake.close();
@@ -193,4 +200,47 @@ test("renderSnapshot: a label keeps to its row, however the page wrapped it", ()
 test("renderSnapshot: says when the table was cut", () => {
   const s: Snapshot = { ...PAGE_STATE, actions: [], omitted_actions: 12 };
   assert.match(renderSnapshot(s), /12 more controls not listed/);
+});
+
+test("takeSnapshot: a document still loading is read again until its body exists (#107)", async () => {
+  let reads = 0;
+  const fake = await startFakeCdp([
+    { id: "P", url: "https://example.org/", evaluate: (p) => (p.expression === "document.readyState" ? "complete" : ++reads < 3 ? null : PAGE_STATE) },
+  ]);
+  try {
+    const { snapshot } = await takeSnapshot({ ip: fake.ip, cdpPort: fake.port });
+    assert.equal(snapshot.title, "Checkout");
+    assert.equal(reads, 3, "two reads with no body, then the page");
+    assert.equal(fake.upgrades.length, 1, "on one connection");
+  } finally {
+    await fake.close();
+  }
+});
+
+test("takeSnapshot: waits for a complete document before reading it, bounded (#107)", async () => {
+  let state = "loading";
+  const reads: string[] = [];
+  const fake = await startFakeCdp([
+    {
+      id: "P",
+      url: "https://example.org/",
+      evaluate: (p) => {
+        if (p.expression === "document.readyState") return state;
+        reads.push(state);
+        return PAGE_STATE;
+      },
+    },
+  ]);
+  try {
+    setTimeout(() => (state = "complete"), 300);
+    await takeSnapshot({ ip: fake.ip, cdpPort: fake.port });
+    assert.deepEqual(reads, ["complete"], "the table was read only once the document completed");
+    state = "interactive";
+    const t0 = Date.now();
+    await takeSnapshot({ ip: fake.ip, cdpPort: fake.port, settleMs: 300 });
+    assert.ok(Date.now() - t0 < 2000, "a page that never completes is read anyway, after the bound");
+    assert.equal(reads.at(-1), "interactive");
+  } finally {
+    await fake.close();
+  }
 });
