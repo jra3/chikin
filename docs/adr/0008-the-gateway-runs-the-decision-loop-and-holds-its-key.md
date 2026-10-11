@@ -61,6 +61,11 @@ and whose session closure already holds every piece the loop needs
   one Jev yes/no question for the consequential check. In the 2026-10-11 live
   runs it reached the same outcomes as Haiku 5.5, 2 to 6 times faster end to
   end. Click decisions took 0.3 to 0.7 s including the consequential check.
-  Fills took about 1 to 2 s, dominated by the text model. Any non-`jev-*` id is
+  Fills took about 1 to 2 s, dominated by the text model. So when the goal
+  quotes values, the same Jev request also asks one choice question per
+  fillable field (the quoted strings plus NONE), and a confident pick is typed
+  verbatim with no text-model call; the fill decision median fell from 1.3 s to
+  0.25 s (#110). Thresholds and fallbacks live in `gateway/src/loop/jev.ts`.
+  Any non-`jev-*` id is
   sent as an OpenRouter chat model instead. That includes `typesafe/jev-router`,
   which is a router to other LLMs (GPT-6 Luna, DeepSeek V4.1 Flash), not Jev.

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { actionSpace, validateChoice, quotedValues, JevDecider, OpenRouterTextHelper, JEV_NEXT_ACTION, MAX_VALUE_FIELDS, type SystemOneClient, type TextHelper } from "../src/loop/jev.js";
+import { actionSpace, validateChoice, quotedValues, JevDecider, OpenRouterTextHelper, JEV_NEXT_ACTION, MAX_VALUE_FIELDS, VALUE_CONFIDENCE, type SystemOneClient, type TextHelper } from "../src/loop/jev.js";
 import { DeciderError } from "../src/loop/decider.js";
 import type { PageState, SnapshotAction } from "../src/snapshot/index.js";
 
@@ -217,4 +217,49 @@ test("no quoted values, or too many fields, means no value questions at all", as
   const big = client((q) => ({ operation: pick("TYPE_TEXT", Object.keys((q.operation as any).criteria)), type_text_target: pick("1", ids) }));
   await new JevDecider({ client: big.c, model: "jev-latest", text: { valueFor: async () => ({ text: "x" }) } }).decide({ ...goalWithQuotes, page: many });
   assert.ok(!Object.keys(big.calls[0].questions).some((k) => k.startsWith("value_")), "bounded fan-out");
+});
+
+test("only the chosen field's value head is read: two fields, each its own quoted value", async () => {
+  const form: PageState = {
+    ...PAGE,
+    actions: [
+      a({ id: "e1", kind: "fill", label: "Name", node: 1, role: "textbox", value: "" }),
+      a({ id: "e2", kind: "fill", label: "Email", node: 2, role: "textbox", value: "" }),
+    ],
+  };
+  const goal = { ...input, goal: 'sign up as "Ada" with “ada@example.com”', page: form };
+  const both = ["Ada", "ada@example.com", "NONE"];
+  const sure = (v: string) => ({ type: "choice", choice: v, confidence: 0.99, probabilities: Object.fromEntries(both.map((k) => [k, k === v ? 1 : 0])) });
+  for (const [target, want] of [["1", "Ada"], ["2", "ada@example.com"]]) {
+    let helperCalls = 0;
+    const { c, calls } = client((q) => ({
+      operation: pick("TYPE_TEXT", Object.keys((q.operation as any).criteria)),
+      type_text_target: pick(target, ["1", "2"]),
+      value_1: sure("Ada"),
+      value_2: sure("ada@example.com"),
+    }));
+    const out = await new JevDecider({ client: c, model: "jev-latest", text: { valueFor: async () => (helperCalls++, { text: "x" }) } }).decide(goal);
+    assert.equal(out.choice, `e${target}`);
+    assert.equal(out.text, want);
+    assert.equal(helperCalls, 0);
+    assert.deepEqual(Object.keys(calls[0].questions).filter((k) => k.startsWith("value_")).sort(), ["value_1", "value_2"]);
+  }
+});
+
+test("exactly MAX_VALUE_FIELDS fillable fields still asks; a pick at exactly VALUE_CONFIDENCE is taken", async () => {
+  const many: PageState = {
+    ...PAGE,
+    actions: Array.from({ length: MAX_VALUE_FIELDS }, (_, i) => a({ id: `e${i + 1}`, kind: "fill", label: `F${i}`, node: i + 1, role: "textbox", value: "" })),
+  };
+  const ids = many.actions.map((_, i) => String(i + 1));
+  const { c, calls } = client((q) => ({
+    operation: pick("TYPE_TEXT", Object.keys((q.operation as any).criteria)),
+    type_text_target: pick("1", ids),
+    value_1: { type: "choice", choice: "L socks", confidence: VALUE_CONFIDENCE, probabilities: { "L socks": 1, NONE: 0 } },
+  }));
+  let helperCalls = 0;
+  const out = await new JevDecider({ client: c, model: "jev-latest", text: { valueFor: async () => (helperCalls++, { text: "x" }) } }).decide({ ...goalWithQuotes, page: many });
+  assert.equal(Object.keys(calls[0].questions).filter((k) => k.startsWith("value_")).length, MAX_VALUE_FIELDS);
+  assert.equal(out.text, "L socks");
+  assert.equal(helperCalls, 0);
 });
