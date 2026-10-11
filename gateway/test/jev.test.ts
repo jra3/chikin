@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { actionSpace, validateChoice, JevDecider, OpenRouterTextHelper, JEV_NEXT_ACTION, type SystemOneClient, type TextHelper } from "../src/loop/jev.js";
+import { actionSpace, validateChoice, quotedValues, JevDecider, OpenRouterTextHelper, JEV_NEXT_ACTION, MAX_VALUE_FIELDS, type SystemOneClient, type TextHelper } from "../src/loop/jev.js";
 import { DeciderError } from "../src/loop/decider.js";
 import type { PageState, SnapshotAction } from "../src/snapshot/index.js";
 
@@ -157,4 +157,64 @@ test("a refused step reaches Jev and the text model with its outcome, so it does
   await new JevDecider({ client: c, model: "jev-latest", text }).decide({ ...input, recent });
   assert.deepEqual((calls[0].state as any).recent_actions, [{ action: "e1", kind: "fill", text: "socks", outcome: "refused", page_changed: null }]);
   assert.deepEqual(seen[0].recent_actions, [{ action: "e1", text: "socks", outcome: "refused" }]);
+});
+
+// --- quoted fill values (#110) ----------------------------------------------
+
+test("quotedValues: double and curly quotes, in order, deduplicated; apostrophes are not quotes", () => {
+  assert.deepEqual(quotedValues('name "Ada Test", phone “555-0100”, again "Ada Test"; it\'s fine'), ["Ada Test", "555-0100"]);
+  assert.deepEqual(quotedValues("no quotes here"), []);
+  assert.deepEqual(quotedValues('an empty "" quote'), []);
+});
+
+const goalWithQuotes = { ...input, goal: 'search for "L socks"' };
+const fillAnswer = (valueAnswer: unknown) => (q: Record<string, unknown>) =>
+  ({
+    operation: pick("TYPE_TEXT", Object.keys((q.operation as any).criteria)),
+    type_text_target: pick("1", ["1"]),
+    click_target: pick("1", ["1", "2"]),
+    select_target: pick("3:1", ["3:1", "3:2"]),
+    ...(q.value_1 ? { value_1: valueAnswer } : {}),
+  }) as Record<string, unknown>;
+
+test("a quoted value Jev is sure of is typed with no text-model call, and the per-field question rode in the one request", async () => {
+  let helperCalls = 0;
+  const text: TextHelper = { valueFor: async () => (helperCalls++, { text: "WRONG" }) };
+  const { c, calls } = client(fillAnswer({ type: "choice", choice: "L socks", confidence: 0.95, probabilities: { "L socks": 0.97, NONE: 0.03 } }));
+  const out = await new JevDecider({ client: c, model: "jev-latest", text }).decide(goalWithQuotes);
+  assert.equal(out.text, "L socks");
+  assert.equal(helperCalls, 0, "no generative call");
+  assert.equal(calls.length, 1, "no extra Jev round trip either");
+  assert.deepEqual(Object.keys(calls[0].questions.value_1.criteria), ["L socks", "NONE"]);
+  assert.match(out.reason, /value from the goal p=0\.97/);
+});
+
+test("NONE, low confidence, or an unusable value answer all fall back to the text model", async () => {
+  for (const answer of [
+    { type: "choice", choice: "NONE", confidence: 0.9, probabilities: { "L socks": 0.05, NONE: 0.95 } },
+    { type: "choice", choice: "L socks", confidence: 0.5, probabilities: { "L socks": 0.6, NONE: 0.4 } },
+    { type: "choice", choice: "garbage" },
+  ]) {
+    let helperCalls = 0;
+    const text: TextHelper = { valueFor: async () => (helperCalls++, { text: "from model", model: "m" }) };
+    const { c } = client(fillAnswer(answer));
+    const out = await new JevDecider({ client: c, model: "jev-latest", text }).decide(goalWithQuotes);
+    assert.equal(out.text, "from model");
+    assert.equal(helperCalls, 1);
+  }
+});
+
+test("no quoted values, or too many fields, means no value questions at all", async () => {
+  const { c, calls } = client(fillAnswer(undefined));
+  await new JevDecider({ client: c, model: "jev-latest", text: { valueFor: async () => ({ text: "x" }) } }).decide(input);
+  assert.ok(!Object.keys(calls[0].questions).some((k) => k.startsWith("value_")));
+
+  const many: PageState = {
+    ...PAGE,
+    actions: Array.from({ length: MAX_VALUE_FIELDS + 1 }, (_, i) => a({ id: `e${i + 1}`, kind: "fill", label: `F${i}`, node: i + 1, role: "textbox", value: "" })),
+  };
+  const ids = many.actions.map((_, i) => String(i + 1));
+  const big = client((q) => ({ operation: pick("TYPE_TEXT", Object.keys((q.operation as any).criteria)), type_text_target: pick("1", ids) }));
+  await new JevDecider({ client: big.c, model: "jev-latest", text: { valueFor: async () => ({ text: "x" }) } }).decide({ ...goalWithQuotes, page: many });
+  assert.ok(!Object.keys(big.calls[0].questions).some((k) => k.startsWith("value_")), "bounded fan-out");
 });
