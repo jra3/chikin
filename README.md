@@ -122,22 +122,29 @@ A session's browser name (`inst-<pid>`) says *which profile* it drives, not *wha
                  "description": "debugging the OAuth callback" } }  // optional free text
 ```
 
-- **Required first.** Any browser tool (`navigate_page`, `new_page`, …) called before identifying returns an instructive error naming `chikin_identify`, the handle format, and an example. `initialize`, `tools/list`, `chikin_identify`, and `chikin_reset` are never blocked; `chikin_snapshot` is gated like a browser tool.
+- **Required first.** Any browser tool (`navigate_page`, `new_page`, …) called before identifying returns an instructive error naming `chikin_identify`, the handle format, and an example. `initialize`, `tools/list`, `chikin_identify`, and `chikin_reset` are never blocked; `chikin_snapshot` and `chikin_act` are gated like browser tools.
 - **`handle` is required, unique across live sessions.** A handle already held by another live session is rejected with a clear error — pick another. It's a display/correlation label only; the sticky profile stays keyed by the browser *name* (identifying is orthogonal to the profile, and must be re-done on each reconnect).
 - **Surfaces everywhere:** a **handle** column in the dashboard, the session's log lines, and the noVNC page title.
 
 **Self-directing — no docs required.** A caller with zero prior knowledge of chikin is steered to correct usage by the MCP itself: the `initialize` result's `instructions` state the contract up front, `chikin_identify`'s own tool description is fully self-explanatory (format, uniqueness rule, worked example), and the gating error on any premature browser tool is actionable. A Claude-driven client therefore adapts automatically — no client changes needed beyond letting it read the MCP's own context.
 
-### Read the page as an action table (`chikin_snapshot`)
+### Read and act on the page as a table (`chikin_snapshot`, `chikin_act`)
 
-The gateway also injects **`chikin_snapshot`**: one atomic read of the selected page as a numbered table of every visible, enabled control (`e1`, `e2`, …) with its role, label and current value, plus the visible text. It is the observation half of a fast decision loop (issue #95): a model reads the table and picks a row, instead of parsing an accessibility tree. The read goes over the gateway's **own CDP connection** to the browser, never through chrome-devtools-mcp, so it neither waits on nor holds the child's per-session tool mutex — a `take_screenshot` stuck on a background tab does not stall it.
+The gateway injects two tools for fast, goal-driven use (issue #95). **`chikin_snapshot`** reads the page in one atomic step as a numbered table of every visible, enabled control (`e1`, `e2`, …), with its role, label and current value, plus the visible text. **`chikin_act`** carries out one row of that table: a click, typing into a field, a dropdown choice, a scroll, or a wait. It replies with the page as it is afterwards, as a new table. A model reads rows and picks one, instead of parsing an accessibility tree and naming uids.
 
 ```jsonc
-{ "name": "chikin_snapshot", "arguments": {} }                                  // the page the last navigation selected
+{ "name": "chikin_snapshot", "arguments": {} }                                  // the page last read, else the one the last navigation selected
 { "name": "chikin_snapshot", "arguments": { "url": "https://example.org/x" } }  // a named open page (origin + path)
+{ "name": "chikin_act", "arguments": { "id": "e3" } }                           // click / select / scroll_down / wait
+{ "name": "chikin_act", "arguments": { "id": "e5", "text": "Zurich" } }         // fill: replaces the field's value
 ```
 
-It is gated like any browser tool (identify first), provisions the browser on first use, and counts as browser activity. It only reads: act with the usual `click` / `fill` tools afterwards. When more than one open page fits, or none does, it refuses and lists what is open rather than guessing (a selection that no longer matches falls back to the only open page, if there is just one); between navigations a client's own `select_page` moves the child's selection without telling the gateway, so pass `url` when in doubt. Shadow DOM and frames are not traversed (the in-page script is Browser Use's [jev-ultrafast](https://github.com/browser-use/jev-ultrafast) observation script, verbatim).
+- **Ids belong to the most recent table only.** Every read renumbers them, and they are not `take_snapshot` uids, so upstream `click`/`fill` cannot use them.
+- **Nothing is input unless the row still means what it meant.** Before acting, the gateway checks that the control and its surroundings (form, dialog, row) are unchanged since the read, and that nothing covers it. Otherwise nothing happens, and the error carries the page as it is now. A landed action whose page could not be read afterwards is still reported as done, so a caller never clicks twice.
+- **Both go over the gateway's own CDP connection**, never through chrome-devtools-mcp. They neither wait on nor hold the child's per-session tool mutex, so a `take_screenshot` stuck on a background tab does not stall them. [ADR 0007](docs/adr/0007-drive-the-browser-over-the-gateways-own-cdp-socket.md) records why.
+- **Gated like any browser tool.** Identify first. The first call provisions the browser, and every call counts as browser activity.
+- **Which page.** A read without `url` stays on the tab the gateway last read, until the child navigates or changes its selection. When more than one open page fits, or none does, it refuses and lists what is open (a stale selection falls back to the only open page, if there is just one).
+- **Limits.** Shadow DOM and frames are not traversed, and password fields never appear. The in-page scripts are Browser Use's [jev-ultrafast](https://github.com/browser-use/jev-ultrafast), verbatim.
 
 ### Watch a browser / solve a captcha
 

@@ -146,7 +146,8 @@ export async function startFakeCdp(pages: FakePage[], port = 0): Promise<FakeCdp
           if (out instanceof Error) reply({ result: { exceptionDetails: { text: out.message } } });
           else if (out === HANG) return; // never answer: the client's deadline is under test
           else reply({ result: { result: { type: typeof out, value: out } } });
-        } else reply({ error: { code: -32601, message: `'${msg.method}' wasn't found` } });
+        } else if (msg.method.startsWith("Input.")) reply({ result: {} });
+        else reply({ error: { code: -32601, message: `'${msg.method}' wasn't found` } });
       }
       if (closed) socket.end();
     });
