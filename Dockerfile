@@ -50,6 +50,22 @@ RUN groupadd -r -g "$CHROME_GID" chrome \
 
 COPY --chmod=0755 entrypoint.sh /entrypoint.sh
 
+# Managed Chrome policy (#106). Password leak detection opens a "password found
+# in a data breach" warning after a login with a leaked password, and in a
+# fleet nobody sees, that warning swallows every synthetic click until it is
+# dismissed: the page stays visible and focused but receives no input at all.
+# Only leak detection is off; the password manager, and the golden profile's
+# saved logins, are untouched. google-chrome reads /etc/opt/chrome, chromium
+# (the arm64 build) reads /etc/chromium.
+#
+# The directories are made first, 0755, on purpose: `COPY --chmod` applies its
+# mode to the parent directories it creates too, and a 0644 directory has no
+# execute bit, so Chrome (running as the chrome user) cannot enter it and
+# silently runs with no policy at all.
+RUN install -d -m 0755 /etc/opt/chrome/policies/managed /etc/chromium/policies/managed
+COPY --chmod=0644 chrome-policies/chikin.json /etc/opt/chrome/policies/managed/chikin.json
+COPY --chmod=0644 chrome-policies/chikin.json /etc/chromium/policies/managed/chikin.json
+
 # NOTE: the container starts as root so entrypoint.sh can self-chown the
 # /data profile volume (the gateway may provision a fresh, root-owned volume),
 # then drops to the unprivileged chrome user before launching anything.
