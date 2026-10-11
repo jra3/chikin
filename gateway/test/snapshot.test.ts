@@ -244,3 +244,32 @@ test("takeSnapshot: waits for a complete document before reading it, bounded (#1
     await fake.close();
   }
 });
+
+test("takeSnapshot: a readiness probe that never answers is bounded by settleMs, not the 25 s send timeout (#107)", async () => {
+  // An open alert() blocks Runtime.evaluate; the probe must give up at the
+  // settle deadline and leave the read its own timeout.
+  let probes = 0;
+  const fake = await startFakeCdp([
+    {
+      id: "P",
+      url: "https://example.org/",
+      evaluate: (p) => {
+        if (p.expression === "document.readyState") {
+          probes++;
+          return new Promise(() => {});
+        }
+        return PAGE_STATE;
+      },
+    },
+  ]);
+  try {
+    const t0 = Date.now();
+    const { snapshot } = await takeSnapshot({ ip: fake.ip, cdpPort: fake.port, settleMs: 300 });
+    const took = Date.now() - t0;
+    assert.equal(snapshot.title, "Checkout");
+    assert.ok(probes >= 1);
+    assert.ok(took < 2000, `the hung probe was cut off at the settle bound, took ${took} ms`);
+  } finally {
+    await fake.close();
+  }
+});
