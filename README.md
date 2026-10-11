@@ -122,7 +122,7 @@ A session's browser name (`inst-<pid>`) says *which profile* it drives, not *wha
                  "description": "debugging the OAuth callback" } }  // optional free text
 ```
 
-- **Required first.** Any browser tool (`navigate_page`, `new_page`, …) called before identifying returns an instructive error naming `chikin_identify`, the handle format, and an example. `initialize`, `tools/list`, `chikin_identify`, and `chikin_reset` are never blocked; `chikin_snapshot` and `chikin_act` are gated like browser tools.
+- **Required first.** Any browser tool (`navigate_page`, `new_page`, …) called before identifying returns an instructive error naming `chikin_identify`, the handle format, and an example. `initialize`, `tools/list`, `chikin_identify`, and `chikin_reset` are never blocked; `chikin_snapshot`, `chikin_act` and `chikin_achieve` are gated like browser tools.
 - **`handle` is required, unique across live sessions.** A handle already held by another live session is rejected with a clear error — pick another. It's a display/correlation label only; the sticky profile stays keyed by the browser *name* (identifying is orthogonal to the profile, and must be re-done on each reconnect).
 - **Surfaces everywhere:** a **handle** column in the dashboard, the session's log lines, and the noVNC page title.
 
@@ -163,7 +163,7 @@ With a decision model configured (`CHIKIN_ANTHROPIC_API_KEY`, see [Configuration
 - **Put every value in the goal.** Text to type comes from the goal; a value the goal does not give is never invented, and the loop stops BLOCKED instead.
 - **Consequential steps wait for you.** When the model marks the next row as committing something hard to undo, the loop stops with `needs_confirmation` and names the row. Do it yourself with `chikin_act` and that id, then call `chikin_achieve` again. Pass `allow_consequential: true` to let it through.
 - **DONE is the model's claim**, returned with the page it rests on. Check that page when it matters.
-- **Stops on its own** after three actions in a row that leave the page unchanged, after two answers naming rows that are not there, when the model declines, and when an input may not have completed (a JavaScript dialog). It never retries an input that landed.
+- **Stops on its own** after three actions in a row that leave the page unchanged, after two answers naming rows that are not there, when the model declines, when an input may not have completed (a JavaScript dialog), and when a row cannot be done because the tab is gone (nothing is input for that step). It never retries an input that landed.
 - **Long calls behave.** It sends one `notifications/progress` per step when the call carries a progress token, and a client cancel stops it between steps. Clients with a short request timeout should reset it on progress or raise it.
 
 ### Watch a browser / solve a captcha
