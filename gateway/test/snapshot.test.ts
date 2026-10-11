@@ -84,6 +84,12 @@ test("choosePage: no match and no page are distinct refusals", () => {
   assert.throws(() => choosePage([], {}), /No page is open/);
 });
 
+test("choosePage: a stale selection falls back to a lone page, but not to one of several", () => {
+  assert.equal(choosePage([page("fresh", "about:blank")], { selected: "https://example.org/gone" }).id, "fresh");
+  const pages = [page("a", "https://example.org/a"), page("b", "https://example.org/b")];
+  assert.throws(() => choosePage(pages, { selected: "https://example.org/gone" }), /No open page matches the selected page/);
+});
+
 // --- the read, on the wire --------------------------------------------------
 
 test("takeSnapshot: dials the page by id, evaluates the script once, strips the internals", async () => {

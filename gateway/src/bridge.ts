@@ -935,6 +935,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   async function startChild(gen: number, ip: string | null): Promise<StdioClientTransport> {
     currentIp = ip;
     cdpFailStreak = 0;
+    navNewest = { seq: navNewest.seq };
     // Connect by IP (not container name): Chrome's DevTools HTTP endpoint
     // rejects a DNS-name Host header but accepts an IP; socat in the container
     // bridges to Chrome's loopback CDP port.

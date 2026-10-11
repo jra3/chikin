@@ -114,7 +114,9 @@ export function choosePage(pages: CdpTarget[], prefer: { url?: string; selected?
     );
   };
   if (prefer.url) return pick(prefer.url, "url");
-  if (prefer.selected) return pick(prefer.selected, "the selected page");
+  if (prefer.selected && (pages.length !== 1 || pages.some((p) => sameDoc(p.url, prefer.selected!)))) {
+    return pick(prefer.selected, "the selected page");
+  }
   if (pages.length === 1) return pages[0];
   if (pages.length === 0) throw new PageChoiceError("No page is open; navigate somewhere first.");
   throw new PageChoiceError(

@@ -27,7 +27,12 @@ function handle(m) {
     reply({ protocolVersion: m.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "chrome_devtools", version: "0.0.0" }, instructions: "UPSTREAM DOC" });
   else if (m.method === "tools/list")
     reply({ tools: [{ name: "list_pages", description: "fake", inputSchema: { type: "object" } }] });
-  else if (m.method === "tools/call") { seen.push(m.params.name); reply({ content: [{ type: "text", text: "forwarded:" + seen.join(",") }] }); }
+  else if (m.method === "tools/call") {
+    seen.push(m.params.name);
+    const result = { content: [{ type: "text", text: "forwarded:" + seen.join(",") }] };
+    if (m.params.name === "navigate_page") result.structuredContent = { pages: [{ id: 1, url: "https://example.org/gone", selected: true }] };
+    reply(result);
+  }
   else reply({});
 }
 let buf = "";
@@ -63,6 +68,7 @@ process.env.PORT = String(port);
 process.env.CHROME_CDP_PORT = String(chromePort);
 process.env.CDM_COMMAND = fakeCdm;
 process.env.GATEWAY_TOKEN = "";
+process.env.NAV_VERIFY_DELAY_MS = "600000";
 
 const { createApp } = await import("../src/server.js");
 const { Registry } = await import("../src/registry.js");
@@ -174,6 +180,34 @@ test("chikin_snapshot: listed, gated, lazily provisioning, browser-active, and n
     assert.equal(bad.isError, true);
     assert.match(textOf(bad), /`url` must be a string/);
   } finally {
+    await close();
+  }
+});
+
+test("chikin_snapshot: a reset forgets the replaced child's selection; a stale one falls back to a lone page", async () => {
+  const { client, close } = await connect("inst-snap-reset");
+  try {
+    const ident = await client.callTool({ name: "chikin_identify", arguments: { handle: "snap-reset" } });
+    assert.notEqual(ident.isError, true, textOf(ident));
+    const nav = await client.callTool({ name: "navigate_page", arguments: { url: "https://example.org/gone" } });
+    assert.notEqual(nav.isError, true, textOf(nav));
+
+    const lone = await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    assert.notEqual(lone.isError, true, textOf(lone));
+    assert.equal((lone.structuredContent as { page?: { id?: string } }).page?.id, "P1");
+
+    chrome.pages.push({ id: "P2", url: "https://example.org/other", title: "Other" });
+    const stale = await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    assert.equal(stale.isError, true);
+    assert.match(textOf(stale), /No open page matches the selected page https:\/\/example\.org\/gone/);
+
+    const reset = await client.callTool({ name: "chikin_reset", arguments: {} });
+    assert.notEqual(reset.isError, true, textOf(reset));
+    const after = await client.callTool({ name: "chikin_snapshot", arguments: {} });
+    assert.equal(after.isError, true);
+    assert.match(textOf(after), /no page is selected yet/, "the replaced child's selection is forgotten");
+  } finally {
+    chrome.pages.splice(1);
     await close();
   }
 });
