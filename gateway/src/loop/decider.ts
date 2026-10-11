@@ -169,15 +169,15 @@ export class HaikuDecider implements Decider {
 
 /**
  * The same decision through OpenRouter's OpenAI-compatible chat completions,
- * which is where TypeSafe's Jev is hosted (`typesafe/jev-router`) alongside
- * `anthropic/claude-haiku-5.5` and the rest. Same rules, same prompt, same
- * schema; the answer is validated against `DECISION_SCHEMA` before it is used.
+ * for any non-`jev-*` model there (`anthropic/claude-haiku-5.5` and the rest).
+ * Same rules, same prompt, same schema; the answer is validated against
+ * `DECISION_SCHEMA` before it is used. Jev itself, through the System One API
+ * OpenRouter also serves, is `JevDecider` in `./jev.ts`.
  *
  * Note what `typesafe/jev-router` is on OpenRouter: a ROUTER that picks a
  * downstream model per request (it served `openai/gpt-6-luna` when probed on
- * 2026-10-11), not TypeSafe's System One choice API that jev-ultrafast calls.
- * The served model is reported back on every decision so a trace says which
- * model actually chose.
+ * 2026-10-11), not Jev. The served model is reported back on every decision so
+ * a trace says which model actually chose.
  *
  * Plain `fetch`, not an SDK: OpenRouter is a different provider, and its
  * request is one POST. For Anthropic models directly, `HaikuDecider` above

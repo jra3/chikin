@@ -148,7 +148,7 @@ The gateway injects two tools for fast, goal-driven use (issue #95). **`chikin_s
 
 ### Run a goal to the end (`chikin_achieve`)
 
-With a decision model configured (`CHIKIN_ANTHROPIC_API_KEY` or `CHIKIN_OPENROUTER_API_KEY`, see [Configuration](#configuration-fleet)), the gateway also offers **`chikin_achieve`**. The caller states a goal once. A fast loop inside the gateway then repeats three steps: read the page as a `chikin_snapshot` table, ask a fast model (Claude Haiku 5.5 by default) which row moves the goal forward, and do that row with `chikin_act`'s guards. It stops at DONE, at BLOCKED, or when a budget runs out. The caller gets back one result: the outcome, a step-by-step trace, and the page as it ended. That is one tool call where driving the page yourself costs a big-model round trip per click (issue #95).
+With a decision model configured (`CHIKIN_ANTHROPIC_API_KEY` or `CHIKIN_OPENROUTER_API_KEY`, see [Configuration](#configuration-fleet)), the gateway also offers **`chikin_achieve`**. The caller states a goal once. A fast loop inside the gateway then repeats three steps: read the page as a `chikin_snapshot` table, ask a fast model (Claude Haiku 5.5 by default, or TypeSafe's Jev on an OpenRouter key) which row moves the goal forward, and do that row with `chikin_act`'s guards. It stops at DONE, at BLOCKED, or when a budget runs out. The caller gets back one result: the outcome, a step-by-step trace, and the page as it ended. That is one tool call where driving the page yourself costs a big-model round trip per click (issue #95).
 
 ```jsonc
 { "name": "chikin_achieve", "arguments": {
