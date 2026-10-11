@@ -267,3 +267,30 @@ test("onStep sees every step as it happens", async () => {
   await runLoop(base({ decider, driver: driver().driver, onStep: (s) => seenSteps.push(s.step) }));
   assert.deepEqual(seenSteps, [1, 2]);
 });
+
+test("an act that throws (the page is gone) ends the loop as an error and keeps the trace so far", async () => {
+  const gone = (): ActOutcome => {
+    throw new Error("the page closed");
+  };
+  const { decider } = scripted([{ choice: "e2" }, { choice: "e3" }]);
+  const { driver: d, acted } = driver([() => ({ done: true, state: page(2) }), gone]);
+  const r = await runLoop(base({ decider, driver: d }));
+  assert.equal(r.status, "error");
+  assert.match(r.message, /click "Buy now" \(e3\) could not be done: the page closed\. Nothing was input/);
+  assert.doesNotMatch(r.message, /retry/i);
+  assert.deepEqual(r.steps.map((s) => [s.choice, s.outcome]), [["e2", "executed"], ["e3", "failed"]]);
+  assert.equal(r.steps[1].note, "the page closed");
+  assert.equal(r.state, null);
+  assert.equal(acted.length, 2);
+});
+
+test("a halt reason (session closed, browser restarted) stops the loop before the next decision", async () => {
+  let halt: string | null = null;
+  const { decider, seen } = scripted([{ choice: "e2" }, { choice: "DONE" }]);
+  const r = await runLoop(
+    base({ decider, driver: driver().driver, halted: () => halt, onStep: () => (halt = "the browser restarted") }),
+  );
+  assert.equal(r.status, "cancelled");
+  assert.match(r.message, /the browser restarted/);
+  assert.equal(seen.length, 1, "no second decision was asked for");
+});

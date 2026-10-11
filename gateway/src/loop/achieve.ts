@@ -46,7 +46,7 @@ export interface TraceStep {
   reason: string;
   consequential: boolean;
   /** What happened to the choice. */
-  outcome: "executed" | "sent-unconfirmed" | "refused" | "invalid" | "stopped";
+  outcome: "executed" | "sent-unconfirmed" | "refused" | "invalid" | "stopped" | "failed";
   page_changed: boolean | null;
   decide_ms: number;
   act_ms: number;
@@ -74,6 +74,8 @@ export interface LoopOptions {
   /** The first read, when the caller already has it. */
   initial?: PageState;
   signal?: AbortSignal;
+  /** Checked with `signal` between steps: a reason the loop must stop now (the session closed, the browser restarted). */
+  halted?: () => string | null;
   onStep?: (step: TraceStep) => void;
   now?: () => number;
 }
@@ -132,8 +134,15 @@ export async function runLoop(opts: LoopOptions): Promise<LoopResult> {
         page_changed: s.page_changed,
       }));
 
+  const interrupted = (): LoopResult | null => {
+    const why = opts.halted?.();
+    if (why) return stop("cancelled", `Stopped after ${steps.length} step(s): ${why}.`);
+    return opts.signal?.aborted ? stop("cancelled", `Cancelled after ${steps.length} step(s).`) : null;
+  };
+
   for (let step = 1; ; step++) {
-    if (opts.signal?.aborted) return stop("cancelled", `Cancelled after ${steps.length} step(s).`);
+    const early = interrupted();
+    if (early) return early;
     if (step > opts.maxSteps) return stop("budget", `Stopped at the ${opts.maxSteps}-step budget without DONE.`);
     if (now() >= deadline)
       return stop("budget", `Stopped at the ${Math.round(opts.deadlineMs / 1000)}s time budget without DONE.`);
@@ -156,7 +165,8 @@ export async function runLoop(opts: LoopOptions): Promise<LoopResult> {
     try {
       decision = await opts.decider.decide({ goal: opts.goal, table: renderSnapshot(state), recent: recent() }, opts.signal);
     } catch (e) {
-      if (opts.signal?.aborted) return stop("cancelled", `Cancelled after ${steps.length} step(s).`);
+      const halt = interrupted();
+      if (halt) return halt;
       if (e instanceof DeciderRefusedError) return stop("blocked", `${e.message}; nothing more was done.`);
       if (e instanceof DeciderError) return stop("error", `${e.message}; nothing more was done.`);
       throw e;
@@ -202,11 +212,20 @@ export async function runLoop(opts: LoopOptions): Promise<LoopResult> {
         { proposed: { id: row.id, label, kind: row.kind, text } },
       );
     }
-    if (opts.signal?.aborted) return stop("cancelled", `Cancelled after ${steps.length} step(s).`);
+    const late = interrupted();
+    if (late) return late;
 
     const before = markerOf(state);
     const t0 = performance.now();
-    const outcome = await opts.driver.act(state, row, text ?? undefined);
+    let outcome: ActOutcome;
+    try {
+      outcome = await opts.driver.act(state, row, text ?? undefined);
+    } catch (e) {
+      const why = String(e instanceof Error ? e.message : e);
+      record({ ...base, label, kind: row.kind, text, outcome: "failed", act_ms: Math.round(performance.now() - t0), note: why });
+      state = null;
+      return stop("error", `${row.kind} "${label}" (${row.id}) could not be done: ${why}. Nothing was input for that step; the page may be gone.`);
+    }
     const act_ms = Math.round(performance.now() - t0);
 
     if (outcome.done) {

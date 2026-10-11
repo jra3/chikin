@@ -260,3 +260,44 @@ test("chikin_achieve: a client cancel stops the loop between steps", async () =>
     await close();
   }
 });
+
+test("chikin_achieve: a cancel that arrives while the call is still queued stops it before any decision", async () => {
+  begin(1);
+  const before = clicks();
+  const { client, close } = await connect("inst-queued");
+  try {
+    // Hold the owned-call queue with a first loop whose decision waits.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let asked = 0;
+    script.push(async () => {
+      asked++;
+      await held;
+      return { choice: "BLOCKED" };
+    });
+    const first = client.callTool({ name: "chikin_achieve", arguments: { goal: "hold" } });
+    while (asked === 0) await new Promise((r) => setTimeout(r, 10));
+
+    const ctl = new AbortController();
+    const second = client.callTool({ name: "chikin_achieve", arguments: { goal: "queued" } }, CallToolResultSchema, {
+      signal: ctl.signal,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    ctl.abort();
+    await assert.rejects(second);
+    await new Promise((r) => setTimeout(r, 50));
+    script.push(async () => {
+      asked++;
+      return { choice: "e1" };
+    });
+    release();
+    const r = await first;
+    assert.match(textOf(r), /^BLOCKED/);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(asked, 1, "the cancelled call never asked the decider");
+    assert.equal(clicks(), before, "nothing was clicked");
+    script.length = 0;
+  } finally {
+    await close();
+  }
+});

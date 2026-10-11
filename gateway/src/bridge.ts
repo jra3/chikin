@@ -1347,8 +1347,15 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
 
   /** Queue a gateway-owned browser call behind any already running on this session. */
   function runOwned(f: Frame): void {
-    const handler =
-      f.params?.name === ACT_TOOL.name ? handleAct : f.params?.name === ACHIEVE_TOOL.name ? handleAchieve : handleSnapshot;
+    let handler: (f: Frame) => Promise<void> = f.params?.name === ACT_TOOL.name ? handleAct : handleSnapshot;
+    if (f.params?.name === ACHIEVE_TOOL.name) {
+      const abort = new AbortController();
+      if (f.id !== undefined) activeLoops.set(f.id, abort);
+      handler = (fr) =>
+        handleAchieve(fr, abort.signal).finally(() => {
+          if (fr.id !== undefined && activeLoops.get(fr.id) === abort) activeLoops.delete(fr.id);
+        });
+    }
     ownedChain = ownedChain.then(() => handler(f)).catch((e) => {
       log.warn(`session[${name}]: ${f.params?.name} failed`, String(e));
       replyTool(f.id, `${f.params?.name} failed (${String(e)}); retry the request`, true);
@@ -1539,7 +1546,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
    * checks for cancellation. The loop's final read becomes the session's table,
    * so a needs_confirmation row can be done with chikin_act by its id.
    */
-  async function handleAchieve(f: Frame): Promise<void> {
+  async function handleAchieve(f: Frame, signal: AbortSignal): Promise<void> {
     const args = f.params?.arguments ?? {};
     const decider = deciderFor(deps);
     if (!decider) {
@@ -1567,6 +1574,14 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       replyTool(f.id, "chikin browser restarting; retry the request", true);
       return;
     }
+    const t0 = Date.now();
+    const cancelledEarly = () => {
+      if (!signal.aborted) return false;
+      const result: LoopResult = { status: "cancelled", message: "Cancelled before the first step; nothing was done.", steps: [], state: null };
+      replyAchieve(f, result, t0, null, childGen);
+      return true;
+    };
+    if (cancelledEarly()) return;
     const gen = childGen;
     const ours =
       lastRead && lastRead.navSeq === navNewest.seq && lastRead.selEpoch === selectionEpoch ? lastRead.page.id : undefined;
@@ -1581,11 +1596,10 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       }
       throw e;
     }
+    if (cancelledEarly()) return;
 
-    const abort = new AbortController();
-    if (f.id !== undefined) activeLoops.set(f.id, abort);
     const progressToken = (f.params?._meta as { progressToken?: string | number } | undefined)?.progressToken;
-    const t0 = Date.now();
+    const seen: TraceStep[] = [];
     let result: LoopResult;
     try {
       result = await runLoop({
@@ -1596,14 +1610,15 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         allowConsequential: args.allow_consequential === true,
         decider,
         initial,
-        signal: abort.signal,
+        signal,
+        halted: () => (session.isClosed ? "the session closed" : childGen !== gen ? "the browser restarted" : null),
         driver: {
           read: () => readPage(ip, config.cdpPort, page),
           act: (state, row, text) => act({ ip, cdpPort: config.cdpPort, page, state, row, text }),
         },
         onStep: (s) => {
+          seen.push(s);
           deps.registry.touchBrowserActivity(name);
-          if (session.isClosed || childGen !== gen) abort.abort();
           if (progressToken === undefined || f.id === undefined) return;
           http
             .send(
@@ -1619,10 +1634,20 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
             });
         },
       });
-    } finally {
-      if (f.id !== undefined) activeLoops.delete(f.id);
+    } catch (e) {
+      log.warn(`session[${name}]: chikin_achieve loop failed`, String(e));
+      result = {
+        status: "error",
+        message: `The loop failed (${String(e instanceof Error ? e.message : e)}); nothing more was done.`,
+        steps: seen,
+        state: null,
+      };
     }
+    replyAchieve(f, result, t0, page, gen);
+  }
 
+  /** Reply to a chikin_achieve call with its outcome, its trace and, when it could be read, the page it stopped on. */
+  function replyAchieve(f: Frame, result: LoopResult, t0: number, page: CdpTarget | null, gen: number): void {
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     const head = `${result.status.toUpperCase()} after ${result.steps.length} step(s), ${secs}s: ${result.message}`;
     const trace = result.steps.map(stepLine).join("\n");
@@ -1634,18 +1659,19 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       ...(result.proposed ? { proposed: result.proposed } : {}),
     };
     const isError = result.status === "error";
-    if (result.state && childGen === gen) {
+    if (page && result.state && childGen === gen) {
       remember(gen, page, result.state);
       replyTable(f.id, `${lead}\n\nThe page now:`, page, result.state, isError, extra);
       return;
     }
-    if (lastRead?.page.id === page.id) lastRead = null;
+    if (page && lastRead?.page.id === page.id) lastRead = null;
     if (f.id === undefined || session.isClosed) return;
+    const tail = page ? "\n\nThe page could not be read at the end; call chikin_snapshot." : "";
     http
       .send({
         jsonrpc: "2.0",
         id: f.id,
-        result: { content: [{ type: "text", text: `${lead}\n\nThe page could not be read at the end; call chikin_snapshot.` }], structuredContent: extra, isError },
+        result: { content: [{ type: "text", text: `${lead}${tail}` }], structuredContent: extra, isError },
       } as JSONRPCMessage)
       .catch((e) => log.warn(`session[${name}]: achieve reply failed`, String(e)));
   }
@@ -1977,6 +2003,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     name,
     http,
     async () => {
+      for (const loop of activeLoops.values()) loop.abort();
       clearChildState();
       try {
         await child?.close();
