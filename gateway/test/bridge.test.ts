@@ -532,3 +532,17 @@ test("a superseded nav with nothing to compare is not judged", () => {
   assert.equal(shouldJudgeNav(nav(1, "https://a.example/"), { seq: 2 }), false);
   assert.equal(shouldJudgeNav(nav(1), { seq: 2 }), false);
 });
+
+// --- chikin_snapshot (#96): gated like a browser tool, answered by the gateway
+
+test("gate: chikin_snapshot is blocked before identify and routed to the gateway after", () => {
+  const snap = { method: "tools/call", params: { name: "chikin_snapshot" } };
+  assert.equal(classifyClientFrame(snap, false), "block", "it needs a browser, so it needs identity");
+  assert.equal(classifyClientFrame(snap, true), "snapshot", "never forwarded to the child");
+});
+
+test("chikin_snapshot IS browser work: it claims the slot and moves the activity clock", () => {
+  const snap = { method: "tools/call", params: { name: "chikin_snapshot" } };
+  assert.equal(isBrowserWork(snap, true), true);
+  assert.equal(isBrowserWork(snap, false), false, "blocked calls still are not");
+});

@@ -122,11 +122,22 @@ A session's browser name (`inst-<pid>`) says *which profile* it drives, not *wha
                  "description": "debugging the OAuth callback" } }  // optional free text
 ```
 
-- **Required first.** Any browser tool (`navigate_page`, `new_page`, …) called before identifying returns an instructive error naming `chikin_identify`, the handle format, and an example. `initialize`, `tools/list`, `chikin_identify`, and `chikin_reset` are never blocked.
+- **Required first.** Any browser tool (`navigate_page`, `new_page`, …) called before identifying returns an instructive error naming `chikin_identify`, the handle format, and an example. `initialize`, `tools/list`, `chikin_identify`, and `chikin_reset` are never blocked; `chikin_snapshot` is gated like a browser tool.
 - **`handle` is required, unique across live sessions.** A handle already held by another live session is rejected with a clear error — pick another. It's a display/correlation label only; the sticky profile stays keyed by the browser *name* (identifying is orthogonal to the profile, and must be re-done on each reconnect).
 - **Surfaces everywhere:** a **handle** column in the dashboard, the session's log lines, and the noVNC page title.
 
 **Self-directing — no docs required.** A caller with zero prior knowledge of chikin is steered to correct usage by the MCP itself: the `initialize` result's `instructions` state the contract up front, `chikin_identify`'s own tool description is fully self-explanatory (format, uniqueness rule, worked example), and the gating error on any premature browser tool is actionable. A Claude-driven client therefore adapts automatically — no client changes needed beyond letting it read the MCP's own context.
+
+### Read the page as an action table (`chikin_snapshot`)
+
+The gateway also injects **`chikin_snapshot`**: one atomic read of the selected page as a numbered table of every visible, enabled control (`e1`, `e2`, …) with its role, label and current value, plus the visible text. It is the observation half of a fast decision loop (issue #95): a model reads the table and picks a row, instead of parsing an accessibility tree. The read goes over the gateway's **own CDP connection** to the browser, never through chrome-devtools-mcp, so it neither waits on nor holds the child's per-session tool mutex — a `take_screenshot` stuck on a background tab does not stall it.
+
+```jsonc
+{ "name": "chikin_snapshot", "arguments": {} }                                  // the page the last navigation selected
+{ "name": "chikin_snapshot", "arguments": { "url": "https://example.org/x" } }  // a named open page (origin + path)
+```
+
+It is gated like any browser tool (identify first), provisions the browser on first use, and counts as browser activity. It only reads: act with the usual `click` / `fill` tools afterwards. When more than one open page fits, or none does, it refuses and lists what is open rather than guessing (a selection that no longer matches falls back to the only open page, if there is just one); between navigations a client's own `select_page` moves the child's selection without telling the gateway, so pass `url` when in doubt. Shadow DOM and frames are not traversed (the in-page script is Browser Use's [jev-ultrafast](https://github.com/browser-use/jev-ultrafast) observation script, verbatim).
 
 ### Watch a browser / solve a captcha
 

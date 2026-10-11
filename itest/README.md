@@ -54,6 +54,39 @@ was already there alone, and it refuses outright to run against a name that is
 not `inst-*` — the cleanup is a `docker volume rm`, and a sticky profile is not
 something a test may put at risk.
 
+`snapshot.mjs` is the evidence #96 was built to produce: on real pages, is
+`chikin_snapshot`'s indexed action table smaller and faster than upstream's
+`take_snapshot`? It provisions one browser, navigates it to each URL, calls
+both tools several times, and prints median tokens (bytes/4) and round-trip
+milliseconds per page, plus the first lines of each table so the output can be
+eyeballed. Same cleanup rules as `cdp-playwright.mjs`: `inst-*` names only, and
+it removes only the container and volume it created.
+
+```bash
+BASE=http://localhost:18096 node snapshot.mjs inst-snap1                  # three default pages
+BASE=http://localhost:18096 node snapshot.mjs inst-snap1 https://a.test/ # your own
+```
+
+A scratch gateway for it, from a locally built image, on a port nothing else
+holds (`ss -ltn`), with reaping and the volume sweep off and no seed volume:
+
+```bash
+docker build -t chikin-gateway:scratch gateway/
+P=18096
+docker create --name chikin-gateway-scratch --init --network chikin-control -p 127.0.0.1:$P:$P \
+  -e HOST=0.0.0.0 -e PORT=$P -e MAX_FLEET=3 -e CHIKIN_VOLUME_GC=0 -e SEED_VOLUME= \
+  -e IDLE_TTL_SEC=100000 -e ATTACHED_IDLE_TTL_SEC=0 -e REAP_INTERVAL_SEC=100000 \
+  -e CHROME_IMAGE=chikin:local -e CHIKIN_NETWORK=chikin-net -e CHIKIN_EGRESS_NETWORK=chikin-egress \
+  -e SHARED_DIR=/tmp/chikin-shared -e DOCKER_PROXY_HOST=docker-socket-proxy -e DOCKER_PROXY_PORT=2375 \
+  chikin-gateway:scratch
+docker network connect chikin-net chikin-gateway-scratch
+docker network connect chikin-egress chikin-gateway-scratch   # before start, so it binds loopback + egress, not all interfaces
+docker start chikin-gateway-scratch
+```
+
+`PORT` inside the container must equal the published port: the MCP Host guard
+trusts `127.0.0.1:<PORT>` and answers `forbidden host` otherwise.
+
 `reaper-helper.mjs` drives the live reaper test. Every mode calls
 `chikin_identify` before touching a browser tool (the gate added in #54) and
 exits non-zero the moment the gateway refuses a call. `hold` keeps one real
