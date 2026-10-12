@@ -50,6 +50,11 @@ export interface Decision {
   ms: number;
   /** The model that actually answered, when the provider says (a router names its pick). */
   model?: string;
+  /**
+   * How sure the decider was of the operation it picked, 0-1, when it can say
+   * (Jev's calibrated probability). A generative decider leaves it unset.
+   */
+  confidence?: number;
 }
 
 export interface Decider {
@@ -258,3 +263,43 @@ export class OpenRouterDecider implements Decider {
     return { ...out.data, ms: Math.round(performance.now() - t0), model: j?.model };
   }
 }
+
+/**
+ * Hand a decision the first decider is unsure of to a second one (#109). This is
+ * TypeSafe's confidence-routing pattern: Jev answers in a few hundred ms with a
+ * calibrated probability, and in every live run the wrong steps were the
+ * unsure ones (operation p 0.42-0.55: a footer link instead of waiting, a
+ * BLOCKED on a page still rendering) while the right ones sat above 0.7. Below
+ * the threshold that one step goes to the generative model; the rest stay
+ * fast. A decision with no confidence (a generative first decider) is never
+ * escalated.
+ */
+export class EscalatingDecider implements Decider {
+  constructor(
+    private readonly first: Decider,
+    private readonly fallback: Decider,
+    private readonly threshold = ESCALATE_BELOW,
+  ) {}
+
+  async decide(input: DecisionInput, signal?: AbortSignal): Promise<Decision> {
+    const d = await this.first.decide(input, signal);
+    if (d.confidence === undefined || d.confidence >= this.threshold) return d;
+    const why = `${d.choice} at p=${d.confidence.toFixed(2)} < ${this.threshold}`;
+    let f: Decision;
+    try {
+      f = await this.fallback.decide(input, signal);
+    } catch (e) {
+      if (signal?.aborted || !(e instanceof DeciderError)) throw e;
+      return { ...d, reason: `escalation (${why}) failed (${e.message}); kept the first pick: ${d.reason}` };
+    }
+    return {
+      ...f,
+      consequential: f.choice === d.choice ? f.consequential || d.consequential : f.consequential,
+      ms: d.ms + f.ms,
+      reason: `escalated (${why}): ${f.reason}`,
+    };
+  }
+}
+
+/** Below this operation probability, a Jev decision is escalated. */
+export const ESCALATE_BELOW = 0.6;

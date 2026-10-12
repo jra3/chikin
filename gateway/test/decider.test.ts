@@ -1,7 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Anthropic from "@anthropic-ai/sdk";
-import { HaikuDecider, OpenRouterDecider, DeciderError, DeciderRefusedError, RULES, type MessagesClient } from "../src/loop/decider.js";
+import {
+  HaikuDecider,
+  OpenRouterDecider,
+  EscalatingDecider,
+  ESCALATE_BELOW,
+  DeciderError,
+  DeciderRefusedError,
+  RULES,
+  type Decider,
+  type Decision,
+  type MessagesClient,
+} from "../src/loop/decider.js";
 
 /**
  * The decider's request and its handling of what comes back (#103), against a
@@ -137,4 +148,115 @@ test("OpenRouter: one retry on 429/5xx, then the status is reported; a 401 is no
   const auth = fakeFetch([{ status: 401, body: { error: { message: "No auth" } } }]);
   await assert.rejects(new OpenRouterDecider({ apiKey: "k", model: "m", fetch: auth.f }).decide(input), /\(401\): No auth/);
   assert.equal(auth.calls.length, 1);
+});
+
+// --- escalation (#109) ------------------------------------------------------
+
+
+function fixed(d: Partial<Decision>, calls: string[], name: string): Decider {
+  return {
+    decide: async () => {
+      calls.push(name);
+      return { choice: "e1", text: null, consequential: false, reason: name, ms: 100, ...d };
+    },
+  };
+}
+
+test("a sure first decision stands; the fallback is never asked", async () => {
+  const calls: string[] = [];
+  const out = await new EscalatingDecider(fixed({ choice: "e2", confidence: 0.9 }, calls, "jev"), fixed({}, calls, "haiku")).decide(input);
+  assert.equal(out.choice, "e2");
+  assert.deepEqual(calls, ["jev"]);
+});
+
+test("below the threshold the step goes to the fallback, and the trace says why", async () => {
+  const calls: string[] = [];
+  const out = await new EscalatingDecider(
+    fixed({ choice: "e9", confidence: 0.48 }, calls, "jev"),
+    fixed({ choice: "wait", reason: "the list is still loading", model: "anthropic/claude-haiku-5.5" }, calls, "haiku"),
+  ).decide(input);
+  assert.deepEqual(calls, ["jev", "haiku"]);
+  assert.equal(out.choice, "wait", "the fallback's choice is the one taken");
+  assert.equal(out.model, "anthropic/claude-haiku-5.5");
+  assert.equal(out.ms, 200, "both calls are counted");
+  assert.match(out.reason, /^escalated \(e9 at p=0\.48 < 0\.6\): the list is still loading$/);
+});
+
+test("low-confidence DONE and BLOCKED are escalated too; a decision without confidence never is", async () => {
+  for (const choice of ["DONE", "BLOCKED"]) {
+    const calls: string[] = [];
+    await new EscalatingDecider(fixed({ choice, confidence: 0.51 }, calls, "jev"), fixed({}, calls, "haiku")).decide(input);
+    assert.deepEqual(calls, ["jev", "haiku"], choice);
+  }
+  const calls: string[] = [];
+  await new EscalatingDecider(fixed({ choice: "e1" }, calls, "haiku-first"), fixed({}, calls, "other")).decide(input);
+  assert.deepEqual(calls, ["haiku-first"]);
+  assert.equal(ESCALATE_BELOW, 0.6);
+});
+
+function failing(err: Error, calls: string[], name: string): Decider {
+  return {
+    decide: async () => {
+      calls.push(name);
+      throw err;
+    },
+  };
+}
+
+test("a fallback that fails keeps the first pick, and the trace says so", async () => {
+  const calls: string[] = [];
+  const out = await new EscalatingDecider(
+    fixed({ choice: "e4", text: "hi", consequential: true, confidence: 0.52, reason: "the search box" }, calls, "jev"),
+    failing(new DeciderError("decision model call failed (503): down"), calls, "haiku"),
+  ).decide(input);
+  assert.deepEqual(calls, ["jev", "haiku"]);
+  assert.equal(out.choice, "e4");
+  assert.equal(out.text, "hi");
+  assert.equal(out.consequential, true);
+  assert.equal(out.confidence, 0.52);
+  assert.equal(out.ms, 100);
+  assert.match(out.reason, /^escalation \(e4 at p=0\.52 < 0\.6\) failed \(decision model call failed \(503\): down\); kept the first pick: the search box$/);
+});
+
+test("a fallback refusal or an abort still stops the step", async () => {
+  await assert.rejects(
+    new EscalatingDecider(
+      fixed({ confidence: 0.4 }, [], "jev"),
+      failing(new DeciderRefusedError("the decision model declined"), [], "haiku"),
+    ).decide(input),
+    DeciderRefusedError,
+  );
+  const ac = new AbortController();
+  ac.abort();
+  await assert.rejects(
+    new EscalatingDecider(
+      fixed({ confidence: 0.4 }, [], "jev"),
+      failing(new DeciderError("decision model call failed: aborted"), [], "haiku"),
+    ).decide(input, ac.signal),
+    DeciderError,
+  );
+  const abort = new DOMException("aborted", "AbortError");
+  await assert.rejects(
+    new EscalatingDecider(fixed({ confidence: 0.4 }, [], "jev"), failing(abort, [], "haiku")).decide(input),
+    (e: unknown) => e === abort,
+  );
+});
+
+test("a consequential flag survives escalation when both pick the same row, not otherwise", async () => {
+  const same = await new EscalatingDecider(
+    fixed({ choice: "e3", consequential: true, confidence: 0.5 }, [], "jev"),
+    fixed({ choice: "e3", consequential: false }, [], "haiku"),
+  ).decide(input);
+  assert.equal(same.consequential, true);
+  const other = await new EscalatingDecider(
+    fixed({ choice: "e3", consequential: true, confidence: 0.5 }, [], "jev"),
+    fixed({ choice: "e7", consequential: false }, [], "haiku"),
+  ).decide(input);
+  assert.equal(other.choice, "e7");
+  assert.equal(other.consequential, false);
+  const fallbackFlags = await new EscalatingDecider(
+    fixed({ choice: "e3", consequential: false, confidence: 0.5 }, [], "jev"),
+    fixed({ choice: "e7", consequential: true }, [], "haiku"),
+  ).decide(input);
+  assert.equal(fallbackFlags.consequential, true);
 });
