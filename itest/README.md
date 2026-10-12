@@ -86,7 +86,8 @@ default) has three: a Wikipedia search, a Hacker News page, and an httpbin
 pizza order, which ends at a final submit and so must come back
 `needs_confirmation`. `--suite hard` (#105) adds multi-step, form, async and
 checkout goals; its shadow DOM, iframe and JavaScript alert goals are marked
-expected limits and report `LIMIT` without failing the run. `--only <part>`
+expected limits and report `LIMIT` without failing the run, unless the
+harness or gateway threw, which is a `FAIL`. `--only <part>`
 runs the goals whose name contains `<part>`. Each goal gets a fresh browser and
 one call, and passes only when its check of the page itself (a probe or the
 final URL) holds; the model's DONE is never the evidence. The script prints the
