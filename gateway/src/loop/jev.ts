@@ -312,6 +312,7 @@ export class JevDecider implements Decider {
         reason: `Jev ${op} p=${pct(opAnswer.probabilities[op])} confidence ${pct(opAnswer.confidence)}`,
         ms: Math.round(performance.now() - t0),
         model: result.model,
+        confidence: opAnswer.probabilities[op],
       };
 
     let row: SnapshotAction;
@@ -372,6 +373,7 @@ export class JevDecider implements Decider {
       reason: fromGoal ? `${reason}, ${fromGoal}` : helperModel ? `${reason}, text by ${helperModel}` : reason,
       ms: Math.round(performance.now() - t0),
       model: result.model,
+      confidence: opAnswer.probabilities[op],
     };
   }
 }

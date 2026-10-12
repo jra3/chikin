@@ -22,7 +22,7 @@ import {
 } from "./snapshot/index.js";
 import { act, ActPageGoneError, ActRequestError, resolveRow } from "./snapshot/act.js";
 import Anthropic from "@anthropic-ai/sdk";
-import { HaikuDecider, OpenRouterDecider, type Decider } from "./loop/decider.js";
+import { EscalatingDecider, HaikuDecider, OpenRouterDecider, type Decider } from "./loop/decider.js";
 import { jevOverOpenRouter } from "./loop/jev.js";
 import { normaliseOrigins, runLoop, type LoopResult, type TraceStep } from "./loop/achieve.js";
 
@@ -45,7 +45,10 @@ function deciderFor(deps: BridgeDeps): Decider | null {
     provider === "anthropic"
       ? new HaikuDecider({ client: new Anthropic({ apiKey: config.deciderApiKey }), model })
       : deciderIsJev()
-        ? jevOverOpenRouter(config.openrouterApiKey, model, textModel() as string)
+        ? new EscalatingDecider(
+            jevOverOpenRouter(config.openrouterApiKey, model, textModel() as string),
+            new OpenRouterDecider({ apiKey: config.openrouterApiKey, model: textModel() as string }),
+          )
         : new OpenRouterDecider({ apiKey: config.openrouterApiKey, model });
   return configuredDecider;
 }

@@ -97,6 +97,7 @@ let removed = 0;
     let steps = [];
     let ms = 0;
     let ok = false;
+    let crashed = false;
     try {
       browser = await openBrowser(`${NAME}-${++n}`);
       client = browser.client;
@@ -129,10 +130,13 @@ let removed = 0;
       if (g.cleanup) await g.cleanup({ probe, call });
     } catch (e) {
       console.log(`      !! ${String(e?.message ?? e).slice(0, 200)}`);
+      // A harness or gateway failure is never an expected limit: it says
+      // nothing about what the design can do (#105 review).
+      crashed = true;
     } finally {
       if (browser) removed += await browser.close();
     }
-    const verdict = ok ? "PASS" : g.limit ? "LIMIT" : "FAIL";
+    const verdict = ok ? "PASS" : g.limit && !crashed ? "LIMIT" : "FAIL";
     if (verdict === "FAIL") failures++;
     console.log(`${verdict}  ${g.name}: ${sc.status ?? "no result"} (wanted ${g.want}), final url ${sc.url ?? "?"}`);
     const decide = steps.map((s) => s.decide_ms).filter((x) => x > 0).sort((a, b) => a - b);

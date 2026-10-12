@@ -1,7 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Anthropic from "@anthropic-ai/sdk";
-import { HaikuDecider, OpenRouterDecider, DeciderError, DeciderRefusedError, RULES, type MessagesClient } from "../src/loop/decider.js";
+import {
+  HaikuDecider,
+  OpenRouterDecider,
+  EscalatingDecider,
+  ESCALATE_BELOW,
+  DeciderError,
+  DeciderRefusedError,
+  RULES,
+  type Decider,
+  type Decision,
+  type MessagesClient,
+} from "../src/loop/decider.js";
 
 /**
  * The decider's request and its handling of what comes back (#103), against a
@@ -137,4 +148,48 @@ test("OpenRouter: one retry on 429/5xx, then the status is reported; a 401 is no
   const auth = fakeFetch([{ status: 401, body: { error: { message: "No auth" } } }]);
   await assert.rejects(new OpenRouterDecider({ apiKey: "k", model: "m", fetch: auth.f }).decide(input), /\(401\): No auth/);
   assert.equal(auth.calls.length, 1);
+});
+
+// --- escalation (#109) ------------------------------------------------------
+
+
+function fixed(d: Partial<Decision>, calls: string[], name: string): Decider {
+  return {
+    decide: async () => {
+      calls.push(name);
+      return { choice: "e1", text: null, consequential: false, reason: name, ms: 100, ...d };
+    },
+  };
+}
+
+test("a sure first decision stands; the fallback is never asked", async () => {
+  const calls: string[] = [];
+  const out = await new EscalatingDecider(fixed({ choice: "e2", confidence: 0.9 }, calls, "jev"), fixed({}, calls, "haiku")).decide(input);
+  assert.equal(out.choice, "e2");
+  assert.deepEqual(calls, ["jev"]);
+});
+
+test("below the threshold the step goes to the fallback, and the trace says why", async () => {
+  const calls: string[] = [];
+  const out = await new EscalatingDecider(
+    fixed({ choice: "e9", confidence: 0.48 }, calls, "jev"),
+    fixed({ choice: "wait", reason: "the list is still loading", model: "anthropic/claude-haiku-5.5" }, calls, "haiku"),
+  ).decide(input);
+  assert.deepEqual(calls, ["jev", "haiku"]);
+  assert.equal(out.choice, "wait", "the fallback's choice is the one taken");
+  assert.equal(out.model, "anthropic/claude-haiku-5.5");
+  assert.equal(out.ms, 200, "both calls are counted");
+  assert.match(out.reason, /^escalated \(e9 at p=0\.48 < 0\.6\): the list is still loading$/);
+});
+
+test("low-confidence DONE and BLOCKED are escalated too; a decision without confidence never is", async () => {
+  for (const choice of ["DONE", "BLOCKED"]) {
+    const calls: string[] = [];
+    await new EscalatingDecider(fixed({ choice, confidence: 0.51 }, calls, "jev"), fixed({}, calls, "haiku")).decide(input);
+    assert.deepEqual(calls, ["jev", "haiku"], choice);
+  }
+  const calls: string[] = [];
+  await new EscalatingDecider(fixed({ choice: "e1" }, calls, "haiku-first"), fixed({}, calls, "other")).decide(input);
+  assert.deepEqual(calls, ["haiku-first"]);
+  assert.equal(ESCALATE_BELOW, 0.6);
 });

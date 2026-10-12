@@ -92,6 +92,7 @@ test("one request asks the operation and a target head per operation; only the c
   const d = new JevDecider({ client: c, model: "jev-latest", text: noText });
   const out = await d.decide(input);
   assert.equal(out.choice, "e3");
+  assert.equal(out.confidence, 1, "the operation's probability is reported for escalation (#109)");
   assert.equal(out.consequential, true, "a second Jev question flags Buy now");
   assert.equal(out.model, "typesafe/jev-1.13-test");
   const first = calls[0];
