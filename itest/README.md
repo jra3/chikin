@@ -81,10 +81,16 @@ BASE=http://localhost:18096 node act-guards.mjs inst-actguards
 ```
 
 `achieve.mjs` measures `chikin_achieve` (#103) on real goals with a real
-decision model. It uses three goals: a Wikipedia search, a Hacker News page,
-and an httpbin pizza order. The order ends at a final submit, so it must come
-back `needs_confirmation`. Each goal is one call. The script prints the trace,
-the decision and act time per step, and a summary table. It needs the scratch
+decision model. The goals live in `achieve-goals.mjs`. `--suite basic` (the
+default) has three: a Wikipedia search, a Hacker News page, and an httpbin
+pizza order, which ends at a final submit and so must come back
+`needs_confirmation`. `--suite hard` (#105) adds multi-step, form, async and
+checkout goals; its shadow DOM, iframe and JavaScript alert goals are marked
+expected limits and report `LIMIT` without failing the run. `--only <part>`
+runs the goals whose name contains `<part>`. Each goal gets a fresh browser and
+one call, and passes only when its check of the page itself (a probe or the
+final URL) holds; the model's DONE is never the evidence. The script prints the
+trace, the decision and act time per step, and a summary table. It needs the scratch
 gateway started with `-e CHIKIN_ANTHROPIC_API_KEY=<key>` or
 `-e CHIKIN_OPENROUTER_API_KEY=<key>` (Jev, `jev-latest`, by default; add
 `-e CHIKIN_DECIDER_MODEL=...` to compare another model, e.g.
@@ -94,7 +100,7 @@ so it never lands in shell history. Without a key the gateway reports
 `achieve: false` and the script prints `SKIP`.
 
 ```bash
-BASE=http://localhost:18096 node achieve.mjs inst-achieve
+BASE=http://localhost:18096 node achieve.mjs inst-achieve [--suite hard] [--only <part>]
 ```
 
 A scratch gateway for these, from a locally built image, on a port nothing else

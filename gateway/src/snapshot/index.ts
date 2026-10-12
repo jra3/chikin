@@ -157,6 +157,12 @@ export interface TakeSnapshotOptions {
   selected?: string;
   /** Per-call deadline for the in-page read. Jev's harness allows 25s. */
   evaluateTimeoutMs?: number;
+  /**
+   * How long to keep re-reading a document that is still loading (no body
+   * yet, or torn down mid-read) before reporting it (#107). A cold browser
+   * hands back `navigate_page` before the body exists.
+   */
+  settleMs?: number;
 }
 
 /** The websocket for one page target, built from its id. */
@@ -206,8 +212,29 @@ export async function takeSnapshot(
   const page = choosePage(await listPages(opts.ip, opts.cdpPort), opts);
   const client = await CdpClient.connect(pageSocketUrl(opts.ip, opts.cdpPort, page.id));
   try {
-    const state = await readState(client, opts.evaluateTimeoutMs);
-    return { page, snapshot: publicSnapshot(state), state };
+    const deadline = Date.now() + (opts.settleMs ?? 3000);
+    // Before the first read of a call, let a loading document finish, as
+    // jev-ultrafast does after navigating: a page with a body but its scripts
+    // still loading shows controls whose handlers are not attached yet, and a
+    // click on one does nothing (#107). Bounded; a page that never completes
+    // is read as it is.
+    while (Date.now() < deadline) {
+      const probeMs = Math.min(opts.evaluateTimeoutMs ?? 25_000, Math.max(1, deadline - Date.now()));
+      const r = (await client
+        .send("Runtime.evaluate", { expression: "document.readyState", returnByValue: true }, probeMs)
+        .catch(() => null)) as { result?: { value?: unknown } } | null;
+      if (r?.result?.value === "complete") break;
+      await new Promise((res) => setTimeout(res, 100));
+    }
+    for (;;) {
+      try {
+        const state = await readState(client, opts.evaluateTimeoutMs);
+        return { page, snapshot: publicSnapshot(state), state };
+      } catch (e) {
+        if (!(e instanceof StalePageError) || Date.now() >= deadline) throw e;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
   } finally {
     client.close();
   }
