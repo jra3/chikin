@@ -193,3 +193,70 @@ test("low-confidence DONE and BLOCKED are escalated too; a decision without conf
   assert.deepEqual(calls, ["haiku-first"]);
   assert.equal(ESCALATE_BELOW, 0.6);
 });
+
+function failing(err: Error, calls: string[], name: string): Decider {
+  return {
+    decide: async () => {
+      calls.push(name);
+      throw err;
+    },
+  };
+}
+
+test("a fallback that fails keeps the first pick, and the trace says so", async () => {
+  const calls: string[] = [];
+  const out = await new EscalatingDecider(
+    fixed({ choice: "e4", text: "hi", consequential: true, confidence: 0.52, reason: "the search box" }, calls, "jev"),
+    failing(new DeciderError("decision model call failed (503): down"), calls, "haiku"),
+  ).decide(input);
+  assert.deepEqual(calls, ["jev", "haiku"]);
+  assert.equal(out.choice, "e4");
+  assert.equal(out.text, "hi");
+  assert.equal(out.consequential, true);
+  assert.equal(out.confidence, 0.52);
+  assert.equal(out.ms, 100);
+  assert.match(out.reason, /^escalation \(e4 at p=0\.52 < 0\.6\) failed \(decision model call failed \(503\): down\); kept the first pick: the search box$/);
+});
+
+test("a fallback refusal or an abort still stops the step", async () => {
+  await assert.rejects(
+    new EscalatingDecider(
+      fixed({ confidence: 0.4 }, [], "jev"),
+      failing(new DeciderRefusedError("the decision model declined"), [], "haiku"),
+    ).decide(input),
+    DeciderRefusedError,
+  );
+  const ac = new AbortController();
+  ac.abort();
+  await assert.rejects(
+    new EscalatingDecider(
+      fixed({ confidence: 0.4 }, [], "jev"),
+      failing(new DeciderError("decision model call failed: aborted"), [], "haiku"),
+    ).decide(input, ac.signal),
+    DeciderError,
+  );
+  const abort = new DOMException("aborted", "AbortError");
+  await assert.rejects(
+    new EscalatingDecider(fixed({ confidence: 0.4 }, [], "jev"), failing(abort, [], "haiku")).decide(input),
+    (e: unknown) => e === abort,
+  );
+});
+
+test("a consequential flag survives escalation when both pick the same row, not otherwise", async () => {
+  const same = await new EscalatingDecider(
+    fixed({ choice: "e3", consequential: true, confidence: 0.5 }, [], "jev"),
+    fixed({ choice: "e3", consequential: false }, [], "haiku"),
+  ).decide(input);
+  assert.equal(same.consequential, true);
+  const other = await new EscalatingDecider(
+    fixed({ choice: "e3", consequential: true, confidence: 0.5 }, [], "jev"),
+    fixed({ choice: "e7", consequential: false }, [], "haiku"),
+  ).decide(input);
+  assert.equal(other.choice, "e7");
+  assert.equal(other.consequential, false);
+  const fallbackFlags = await new EscalatingDecider(
+    fixed({ choice: "e3", consequential: false, confidence: 0.5 }, [], "jev"),
+    fixed({ choice: "e7", consequential: true }, [], "haiku"),
+  ).decide(input);
+  assert.equal(fallbackFlags.consequential, true);
+});

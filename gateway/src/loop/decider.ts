@@ -284,11 +284,19 @@ export class EscalatingDecider implements Decider {
   async decide(input: DecisionInput, signal?: AbortSignal): Promise<Decision> {
     const d = await this.first.decide(input, signal);
     if (d.confidence === undefined || d.confidence >= this.threshold) return d;
-    const f = await this.fallback.decide(input, signal);
+    const why = `${d.choice} at p=${d.confidence.toFixed(2)} < ${this.threshold}`;
+    let f: Decision;
+    try {
+      f = await this.fallback.decide(input, signal);
+    } catch (e) {
+      if (signal?.aborted || !(e instanceof DeciderError)) throw e;
+      return { ...d, reason: `escalation (${why}) failed (${e.message}); kept the first pick: ${d.reason}` };
+    }
     return {
       ...f,
+      consequential: f.choice === d.choice ? f.consequential || d.consequential : f.consequential,
       ms: d.ms + f.ms,
-      reason: `escalated (${d.choice} at p=${d.confidence.toFixed(2)} < ${this.threshold}): ${f.reason}`,
+      reason: `escalated (${why}): ${f.reason}`,
     };
   }
 }
