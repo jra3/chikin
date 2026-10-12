@@ -66,7 +66,15 @@ const guardJs = (node: number): string =>
 /**
  * browser.py `browser_operation` act: resolve the observed node, refuse it if it
  * is gone, disabled, hidden, read-only (fill), off-screen or covered, apply a
- * native select in page, and return the centre to click at.
+ * native select in page, and return the point to click at.
+ *
+ * One departure from browser.py (#113): the point is the box centre only when
+ * that centre hits the element. An inline link that wraps onto a short second
+ * line has a box centre in the empty space beside that line, where
+ * `elementFromPoint` finds the container, so every wrapped link read as
+ * "covered". The centre of each line box (`getClientRects`) is tried next, and
+ * the element is still refused when none of them hits it: an overlay covers
+ * every line.
  */
 const targetJs = (action: SnapshotAction): string =>
   String.raw`(action => {
@@ -74,9 +82,14 @@ const targetJs = (action: SnapshotAction): string =>
   if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
       !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
   if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
-  const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-  if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-  if (!e.contains(document.elementFromPoint(x,y))) return null;
+  const r=e.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  const inView=([x,y])=>x>=0 && y>=0 && x<innerWidth && y<innerHeight;
+  const hits=([x,y])=>e.contains(document.elementFromPoint(x,y));
+  const point=[[r.x+r.width/2, r.y+r.height/2],
+    ...[...e.getClientRects()].map(q=>[q.x+q.width/2, q.y+q.height/2])].find(p=>inView(p) && hits(p));
+  if (!point) return null;
+  const [x,y]=point;
   if (action.kind==='select') {
     if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
         !o.disabled && !o.closest('optgroup[disabled]'))) return null;

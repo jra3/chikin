@@ -120,6 +120,8 @@ docker network connect chikin-egress chikin-gateway-scratch   # before start, so
 docker start chikin-gateway-scratch
 ```
 
+`MAX_FLEET` counts every `chikin-chrome-*` container on the host, the live fleet's included. With three live browsers, a scratch cap of 3 is already full; set it to the live count plus the few this run needs.
+
 `PORT` inside the container must equal the published port: the MCP Host guard
 trusts `127.0.0.1:<PORT>` and answers `forbidden host` otherwise.
 
