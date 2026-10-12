@@ -14,6 +14,8 @@
  *   re-sends;
  * - an input that landed is never retried, even when the read after it fails;
  * - three consecutive non-wait actions that left the page unchanged is a stall;
+ * - the same row refused three times in a row for the same reason is BLOCKED
+ *   (chikin's own rule, #113);
  * - DONE is the model's claim, returned with the page it rests on.
  */
 
