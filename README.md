@@ -163,7 +163,7 @@ With a decision model configured (`CHIKIN_ANTHROPIC_API_KEY` or `CHIKIN_OPENROUT
 - **Put every value in the goal.** Text to type comes from the goal; a value the goal does not give is never invented, and the loop stops BLOCKED instead.
 - **Consequential steps wait for you.** When the model marks the next row as committing something hard to undo, the loop stops with `needs_confirmation` and names the row. Do it yourself with `chikin_act` and that id, then call `chikin_achieve` again. Pass `allow_consequential: true` to let it through.
 - **DONE is the model's claim**, returned with the page it rests on. Check that page when it matters.
-- **Stops on its own** after three actions in a row that leave the page unchanged, after two answers naming rows that are not there, when the model declines, when an input may not have completed (a JavaScript dialog), and when a row cannot be done because the tab is gone (nothing is input for that step). It never retries an input that landed.
+- **Stops on its own** after three actions in a row that leave the page unchanged, after two answers naming rows that are not there, after the same row is refused three times in a row for the same reason, when the model declines, when an input may not have completed (a JavaScript dialog), and when a row cannot be done because the tab is gone (nothing is input for that step). It never retries an input that landed.
 - **Long calls behave.** It sends one `notifications/progress` per step when the call carries a progress token, and a client cancel stops it between steps. Clients with a short request timeout should reset it on progress or raise it.
 
 ### Watch a browser / solve a captcha

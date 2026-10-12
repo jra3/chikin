@@ -319,3 +319,20 @@ test("through OpenRouter, each step names the model the router actually served",
   assert.deepEqual(sentModels, ["typesafe/jev-router", "typesafe/jev-router", "typesafe/jev-router"]);
   assert.deepEqual(r.steps.map((s) => s.model), served);
 });
+
+test("the same row refused three times in a row is a stall too, not a budget burner (#113)", async () => {
+  const refused = (): ActOutcome => ({ done: false, error: new ActRefusedError("Row 'e2' is gone, disabled, hidden, off-screen or covered; nothing was done."), state: page(1) });
+  const { decider } = scripted(Array.from({ length: 6 }, () => ({ choice: "e2" })));
+  const { driver: d, acted } = driver([refused, refused, refused, refused]);
+  const r = await runLoop(base({ decider, driver: d }));
+  assert.equal(r.status, "blocked");
+  assert.match(r.message, /refused three times in a row/);
+  assert.equal(acted.length, 3);
+});
+
+test("refusals of different rows, or for different reasons, do not trip it", async () => {
+  const refusedAs = (msg: string) => (): ActOutcome => ({ done: false, error: new ActRefusedError(msg), state: page(1) });
+  const { decider } = scripted([{ choice: "e2" }, { choice: "e3", consequential: false }, { choice: "e2" }, { choice: "DONE" }]);
+  const r = await runLoop(base({ decider, driver: driver([refusedAs("a"), refusedAs("a"), refusedAs("b")]).driver, allowConsequential: true }));
+  assert.equal(r.status, "done");
+});

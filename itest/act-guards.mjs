@@ -194,6 +194,29 @@ try {
   r = await call("chikin_act", { id: stale.id, text: "x" });
   check("a navigation invalidates the old document's rows", r.isError, textOf(r).slice(0, 200));
 
+  // --- a link that wraps onto a short second line (#113) ---------------------
+  // Its bounding box's centre lands in the gap beside the second line, where
+  // elementFromPoint finds the container: the shape of every multi-line
+  // result link (GitHub's issue list was the live case).
+  await page(
+    `document.body.innerHTML='<div style="width:640px;line-height:40px;font:14px sans-serif"><a id="wrap" href="#" ' +
+      'onclick="window.clicks=(window.clicks||0)+1; return false">A long result title that fills the first line of its block<br>x</a></div>'; window.clicks=0; return true;`,
+  );
+  const premise = await page(
+    "const a=document.querySelector('#wrap'); const r=a.getBoundingClientRect(); return [a.getClientRects().length, a.contains(document.elementFromPoint(r.x+r.width/2, r.y+r.height/2))];",
+  );
+  check("premise: the wrapped link's box centre misses it", premise?.[0] >= 2 && premise?.[1] === false, JSON.stringify(premise));
+  snap = await snapshot();
+  const wrapped = snap.actions.find((a) => a.label.startsWith("A long result title"));
+  r = await call("chikin_act", { id: wrapped.id });
+  check("a wrapped link is clicked on one of its own lines, not refused as covered", !r.isError && (await clicks()) === 1, textOf(r).slice(0, 200));
+  await page(
+    "const c=document.createElement('div'); c.style.cssText='position:fixed;inset:0;z-index:9999;background:white'; document.body.append(c); return true;",
+  );
+  snap = await snapshot();
+  r = await call("chikin_act", { id: snap.actions.find((a) => a.label.startsWith("A long result title"))?.id ?? "e1" });
+  check("...and still refused when an overlay covers every line", r.isError && (await clicks()) === 1, textOf(r).slice(0, 200));
+
   // --- a click that navigates (a real cross-site link) -----------------------
   await call("navigate_page", { type: "url", url: "https://example.com/" });
   snap = await snapshot();

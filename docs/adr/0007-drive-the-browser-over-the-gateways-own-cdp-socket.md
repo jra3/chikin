@@ -9,7 +9,9 @@ connection stays open beside it. They are the first pieces of #95, a fast
 decision loop in which a small model picks a row of an indexed table rather than
 a large model driving `take_snapshot` and `click{uid}` one round trip at a time.
 `gateway/src/snapshot/` holds the code; the in-page scripts are Browser Use's
-jev-ultrafast, verbatim (MIT).
+jev-ultrafast, verbatim (MIT), except that the click point falls back to each
+line box when the box centre misses a wrapped link (#113, `targetJs` in
+`act.ts`).
 
 ## Why not through the child
 
@@ -38,7 +40,8 @@ and a snapshot does not delay the client.
   can land between our check and our click. The guards are what make that
   safe. A row is executed only if, at execution time, its node's guard and
   the page key (or, for fill/scroll/wait, the whole-page marker) still equal
-  what the read recorded, and the node's centre is not covered. Otherwise
+  what the read recorded, and the node's centre (or, failing that, one of its
+  line boxes) is not covered. Otherwise
   nothing is input and the page as it now is comes back with the refusal.
   `itest/act-guards.mjs` holds jev-ultrafast's guard cases against a real
   Browser.

@@ -14,6 +14,8 @@
  *   re-sends;
  * - an input that landed is never retried, even when the read after it fails;
  * - three consecutive non-wait actions that left the page unchanged is a stall;
+ * - the same row refused three times in a row for the same reason is BLOCKED
+ *   (chikin's own rule, #113);
  * - DONE is the model's claim, returned with the page it rests on.
  */
 
@@ -257,5 +259,14 @@ export async function runLoop(opts: LoopOptions): Promise<LoopResult> {
 
     state = outcome.state;
     record({ ...base, label, kind: row.kind, text, outcome: "refused", act_ms, note: outcome.error.message });
+    // The stall rule counts executed steps only, so a row that always fails
+    // its hit-test was refused until the budget ran out (#113). Three identical
+    // refusals in a row is a stall of its own.
+    const last3 = steps.slice(-3);
+    if (
+      last3.length === 3 &&
+      last3.every((s) => s.outcome === "refused" && s.label === label && s.kind === row.kind && s.note === outcome.error.message)
+    )
+      return stop("blocked", `${row.kind} "${label}" was refused three times in a row (${outcome.error.message}); stopping rather than repeating it.`);
   }
 }
