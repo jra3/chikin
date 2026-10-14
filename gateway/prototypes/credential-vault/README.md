@@ -1,5 +1,7 @@
 # Credential-use broker prototype
 
+For an operator walkthrough, start with [Trying the credential-vault prototype](USAGE.md). It separates the runnable demo from the work needed before handing a real credential to an agent.
+
 Throwaway research for [#116](https://github.com/jra3/chikin/issues/116), captured on branch `research/116-agentic-credential-vault`. Nothing here is wired into the production Gateway or Docker build. All credentials are synthetic, regenerated on startup, and held in memory. The original HTTP broker needs only Node 22+. The Chikin browser demo below also uses Docker, existing Chikin images/networks, and the Gateway’s locked Playwright dependency.
 
 ## Question and verdict
