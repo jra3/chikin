@@ -5,6 +5,8 @@ import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { connectCdp, createLoginBroker, waitForPage } from './browser-login.mjs';
+import { exerciseRestricted } from './restricted-scenarios.mjs';
+const restricted=process.argv.includes('--restricted');
 const run=randomBytes(5).toString('hex');
 const name=`inst-vault-${run}`, browserName=`chikin-chrome-${name}`, volumeName=`chikin-profile-${name}`;
 const gatewayName=`chikin-vault-gateway-${run}`, fixtureName=`chikin-vault-fixture-${run}`;
@@ -14,10 +16,12 @@ const chromeImage=process.env.VAULT_CHROME_IMAGE||'chikin:local';
 const shared=`/tmp/chikin-vault-${run}`;
 const screenshot=process.env.VAULT_SCREENSHOT||`/tmp/chikin-vault-authenticated-${run}.png`;
 const password=randomBytes(24).toString('hex');
+const gatewayToken=restricted?randomBytes(24).toString('hex'):'';
+const dataNetwork=restricted?`chikin-vault-net-${run}`:'chikin-net';
 const docker=(args,extra={})=>execFileSync('docker',args,{encoding:'utf8',stdio:['ignore','pipe','pipe'],...extra}).trim();
 const exists=(kind,id)=>{try{docker([kind,'inspect',id]);return true;}catch{return false;}};
 const assert=(label,condition)=>{if(!condition)throw new Error(label);console.log(`PASS ${label}`);};
-const owned=[];let cdp,mayHaveBrowser=false;
+const owned=[],networks=[];let cdp,mayHaveBrowser=false;
 const transcript=[];
 function record(label,value){transcript.push(value);console.log(`${label}: ${JSON.stringify(value)}`);return value;}
 async function until(fn){for(let i=0;i<150;i++){try{const result=await fn();if(result)return result;}catch{}await new Promise(r=>setTimeout(r,200));}throw new Error('Scratch gateway did not become ready');}
@@ -28,23 +32,45 @@ try{
  const imageId=docker(['image','inspect',gatewayImage,'--format','{{.Id}}']);
  console.log(`Scratch Gateway image: ${imageId}`);
  await mkdir(shared,{mode:0o777});
+ if(restricted){
+   const options=JSON.parse(docker(['network','inspect','chikin-egress','--format','{{json .Options}}']));
+   assert('shared egress forbids container-to-container traffic',options['com.docker.network.bridge.enable_icc']==='false');
+   docker(['network','create','--internal',dataNetwork]);networks.push(dataNetwork);
+ }
  const fixtureFile=fileURLToPath(new URL('./browser-fixture.mjs',import.meta.url));
- docker(['create','--name',fixtureName,'--network','chikin-net','--user','1000:1000','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','-e','CHIKIN_DEMO_PASSWORD','--mount',`type=bind,src=${fixtureFile},dst=/fixture.mjs,readonly`,'node:22-bookworm-slim','node','/fixture.mjs'],{env:{...process.env,CHIKIN_DEMO_PASSWORD:password}});
+ docker(['create','--name',fixtureName,'--network',dataNetwork,'--user','1000:1000','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','-e','CHIKIN_DEMO_PASSWORD','--mount',`type=bind,src=${fixtureFile},dst=/fixture.mjs,readonly`,'node:22-bookworm-slim','node','/fixture.mjs'],{env:{...process.env,CHIKIN_DEMO_PASSWORD:password}});
  owned.push(fixtureName);docker(['start',fixtureName]);
- const env={HOST:'0.0.0.0',PORT:String(port),MAX_FLEET:String(count+1),GATEWAY_TOKEN:'',CHIKIN_VOLUME_GC:'0',SEED_VOLUME:'',IDLE_TTL_SEC:'100000',ATTACHED_IDLE_TTL_SEC:'0',REAP_INTERVAL_SEC:'100000',CHROME_IMAGE:chromeImage,CHIKIN_NETWORK:'chikin-net',CHIKIN_EGRESS_NETWORK:'chikin-egress',SHARED_DIR:shared,DOCKER_PROXY_HOST:'docker-socket-proxy',DOCKER_PROXY_PORT:'2375'};
+ const env={HOST:'0.0.0.0',PORT:String(port),MAX_FLEET:String(count+1),GATEWAY_TOKEN:gatewayToken,CHIKIN_VOLUME_GC:'0',SEED_VOLUME:'',IDLE_TTL_SEC:'100000',ATTACHED_IDLE_TTL_SEC:'0',REAP_INTERVAL_SEC:'100000',CHROME_IMAGE:chromeImage,CHIKIN_NETWORK:dataNetwork,CHIKIN_EGRESS_NETWORK:'chikin-egress',SHARED_DIR:shared,DOCKER_PROXY_HOST:'docker-socket-proxy',DOCKER_PROXY_PORT:'2375'};
  docker(['create','--name',gatewayName,'--init','--network','chikin-control','-p',`127.0.0.1:${port}:${port}`,...Object.entries(env).flatMap(([k,v])=>['-e',`${k}=${v}`]),gatewayImage]);
- owned.push(gatewayName);docker(['network','connect','chikin-net',gatewayName]);docker(['network','connect','chikin-egress',gatewayName]);docker(['start',gatewayName]);
+ owned.push(gatewayName);docker(['network','connect',dataNetwork,gatewayName]);docker(['network','connect','chikin-egress',gatewayName]);docker(['start',gatewayName]);
  const health=await until(async()=>{const response=await fetch(`${base}/healthz`,{signal:AbortSignal.timeout(1000)});return response.ok&&response.json();});
  assert('effective scratch config disables seeding and volume GC',health.config.seedVolume===''&&!health.config.volumeGc);
  assert('effective scratch config disables attached reaping',health.config.attachedIdleTtlSec===0&&health.config.idleTtlSec===100000);
  mayHaveBrowser=true;
  // Node fetch adds Sec-Fetch-Mode, correctly refused by the CDP lane's page guard.
- const version=await new Promise((resolve,reject)=>{const req=http.get(`${base}/cdp/${name}/json/version`,res=>{let body='';res.on('data',chunk=>body+=chunk);res.on('end',()=>{if(res.statusCode!==200)return reject(new Error('Scratch gateway could not provision Browser'));try{resolve(JSON.parse(body));}catch{reject(new Error('Invalid CDP discovery response'));}});});req.setTimeout(150000,()=>req.destroy(new Error('Browser provisioning timed out')));req.on('error',reject);});
+ const version=await new Promise((resolve,reject)=>{const req=http.get(`${base}/cdp/${name}/json/version`,{headers:gatewayToken?{Authorization:`Bearer ${gatewayToken}`} : {}},res=>{let body='';res.on('data',chunk=>body+=chunk);res.on('end',()=>{if(res.statusCode!==200)return reject(new Error('Scratch gateway could not provision Browser'));try{resolve(JSON.parse(body));}catch{reject(new Error('Invalid CDP discovery response'));}});});req.setTimeout(150000,()=>req.destroy(new Error('Browser provisioning timed out')));req.on('error',reject);});
  assert('real Chrome provisioned through Chikin CDP Lane',typeof version.Browser==='string'&&version.Browser.includes('Chrome/'));
- cdp=await connectCdp(version.webSocketDebuggerUrl);
+ cdp=await connectCdp(version.webSocketDebuggerUrl,{headers:gatewayToken?{Authorization:`Bearer ${gatewayToken}`} : undefined});
  const sessionId='broker-owned-page';
  await cdp.send('Page.enable',{},sessionId);
- const origin=`http://${fixtureName}.chikin-net:43116`;
+ const origin=`http://${fixtureName}.${dataNetwork}:43116`;
+ if(restricted){
+   assert('raw CDP requires a broker-only credential',health.config.authEnabled===true);
+   const browserNetworks=JSON.parse(docker(['inspect',browserName,'--format','{{json .NetworkSettings.Networks}}']));
+   assert('Browser has its own data network, separate from live Fleet',!!browserNetworks[dataNetwork]&&!browserNetworks['chikin-net']);
+   const targets=[browserNetworks[dataNetwork].IPAddress,browserNetworks['chikin-egress'].IPAddress];
+   const probeScript=`const net=require('net');Promise.all(${JSON.stringify(targets)}.map(host=>new Promise(resolve=>{const s=net.connect({host,port:9222});s.setTimeout(800);s.on('connect',()=>{s.destroy();resolve(true)});s.on('error',()=>resolve(false));s.on('timeout',()=>{s.destroy();resolve(false)});}))).then(r=>console.log(JSON.stringify(r)))`;
+   const probe=(suffix,network,withEgress)=>{
+     const probeName=`chikin-vault-probe-${run}-${suffix}`;
+     docker(['create','--name',probeName,'--network',network,'--user','1000:1000','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','node:22-bookworm-slim','node','-e',probeScript]);owned.push(probeName);
+     if(withEgress)docker(['network','connect','chikin-egress',probeName]);
+     return JSON.parse(docker(['start','-a',probeName]));
+   };
+   assert('positive control reaches protected Browser CDP on its own network',probe('control',dataNetwork,false)[0]===true);
+   assert('Fleet-side probe cannot reach either protected Browser address',probe('peer','chikin-net',true).every(value=>value===false));
+   const confinement=await cdp.confine(origin);
+   await exerciseRestricted({cdp,origin,password,gatewayBase:base,name,confinement,assert,record});
+ }else{
  const broker=createLoginBroker({cdp,sessionId,origin,resolveCredential:async alias=>{if(alias!=='demo-accounts')throw new Error('Unknown account');return {username:'demo-user',password};}});
  const grantId=broker.approve('demo-agent');
  const request={grantId,account:'demo-accounts'};
@@ -78,6 +104,7 @@ try{
  record('broker audit',broker.audit);
  assert('synthetic password absent from agent replies and audit',!JSON.stringify(transcript).includes(password));
  console.log('VERDICT: website login through Chikin works with broker-owned synthetic credentials. Bitwarden, MFA, hostile-CDP protection and production integration are not connected.');
+ }
 }catch(error){console.error(`FAIL ${error.message?.startsWith('Command failed')?'Docker operation failed (details suppressed)':error.message}`);process.exitCode=1;}
 finally{
  await cdp?.close().catch(()=>{});
@@ -88,6 +115,7 @@ finally{
   if(exists('volume',volumeName)){try{docker(['volume','rm',volumeName]);}catch{console.error(`Cleanup needed: ${volumeName}`);process.exitCode=1;}}
  }
  for(const container of owned.reverse()){try{docker(['rm','-f',container]);}catch{console.error(`Cleanup needed: ${container}`);process.exitCode=1;}}
+ for(const network of networks.reverse()){try{docker(['network','rm',network]);}catch{console.error(`Cleanup needed: ${network}`);process.exitCode=1;}}
  await rm(shared,{recursive:true,force:true}).catch(()=>{});
  if(!process.exitCode)console.log('CLEANUP removed only this run’s Browser, disposable Profile Volume, fixture and scratch Gateway.');
 }

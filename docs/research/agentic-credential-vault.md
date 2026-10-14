@@ -119,8 +119,8 @@ Recommended invariants for the working prototype:
 
 ## Decisions still needing product judgment
 
-- Are we protecting against accidental transcript exposure, a prompt-injected browser agent, a compromised Browser, or a same-user shell agent? These require increasingly different boundaries.
-- Must agents retain unrestricted CDP/evaluate access after login? If yes, treat the granted account/session as delegated authority and narrow the account itself.
+- Confirmed: restrict browser tools to resist credential extraction. Deployment must preserve separation from the broker host; the contained-client prototype does not secure an ordinary same-user host shell.
+- Confirmed: agents must not retain unrestricted CDP/evaluate access. The next product question is which reviewed website operations are useful enough to expose.
 - Is the preferred source an existing personal password manager, dedicated automation accounts, or newly issued API credentials?
 - Should approval authorize one operation, one login, or a time-limited session? What must revoke actually end?
 - Which first real site has a representative login flow and an appropriately limited test account?
@@ -138,3 +138,11 @@ The state model's browser-session walkthrough demonstrated the separate authorit
 After the operator clarified the scope, the [Chikin login walkthrough](../../gateway/prototypes/credential-vault/chikin-demo.mjs) successfully provisioned one fresh headful Chrome Browser through a separate scratch Gateway, submitted a synthetic HTML login form, and verified an authenticated account page. No real vault was accessed. [Recorded evidence](../../gateway/prototypes/credential-vault/chikin-evidence.txt) includes denials, exactly one accepted form submission, session survival after grant revocation, actual site logout, and cleanup of only this run’s resources. The [screenshot](../../gateway/prototypes/credential-vault/browser-authenticated.png) shows the real authenticated Browser.
 
 This advances the evidence from HTTP session brokering to real Chrome interaction through the CDP Lane. It still does not validate hostile-agent isolation or a production Bitwarden adapter. The broker’s credential resolver is the intended backend seam; Password Manager `bw` unlock/item access belongs entirely on the trusted side. No production Gateway code changed.
+
+### Follow-up: restricted tools and contained client
+
+The operator selected the stronger restriction direction. The [`--restricted` walkthrough](../../gateway/prototypes/credential-vault/README.md) now exposes only authenticated login, typed invoice read, and logout operations over a Unix socket. A separate read-only, network-disabled client container gets that socket and its own limited token/grant. It can perform the approved read while its extraction and self-approval attempts fail; it cannot reach the host Gateway or Docker socket. This is a concrete containment experiment, not an assertion that ordinary host-running coding agents are contained.
+
+The protected Browser uses a private internal data network and no seed. An on-network CDP control succeeds; a probe on the Fleet’s usual data/egress networks fails against both protected Browser addresses. A separate random Gateway bearer credential rejects the tool client’s token on the raw CDP Lane. Agent-controlled navigation/code/selectors are unavailable. Broker routing additionally blocks off-origin requests. The allowed invoice projection rejects a synthetic credential deliberately echoed into its numeric field. [Captured evidence](../../gateway/prototypes/credential-vault/restricted-evidence.txt) records the exercised cases and limitations.
+
+The deployment requirement is now explicit: keep the broker, vault unlock credential, raw Gateway/noVNC surfaces and driver outside the agent’s host/filesystem/network privileges. The approved destination site still receives its own credential and remains trusted; this prototype is not a proof against a compromised broker, container escape, denial of service or covert channels through legitimate task data. No production Gateway code changed and Bitwarden remains disconnected.

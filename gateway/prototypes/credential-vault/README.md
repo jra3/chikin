@@ -10,7 +10,37 @@ Throwaway research for [#116](https://github.com/jra3/chikin/issues/116), captur
 
 This does **not** establish secrecy against an agent with host/process access, and the original HTTP broker does not implement Chrome login. The follow-up below now demonstrates login inside real Chikin Chrome. The research identifies unrestricted CDP and accepted cross-Browser reachability as separate obstacles to meaningful account isolation in Chikin. A production vault adapter remains a later choice.
 
-## Run the Chikin website-login prototype (preferred first slice)
+## Run the restricted browser prototype (current direction)
+
+The operator selected **restricted browser tools to resist credential extraction**. The latest prototype therefore keeps the browser driver private and gives the agent only three named operations:
+
+- `browser_login`: sign in to the fixed approved account once.
+- `invoice_read`: read a typed invoice total and status, with three attempts allowed.
+- `browser_logout`: submit the reviewed sign-out action.
+
+```sh
+npm ci --prefix gateway --ignore-scripts
+node gateway/prototypes/credential-vault/chikin-demo.mjs --restricted
+```
+
+Use the Docker/images/network prerequisites below. This mode additionally creates one temporary internal Docker network and removes it on completion. It keeps the earlier unrestricted-driver walkthrough available only as historical comparison.
+
+**Agent interface:** authenticated HTTP over a private Unix socket, using `GET /tools` and `POST /call` with exactly `{grantId, method}`. This is a prototype interface, not an MCP implementation or a shipped Gateway tool. Operator approval/revocation are private harness methods with no agent endpoint. Each Browser controller belongs to one grant; every operation checks its principal, expiry, revocation and state. The broker handles JavaScript/CDP internally, including all selectors and destinations; it never accepts executable code, URLs, selectors, headers, or caller-chosen identity.
+
+**Client containment:** part of the walkthrough runs a separate Node client in a read-only Docker container with `--network none`, no capabilities, no new privileges, its own process namespace, and no Docker socket. It mounts only the client program and a directory containing the broker Unix socket. It receives its own limited token/grant, never the Gateway token or the synthetic password. The client proves that the socket works, extraction requests fail, the host Gateway is unreachable, and the approved invoice read still succeeds. This demonstrates the required separation; it does not retrofit containment onto an ordinary Claude/Codex process running on the host.
+
+**Browser isolation:** the protected Browser gets a unique internal data network, no Seed Volume, and the existing egress network only after checking that inter-container communication is disabled there. The scratch Gateway uses its own random bearer token. A positive control can reach CDP on the protected data network; a separate probe on the Fleet's ordinary data and egress networks cannot reach either protected Browser address. The live Fleet's networks/configuration are not changed, and the probes target only the scratch Browser. Browser request routing also refuses destinations outside the exact synthetic origin and reviewed paths; browser WebSockets are closed.
+
+**Observed extraction cases:** JavaScript evaluation, raw CDP, cookies, network inspection, raw DOM, screenshots, arbitrary navigation, uploads/downloads, selectors, forged identity, and self-approval. They refuse before and after login. A hidden DOM attribute intentionally echoes the generated password as a positive control: the trusted driver can see it, while the agent has no DOM-reading operation. When the harness places that password in the otherwise allowed invoice-total field, output validation refuses it. Expiry, replay, read budgets, unexpected-page refusal, logout and revocation also passed. [restricted-evidence.txt](restricted-evidence.txt) contains the captured run, including the contained client's own report. No generated password appeared in captured tool outputs or audit entries.
+
+**Protection limits:** the broker host, Docker/kernel, trusted driver and approved destination site remain trusted. A process with shell access to the broker host can bypass these restrictions; the scratch Gateway still has host-trusted dashboard/noVNC surfaces. Those surfaces are not available to the contained client, and must not be exposed to an uncontained agent in production. A malicious approved service can encode information into otherwise valid task data; typed projection is not a proof against all covert channels. The prototype does not resist denial of service, implement durable audit or general website navigation, support MFA/SSO, or access Bitwarden. Routing was exercised for an off-origin HTTP request; WebSocket closure is configured but not independently attacked in this walkthrough.
+
+Revocation blocks subsequent tool calls. It cannot recall an action already sent and does not promise remote cookie invalidation. The website session remains private inside the broker-owned Browser, and the run removes that disposable Browser/Profile Volume during cleanup. The successful evidence's final “not a sandbox for a shell-capable agent” sentence refers to **an agent with broker-host shell access**; the contained client intentionally demonstrates a separate process/filesystem/network environment.
+
+The cost of this protection is reduced functionality: this prototype reads one reviewed account view. Broader browsing requires additional reviewed actions, selectors and output schemas; exposing generic CDP/evaluate as an escape hatch would defeat the design.
+
+## Run the earlier Chikin website-login prototype
+
 
 The operator clarified that the first feature should log into websites through Chikin; personal Bitwarden is the likely source. This follow-up submits a real HTML login form inside a fresh Chikin Browser through a separate scratch Gateway.
 
@@ -93,6 +123,6 @@ Its last walkthrough intentionally differs from the broker: it models handing a 
 
 ## Next production decision
 
-Choose whether the first supported boundary is accidental transcript exposure or a hostile/prompt-injected agent. For the stronger boundary, a Browser spike must restrict raw CDP, script execution/observation, and peer-Browser access; use a fresh Browser with no inherited Seed Volume. Then connect one supported vault backend and one representative test account. Do not lift this prototype into production as a credential vault.
+The operator chose resistance to credential extraction through restricted browser tools. Preserve the demonstrated client/driver separation when integrating with real Instances; an unrestricted host shell is a bypass. Select the next useful website operation and its allowed outputs, then implement a broker-private Bitwarden adapter and a supported operator unlock flow. Do not lift this prototype into production as a credential vault.
 
 See the [primary-source research](../../../docs/research/agentic-credential-vault.md).

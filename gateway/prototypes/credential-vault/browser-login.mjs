@@ -1,14 +1,24 @@
-// THROWAWAY: cooperative-agent transcript protection, not hostile-CDP isolation.
+// THROWAWAY trusted broker internals. Never expose this driver to a restricted client.
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 // Reuse Chikin's integration-test dependency and its ordinary HTTP/WebSocket transport.
 const { chromium } = createRequire(import.meta.url)('playwright-core');
 
-export async function connectCdp(url) {
-  const browser = await chromium.connectOverCDP(url, { timeout: 15000 });
+export async function connectCdp(url, { headers } = {}) {
+  const browser = await chromium.connectOverCDP(url, { timeout: 15000, headers });
   const page = await browser.contexts()[0].newPage();
   const session = await page.context().newCDPSession(page);
   return {
+    async confine(origin) {
+      const counts = { blockedRequests: 0, blockedWebSockets: 0 };
+      await page.context().route('**/*', route => {
+        const url = new URL(route.request().url());
+        if (url.origin === origin && ['/login', '/account', '/logout', '/metrics'].includes(url.pathname)) return route.continue();
+        counts.blockedRequests++; return route.abort();
+      });
+      await page.context().routeWebSocket('**/*', socket => { counts.blockedWebSockets++; socket.close(); });
+      return counts;
+    },
     async send(method, params = {}) {
       let timer;
       try { return await Promise.race([

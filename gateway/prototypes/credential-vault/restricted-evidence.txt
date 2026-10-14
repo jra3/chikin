@@ -1,0 +1,70 @@
+Scratch Gateway image: sha256:28fc03eec5a2611f7562bd7de769cf737b4521bdcd9bf02f62a47503d83f6265
+PASS shared egress forbids container-to-container traffic
+PASS effective scratch config disables seeding and volume GC
+PASS effective scratch config disables attached reaping
+PASS real Chrome provisioned through Chikin CDP Lane
+PASS raw CDP requires a broker-only credential
+PASS Browser has its own data network, separate from live Fleet
+PASS positive control reaches protected Browser CDP on its own network
+PASS Fleet-side probe cannot reach either protected Browser address
+PASS expired tool grant refused
+PASS restricted login works
+PASS restricted logout works
+PASS read after logout refused
+agent tool list: {"status":200,"tools":["browser_login","invoice_read","browser_logout"]}
+PASS only three reviewed operations exposed
+PASS unauthenticated caller refused
+PASS wrong principal refused
+PASS agent cannot approve its own grant
+PASS no account read before login
+PASS evaluate_script unavailable before login
+PASS Runtime.evaluate unavailable before login
+PASS Network.getAllCookies unavailable before login
+PASS get_cookies unavailable before login
+PASS get_network_requests unavailable before login
+PASS take_screenshot unavailable before login
+PASS get_dom unavailable before login
+PASS navigate_page unavailable before login
+PASS upload_file unavailable before login
+PASS download unavailable before login
+PASS connect_cdp unavailable before login
+PASS open_devtools unavailable before login
+PASS __proto__ unavailable before login
+agent login reply: {"status":200,"ok":true,"authenticated":true,"account":"demo-accounts"}
+PASS restricted browser login authenticated
+PASS evaluate_script unavailable after login
+PASS Runtime.evaluate unavailable after login
+PASS Network.getAllCookies unavailable after login
+PASS get_cookies unavailable after login
+PASS get_network_requests unavailable after login
+PASS take_screenshot unavailable after login
+PASS get_dom unavailable after login
+PASS navigate_page unavailable after login
+PASS upload_file unavailable after login
+PASS download unavailable after login
+PASS connect_cdp unavailable after login
+PASS open_devtools unavailable after login
+PASS __proto__ unavailable after login
+PASS caller-supplied browser controls refused
+PASS caller-supplied browser controls refused
+PASS caller-supplied browser controls refused
+PASS caller-supplied browser controls refused
+PASS caller-supplied browser controls refused
+PASS caller-supplied browser controls refused
+PASS login replay refused
+PASS credential canary exists behind restricted interface
+agent invoice reply: {"status":200,"ok":true,"invoice":{"totalUSD":42,"status":"paid"}}
+PASS useful account read succeeds without raw DOM
+PASS credential echo in allowed output field refused
+PASS off-origin browser request blocked
+PASS read of unexpected page refused
+contained agent evidence: {"isolatedClient":true,"restrictedSocketWorks":true,"extractionAttemptsRefused":9,"selfApprovalRefused":true,"dockerSocketAbsent":true,"hostGatewayUnreachable":true,"invoice":{"totalUSD":42,"status":"paid"}}
+PASS contained agent can work only through restricted socket
+PASS read allowance enforced
+PASS agent credential cannot access raw Chikin CDP
+PASS revocation refuses every later operation
+PASS website session remains private to broker after revoke
+restricted audit: [{"actor":"other-agent","method":"browser_login","decision":"wrong_agent"},{"actor":"demo-agent","method":"invoice_read","decision":"not_authenticated"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"browser_login","decision":"allowed"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"invoice_read","decision":"arguments_refused"},{"actor":"demo-agent","method":"invoice_read","decision":"arguments_refused"},{"actor":"demo-agent","method":"invoice_read","decision":"arguments_refused"},{"actor":"demo-agent","method":"invoice_read","decision":"arguments_refused"},{"actor":"demo-agent","method":"invoice_read","decision":"arguments_refused"},{"actor":"demo-agent","method":"invoice_read","decision":"arguments_refused"},{"actor":"demo-agent","method":"browser_login","decision":"login_already_used"},{"actor":"demo-agent","method":"invoice_read","decision":"allowed"},{"actor":"demo-agent","method":"invoice_read","decision":"result_schema_refused"},{"actor":"demo-agent","method":"invoice_read","decision":"page_refused"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"unavailable","decision":"tool_unavailable"},{"actor":"demo-agent","method":"invoice_read","decision":"arguments_refused"},{"actor":"demo-agent","method":"invoice_read","decision":"allowed"},{"actor":"demo-agent","method":"invoice_read","decision":"read_allowance_exhausted"},{"actor":"demo-agent","method":"invoice_read","decision":"revoked"},{"actor":"demo-agent","method":"browser_logout","decision":"revoked"}]
+PASS generated password absent from all captured tool outputs and audit
+VERDICT: restricted browser operations resisted the exercised extraction attempts. Broker host, destination site and driver remain trusted; this is not a sandbox for a shell-capable agent.
+CLEANUP removed only this run’s Browser, disposable Profile Volume, fixture and scratch Gateway.
