@@ -1,0 +1,21 @@
+PASS unauthenticated agent: {"status":401,"error":"agent_auth_required"}
+PASS agent cannot approve itself: {"status":401,"error":"operator_auth_required"}
+PASS wrong agent: {"status":403,"error":"wrong_agent"}
+PASS wrong operation: {"status":403,"error":"wrong_operation"}
+PASS destination override: {"status":403,"error":"caller_override_refused"}
+PASS body identity override: {"status":403,"error":"caller_override_refused"}
+PASS cross-origin request: {"status":403,"error":"origin_refused"}
+PASS authenticated API read: {"status":200,"result":{"invoiceCount":1,"totalUSD":42},"remaining":0}
+PASS replay refused: {"status":403,"error":"exhausted"}
+PASS website login and account read: {"status":200,"result":{"authenticated":true,"accountAvailable":true},"remaining":2}
+PASS website session reused: {"status":200,"result":{"authenticated":true,"accountAvailable":true},"remaining":1}
+PASS session retained only by broker: {"sessions":1,"logins":1}
+PASS revoke and logout: {"status":200,"revoked":true,"note":"Future calls refused. A request already sent cannot be recalled."}
+PASS revoked grant: {"status":403,"error":"revoked"}
+PASS one allowance under concurrency: {"statuses":[200,403]}
+PASS concurrent website use serialized: {"statuses":[200,403],"reason":"in_flight"}
+PASS expired grant: {"status":403,"error":"expired"}
+PASS real upstream evidence: {"apiAuthenticated":2,"webAuthenticated":3,"accountReads":4,"logoutCalls":3}
+PASS sessions removed: {"retained":0}
+PASS no synthetic password, API key, or retained session token appeared in captured HTTP replies or audit state, despite upstream diagnostic echoes.
+VERDICT: scoped broker works against real HTTP fixtures. Chrome/CDP, vault backend, persistent storage, MFA and hostile-host isolation remain unproven.
