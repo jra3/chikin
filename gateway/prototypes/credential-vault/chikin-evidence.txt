@@ -1,0 +1,29 @@
+Observed 2026-10-14, Node 22.23.2; command: node gateway/prototypes/credential-vault/chikin-demo.mjs
+Scratch Gateway image: sha256:28fc03eec5a2611f7562bd7de769cf737b4521bdcd9bf02f62a47503d83f6265
+PASS effective scratch config disables seeding and volume GC
+PASS effective scratch config disables attached reaping
+PASS real Chrome provisioned through Chikin CDP Lane
+agent reply: {"ok":false,"error":"wrong_agent"}
+PASS wrong agent refused
+agent reply: {"ok":false,"error":"caller_override_refused"}
+PASS caller destination override refused
+agent reply: {"ok":false,"error":"wrong_account"}
+PASS wrong account refused
+agent reply: {"ok":true,"account":"demo-accounts","authenticated":true,"session":"available_in_browser"}
+PASS real website login completed
+agent reply: {"ok":false,"error":"exhausted"}
+PASS login grant replay refused
+PASS Browser is headful Chrome
+PASS website session remains usable after grant revocation
+agent reply: {"ok":false,"error":"revoked"}
+PASS revoked grant refuses a fresh login
+agent reply: {"ok":false,"error":"expired"}
+PASS expired login grant refused
+website evidence: {"attempts":1,"accepted":1,"accountReads":2,"logouts":0}
+PASS denials did not submit extra logins
+Authenticated Browser screenshot: /tmp/chikin-vault-authenticated-3a16bc817e.png
+PASS website logout ends the browser session
+broker audit: [{"actor":"other-agent","account":"demo-accounts","decision":"wrong_agent"},{"actor":"demo-agent","account":"demo-accounts","decision":"caller_override_refused"},{"actor":"demo-agent","account":"demo-accounts","decision":"wrong_account"},{"actor":"demo-agent","account":"demo-accounts","decision":"authenticated"},{"actor":"demo-agent","account":"demo-accounts","decision":"exhausted"},{"actor":"demo-agent","account":"demo-accounts","decision":"revoked"},{"actor":"demo-agent","account":"demo-accounts","decision":"expired"}]
+PASS synthetic password absent from agent replies and audit
+VERDICT: website login through Chikin works with broker-owned synthetic credentials. Bitwarden, MFA, hostile-CDP protection and production integration are not connected.
+CLEANUP removed only this run’s Browser, disposable Profile Volume, fixture and scratch Gateway.

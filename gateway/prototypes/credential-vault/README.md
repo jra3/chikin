@@ -1,6 +1,6 @@
 # Credential-use broker prototype
 
-Throwaway research for [#116](https://github.com/jra3/chikin/issues/116), captured on branch `research/116-agentic-credential-vault`. Nothing here is wired into the production Gateway or Docker build. All credentials are synthetic, regenerated on startup, and held in memory. Node 22+ is the only dependency.
+Throwaway research for [#116](https://github.com/jra3/chikin/issues/116), captured on branch `research/116-agentic-credential-vault`. Nothing here is wired into the production Gateway or Docker build. All credentials are synthetic, regenerated on startup, and held in memory. The original HTTP broker needs only Node 22+. The Chikin browser demo below also uses Docker, existing Chikin images/networks, and the Gateway’s locked Playwright dependency.
 
 ## Question and verdict
 
@@ -8,7 +8,30 @@ Throwaway research for [#116](https://github.com/jra3/chikin/issues/116), captur
 
 **Yes, for a trusted broker exposing a small operation interface.** The executable walkthrough performed real authenticated HTTP requests, retained a website session privately, refused unauthorized uses, and checked captured replies for the fixture's secrets even though upstream diagnostic fields deliberately echoed them.
 
-This does **not** establish secrecy against an agent with host/process access, nor does it implement Chrome login. The research identifies unrestricted CDP and accepted cross-Browser reachability as separate obstacles to meaningful account isolation in Chikin. A production vault adapter remains a later choice.
+This does **not** establish secrecy against an agent with host/process access, and the original HTTP broker does not implement Chrome login. The follow-up below now demonstrates login inside real Chikin Chrome. The research identifies unrestricted CDP and accepted cross-Browser reachability as separate obstacles to meaningful account isolation in Chikin. A production vault adapter remains a later choice.
+
+## Run the Chikin website-login prototype (preferred first slice)
+
+The operator clarified that the first feature should log into websites through Chikin; personal Bitwarden is the likely source. This follow-up submits a real HTML login form inside a fresh Chikin Browser through a separate scratch Gateway.
+
+```sh
+npm ci --prefix gateway --ignore-scripts
+node gateway/prototypes/credential-vault/chikin-demo.mjs
+```
+
+Prerequisites: Docker access; existing `chikin:local`, `chikin-gateway:local`, and `node:22-bookworm-slim` images; the usual `chikin-control`, `chikin-net`, and `chikin-egress` networks and socket proxy; port 18116 free. Override `VAULT_CHIKIN_PORT`, `VAULT_GATEWAY_IMAGE`, or `VAULT_CHROME_IMAGE` if needed. The script uses existing images without rebuilding or restarting production services, and reports the Gateway image digest it exercised.
+
+The trusted harness creates a one-use login grant. An agent-side call names only `demo-accounts` and its grant; the broker navigates its own fresh tab, checks the exact origin, form action/method and field types, resolves synthetic credentials privately, fills/submits, and verifies the authenticated account page. The fixture issues a real HttpOnly session cookie to Chrome. The agent receives an authentication result, with no password.
+
+The run uses one random `inst-vault-*` Name, no Seed Volume, a fleet cap of the existing count plus one, disabled volume GC, disabled attached reaping, and long idle/sweep intervals. It checks the effective settings in `/healthz` before provisioning. Normal completion and caught failures remove only resources created under this run’s unpredictable names. An abrupt process/host termination can still leave those scratch resources behind; no broad cleanup/prune is performed. The live Browser and sticky profiles are never driven or removed.
+
+[Observed transcript](chikin-evidence.txt) and [authenticated-page screenshot](browser-authenticated.png) record the successful run. It proved login, headful Chrome, wrong-agent/account/destination refusals, replay/expiry/revocation, exactly one actual form submission, and real website logout. Revoking the grant intentionally left the already-established site session usable until logout.
+
+The operator/agent separation here is an in-process harness convention, not production authentication. Unlike the earlier HTTP broker, the Browser now owns the website session. This does not defend against unrestricted CDP, hostile page scripts, a same-user shell agent, or peer-Browser access. It does not perform MFA, SSO or real Bitwarden access.
+
+**Bitwarden seam:** `createLoginBroker` accepts `resolveCredential(accountAlias)`. Replace the synthetic resolver only inside the trusted broker, using Password Manager’s `bw get item <approved-item-UUID>` and an operator-held `BW_SESSION`. Keep an explicit item/origin allowlist; do not expose arbitrary item lookup or vault unlock to the agent. `bw` is distinct from Secrets Manager’s `bws`. No Bitwarden command or actual vault access is part of this prototype. The research records the unlock and URI-matching constraints.
+
+**Transport sharp edge:** Node’s built-in `fetch` sends Fetch Metadata and is refused by Chikin’s CDP page guard. The harness uses Node HTTP for discovery and the same Playwright CDP transport as the existing integration tests. The production guard was not weakened.
 
 ## Run the working broker
 
