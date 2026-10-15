@@ -2,7 +2,7 @@
 
 The first real-account trial is **Reddit username/password login, followed by reading every joined subreddit, driven by Codex**. The operator supplies credentials privately. The driving Codex runs separately from the broker and gets only three named operations.
 
-This is throwaway research on `research/116-agentic-credential-vault`, tracked in [#116](https://github.com/jra3/chikin/issues/116). **A successful synthetic run is not evidence of successful real Reddit authentication.** No real Reddit credential has been supplied during development.
+This is throwaway research on `research/116-agentic-credential-vault`, tracked in [#116](https://github.com/jra3/chikin/issues/116). **The first operator-run real Reddit trial succeeded.** On 2026-10-15 the operator shared terminal output showing a complete joined-subreddit list, a matching verified broker list, and successful disposable Browser/Profile Volume cleanup. This is evidence from the operator's run; the coding assistant did not receive the credential. Account identifiers and memberships are not included in these project notes. The synthetic checks below remain separate evidence for the exercised restrictions.
 
 ## Run the Reddit trial
 
