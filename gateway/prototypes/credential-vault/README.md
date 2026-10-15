@@ -2,7 +2,13 @@
 
 For an operator walkthrough, start with [Trying the credential-vault prototype](USAGE.md). It separates the runnable demo from the work needed before handing a real credential to an agent.
 
-Throwaway research for [#116](https://github.com/jra3/chikin/issues/116), captured on branch `research/116-agentic-credential-vault`. Nothing here is wired into the production Gateway or Docker build. All credentials are synthetic, regenerated on startup, and held in memory. The original HTTP broker needs only Node 22+. The Chikin browser demo below also uses Docker, existing Chikin images/networks, and the Gateway’s locked Playwright dependency.
+Throwaway research for [#116](https://github.com/jra3/chikin/issues/116), captured on branch `research/116-agentic-credential-vault`. Nothing here is wired into the production Gateway or Docker build. The earlier demonstrations use synthetic credentials, regenerated on startup and held in memory. The separate Reddit trial accepts private operator entry; see the usage guide before supplying real credentials. The original HTTP broker needs only Node 22+. The Chikin browser demo below also uses Docker, existing Chikin images/networks, and the Gateway’s locked Playwright dependency.
+
+## Reddit trial
+
+The operator selected Reddit username/password sign-in and reading joined subreddits, driven by Codex. The new `reddit-trial.sh` wizard orchestrates a private credential handoff, an isolated Chikin Browser, a site-specific `reddit-session.mjs` adapter, and an actual contained Codex CLI. It exposes `browser_login`, `subreddit_list`, and `session_end`. The trusted model relay keeps model authentication on the host as well. See [USAGE.md](USAGE.md) for prerequisites, limits, human verification, and the exact run command.
+
+`reddit-synthetic.mjs` exercises the new adapter against a synthetic Reddit-shaped site inside real Chrome; `--codex` adds the actual model-driven client. The [adapter evidence](reddit-synthetic-evidence.txt) and [actual Codex run](reddit-codex-evidence.txt) record successful synthetic checks. No real Reddit credential has been supplied during development. The remaining sections describe the earlier synthetic invoice prototypes and their historical limitations, rather than the current Reddit trial.
 
 ## Question and verdict
 
@@ -128,3 +134,9 @@ Its last walkthrough intentionally differs from the broker: it models handing a 
 The operator chose resistance to credential extraction through restricted browser tools. Preserve the demonstrated client/driver separation when integrating with real Instances; an unrestricted host shell is a bypass. Select the next useful website operation and its allowed outputs, then implement a broker-private Bitwarden adapter and a supported operator unlock flow. Do not lift this prototype into production as a credential vault.
 
 See the [primary-source research](../../../docs/research/agentic-credential-vault.md).
+
+## Reddit trial validation notes
+
+The Reddit-shaped fixture passed login, account verification, two-page membership enumeration, malformed-output refusal, one-use login, read limits, revocation and exact resource cleanup. Actual Codex then drove the same adapter through the private socket and reported the synthetic memberships. Operator startup was also checked against real Reddit without credentials: model preflight succeeded, the noVNC page was reachable, missing agent authentication was refused, and SIGTERM cleaned up while waiting for human verification.
+
+`bash -n` passes. ShellCheck 0.11.0 passes with `--exclude=SC1087,SC2329`: those diagnostics come from the unchanged Wizard skill library (an unused Readline helper and unused library functions). The authored stages have no remaining diagnostics. The manual wizard itself has not been run with real credentials. The production Gateway's build and configuration are unchanged.

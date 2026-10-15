@@ -1,0 +1,23 @@
+Scratch Gateway image: sha256:28fc03eec5a2611f7562bd7de769cf737b4521bdcd9bf02f62a47503d83f6265
+PASS shared egress forbids container-to-container traffic
+PASS effective scratch config disables seeding and volume GC
+PASS effective scratch config disables attached reaping
+PASS raw CDP requires broker authentication
+PASS Browser isolated from live Fleet data network
+PASS real Chrome provisioned through Chikin CDP Lane
+PASS real shadow-DOM login form recognized
+PASS read before authentication refused
+PASS arbitrary browser tool refused
+PASS caller-supplied navigation refused
+PASS operator supplies synthetic credential privately
+PASS actual Chrome login succeeds
+PASS login submitted exactly once
+PASS login replay refused
+PASS credential echoed in output field refused
+PASS all membership pages returned
+PASS membership reads bounded
+PASS session end revokes access
+PASS revoked operation refused
+PASS password absent from results and audit
+VERDICT: real Browser + synthetic Reddit-shaped login, identity check, pagination, projection and revocation pass. Real Reddit login remains untested.
+PASS scratch resources cleaned

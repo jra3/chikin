@@ -9,6 +9,8 @@ export async function connectCdp(url, { headers } = {}) {
   const page = await browser.contexts()[0].newPage();
   const session = await page.context().newCDPSession(page);
   return {
+    // Trusted broker internals only; never returned through an agent tool.
+    page,
     async confine(origin) {
       const counts = { blockedRequests: 0, blockedWebSockets: 0 };
       await page.context().route('**/*', route => {
