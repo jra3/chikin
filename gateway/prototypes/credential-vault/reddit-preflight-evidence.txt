@@ -1,0 +1,11 @@
+Scratch Gateway image: sha256:28fc03eec5a2611f7562bd7de769cf737b4521bdcd9bf02f62a47503d83f6265
+PASS shared egress forbids container-to-container traffic
+PASS effective scratch config disables seeding and volume GC
+PASS effective scratch config disables attached reaping
+PASS raw CDP requires broker authentication
+PASS Browser isolated from live Fleet data network
+PASS real Chrome provisioned through Chikin CDP Lane
+PUBLIC LOGIN STATE {"origin":"https://www.reddit.com","path":"/login/","title":"Reddit - Prove your humanity","username":false,"password":false,"challenge":true}
+VERDICT human verification required before login.
+No credentials supplied or submitted.
+CLEANUP removed only this run’s Browser, disposable Profile Volume, scratch Gateway and private network.

@@ -39,6 +39,20 @@ The contained client should report an invoice total of `42` and status `paid`. T
 
 If it fails, retain the error and the failing check. Normal completion and caught failures clean up owned resources; abrupt termination can leave scratch resources behind. Do not use a broad Docker volume prune to clean them up. Only resources identified as belonging to that run should be removed.
 
+## First real trial: Reddit / Codex
+
+The selected task is to sign into `https://www.reddit.com` and return the account's **joined subreddits**. Codex is the selected driving agent. Login/MFA method remains unconfirmed. The proposed read operation returns subreddit names and canonical links; it must enumerate all pages and distinguish a complete result from a partial list. It must not substitute recommendations, visited communities, or the logged-out defaults for account memberships.
+
+On 2026-10-15 the public login form loaded in T3's collaborative browser, but a fresh isolated **Chikin Browser** received **“Reddit - Prove your humanity”** before the login form. No credential was supplied or submitted. The disposable Browser, Profile Volume, scratch Gateway and private network were removed. This is a preflight result, not a successful login or an authenticated subreddit read.
+
+Repeat that public-only check with the same prerequisites as the synthetic demo:
+
+```sh
+node gateway/prototypes/credential-vault/reddit-preflight.mjs
+```
+
+Exit `0` means the public login form appeared, `2` means human verification is required, and `1` means an error occurred. The command accepts no credentials and cleans up rather than leaving a session available. Do not enter credentials into T3's unrestricted preview as a workaround for the vault trial. The operator challenge handoff, private credential entry, Reddit read handler, and contained Codex connection still need implementation before the real-account trial.
+
 ## 2. Before supplying a real credential
 
 Send these non-secret details first:
@@ -129,4 +143,4 @@ If you need to stop access immediately, revoke first. Operator cleanup must rema
 
 On `outcome_unknown` or `login_outcome_unknown`, do not blindly repeat the operation. The input may already have reached the site; inspect the session through the trusted operator path before granting another attempt. On `page_refused` or `result_schema_refused`, report the mismatch and fix the site handler rather than giving the agent unrestricted browser access.
 
-The next input needed to make this real is **the website, task, agent runtime, and login method**. The credential comes afterward, through the private broker handoff.
+The website, task and agent are now selected: **Reddit, joined subreddits, Codex**. The remaining non-secret input is **the login/MFA method**. The credential comes afterward, through the private broker handoff, once the missing integration and human-verification handoff are implemented.
