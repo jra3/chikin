@@ -23,7 +23,7 @@ services:
   # the gateway's startup image check. The "build" profile keeps it out of
   # `up`. Developers build it locally via docker-compose.dev.yml.
   chrome-image:
-    image: ghcr.io/jra3/chikin:${CHIKIN_VERSION:-sha-e1b3e92}
+    image: ghcr.io/jra3/chikin:${CHIKIN_VERSION:-sha-8dd7135}
     profiles: ["build"]
     entrypoint: ["true"]
     restart: "no"
@@ -64,7 +64,7 @@ services:
     restart: unless-stopped
 
   gateway:
-    image: ghcr.io/jra3/chikin-gateway:${CHIKIN_VERSION:-sha-e1b3e92}
+    image: ghcr.io/jra3/chikin-gateway:${CHIKIN_VERSION:-sha-8dd7135}
     container_name: chikin-gateway
     init: true
     restart: unless-stopped
@@ -137,7 +137,7 @@ services:
       CHIKIN_DECIDER_MODEL: "${CHIKIN_DECIDER_MODEL:-}"
       # Writes fill text when the decider is Jev (jev-*), which cannot generate text.
       CHIKIN_TEXT_MODEL: "${CHIKIN_TEXT_MODEL:-}"
-      CHROME_IMAGE: "ghcr.io/jra3/chikin:${CHIKIN_VERSION:-sha-e1b3e92}"
+      CHROME_IMAGE: "ghcr.io/jra3/chikin:${CHIKIN_VERSION:-sha-8dd7135}"
       # Golden-profile seed volume. Empty = off; set to chikin-seed and populate
       # it with bin/chikin-snapshot to have new browsers start logged in.
       SEED_VOLUME: "${SEED_VOLUME:-}"
