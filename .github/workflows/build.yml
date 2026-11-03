@@ -5,6 +5,13 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  # A push is not the only reason to rebuild (#118): the Chrome layer comes from
+  # Google's floating apt repo, so an image nobody rebuilds keeps an old Chrome
+  # forever. The weekly run pushes `main`, `latest` and a dated `refresh-<date>`
+  # tag on both images; it never re-points an immutable `sha-*` tag.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -36,11 +43,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The Dockerfile's apt layer is keyed on this, so the GHA cache cannot
+      # replay a Chrome older than today's (#118).
+      - name: Apt refresh key
+        id: apt
+        run: echo "refresh=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
       - name: Build chrome image for testing (load)
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: APT_REFRESH=${{ steps.apt.outputs.refresh }}
           load: true
           tags: ghcr.io/${{ github.repository }}:ci
           cache-from: type=gha,scope=${{ matrix.short }}
@@ -124,6 +138,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: APT_REFRESH=${{ steps.apt.outputs.refresh }}
           cache-from: type=gha,scope=${{ matrix.short }}
           outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
 
@@ -171,7 +186,8 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=branch
-            type=sha,format=short
+            type=sha,format=short,enable=${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+            type=raw,value=refresh-{{date 'YYYYMMDD'}},enable=${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
 
@@ -214,7 +230,8 @@ jobs:
           images: ghcr.io/${{ github.repository }}-gateway
           tags: |
             type=ref,event=branch
-            type=sha,format=short
+            type=sha,format=short,enable=${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+            type=raw,value=refresh-{{date 'YYYYMMDD'}},enable=${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
 

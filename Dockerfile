@@ -8,7 +8,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 # the self-chown fallback in entrypoint.sh).
 ENV CHROME_UID=1100 CHROME_GID=1100
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Cache key for the apt layer below (#118). Its RUN line never changes, so a
+# layer cache (CI's GHA cache) would replay an old Chrome and old Debian
+# packages forever. CI passes the build date, so the layer is re-run at most
+# once a day; a local build without the arg keeps its cache.
+ARG APT_REFRESH=
+
+RUN : "apt refresh ${APT_REFRESH}" \
+  && apt-get update && apt-get upgrade -y --no-install-recommends \
+  && apt-get install -y --no-install-recommends \
       wget gnupg ca-certificates tini xvfb socat \
       x11vnc novnc websockify \
       fonts-liberation fonts-noto-color-emoji \
