@@ -12,6 +12,6 @@
     "verify": "node verify-fleet.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0"
+    "@modelcontextprotocol/sdk": "^1.32.2"
   }
 }
