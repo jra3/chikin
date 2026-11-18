@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { cdmSpawnParams } from "../src/cdm-spawn.js";
 
 /**
  * One stdio JSON-RPC driver for the REAL chrome-devtools-mcp binary.
@@ -22,6 +23,8 @@ export interface CdmSession {
    * not require guessing where the running build's package.json lives.
    */
   serverInfo: { name?: string; version?: string };
+  /** The child's pid, for tests that inspect what it forked. */
+  pid: number;
   /** Send a request; resolve its `result`, or throw what its `error` said. */
   call(method: string, params?: unknown): Promise<unknown>;
 }
@@ -75,22 +78,15 @@ export async function withCdmStdio<T>(
 ): Promise<T> {
   const bin = opts.bin ?? resolveCdmBin();
   const timeoutMs = opts.timeoutMs ?? 60_000;
-  const child = spawn(
-    process.execPath,
-    [bin, "--browserUrl", opts.browserUrl, "--no-usage-statistics"],
-    {
-      stdio: ["pipe", "pipe", "pipe"],
-      // Keep the spawn hermetic. Upstream defaults to posting usage statistics
-      // to a third party and to spawning a detached npm-registry update check
-      // that writes ~/.cache; neither belongs in a test run, and neither may be
-      // left to the incidental `CI` opt-out, since the point is the LOCAL run.
-      env: {
-        ...process.env,
-        CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: "1",
-        CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS: "1",
-      },
-    },
-  );
+  // The gateway's own argv and env, so the harness is hermetic for the same
+  // reason the gateway is (#128): no telemetry watchdog, no npm update check.
+  // Neither is left to the incidental `CI` opt-out, since the point is the
+  // LOCAL run.
+  const spawnParams = cdmSpawnParams(opts.browserUrl);
+  const child = spawn(process.execPath, [bin, ...spawnParams.args], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, ...spawnParams.env },
+  });
 
   const stderr: string[] = [];
   child.stderr.on("data", (d) => stderr.push(String(d)));
@@ -148,7 +144,7 @@ export async function withCdmStdio<T>(
       clientInfo: { name: opts.clientName, version: "0.0.0" },
     })) as { serverInfo?: { name?: string; version?: string } } | undefined;
     send({ jsonrpc: "2.0", method: "notifications/initialized" });
-    return await body({ serverInfo: init?.serverInfo ?? {}, call });
+    return await body({ serverInfo: init?.serverInfo ?? {}, pid: child.pid as number, call });
   } finally {
     child.kill("SIGKILL");
   }

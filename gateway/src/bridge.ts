@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { config, deciderIsJev, deciderModel, deciderProvider, textModel } from "./config.js";
 import { Session } from "./session.js";
 import { childExited, childSpawned } from "./children.js";
+import { cdmSpawnParams } from "./cdm-spawn.js";
 import { log } from "./log.js";
 import { isValidHandle, HANDLE_RULE } from "./names.js";
 import type { Registry } from "./registry.js";
@@ -1088,7 +1089,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     const browserUrl = ip ? `http://${ip}:${config.cdpPort}` : NO_BROWSER_URL;
     const c = new StdioClientTransport({
       command: config.cdmCommand,
-      args: ["--browserUrl", browserUrl, ...config.cdmExtraArgs],
+      ...cdmSpawnParams(browserUrl, config.cdmExtraArgs),
       stderr: "pipe",
     });
     wireChild(c, gen);
