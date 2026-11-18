@@ -35,6 +35,14 @@ export class Session {
   handle: string | undefined;
   handleDescription: string | undefined;
 
+  /**
+   * Is this session's child bound to a browser? False until the first browser
+   * tool call (issue #63). The bridge owns the answer and replaces this thunk;
+   * it is read for the `browserless` count on /healthz, which must not ask
+   * Docker because the compose healthcheck polls that route.
+   */
+  hasBrowser: () => boolean = () => false;
+
   private closed = false;
   private readonly onClose: (s: Session, reason: string) => void;
   private readonly closeChild: () => Promise<void>;

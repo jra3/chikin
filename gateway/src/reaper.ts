@@ -1,5 +1,6 @@
 import { config } from "./config.js";
 import { log } from "./log.js";
+import { liveChildren } from "./children.js";
 import type { Registry } from "./registry.js";
 import type { FleetMember, Provisioner } from "./provisioner.js";
 
@@ -40,14 +41,19 @@ import type { FleetMember, Provisioner } from "./provisioner.js";
  *
  * Since issue #63 the map also holds names with NO container: a session
  * provisions its browser lazily, on its first browser tool call. Those hold no
- * fleet slot, so they are never torn down here — the whole point of lazy
- * provisioning is that they cost nothing to leave alone. Once such a name is
- * finished with (no session, no stream, past the idle TTL) its disposable
- * profile volume is still collected, so a container that disappeared
- * out-of-band cannot leak one (issue #58).
+ * fleet slot, but they are not free: every session owns a chrome-devtools-mcp
+ * child process and that child's watchdog. So a session whose client is still
+ * there (an open stream, or MCP traffic inside the idle TTL) is left alone,
+ * and one whose client has gone is closed here (issue #122). Nothing else can
+ * close it: clients exit without DELETE, and an `inst-<ppid>` name never
+ * reconnects to be reclaimed as stale. Its disposable profile volume is
+ * collected in the same pass, so a container that disappeared out-of-band
+ * cannot leak one (issue #58).
  */
 export class Reaper {
   private timer: NodeJS.Timeout | undefined;
+  /** Consecutive sweeps that ended with more children than sessions (#125). */
+  private excessSweeps = 0;
 
   constructor(
     private registry: Registry,
@@ -105,22 +111,40 @@ export class Reaper {
       // Since issue #63 an activity record no longer implies a fleet slot: a
       // session provisions its browser lazily, on its first browser tool call,
       // so a connected-but-never-used session is tracked here while owning no
-      // container. There is no SLOT to reclaim from it — evicting it would cost
-      // the client a reconnect and free nothing — so it is never torn down here.
+      // container. There is no SLOT to reclaim from it, but there is a child
+      // process (issue #122), so the question here is whether its client is
+      // still there:
       //
-      // Its disposable PROFILE VOLUME is another matter (issue #58): a name
-      // whose container vanished out-of-band leaves ~200 MB behind, and before
-      // lazy provisioning the reclaim path below collected it. So the record is
-      // kept until it satisfies every condition the reclaim path would have
-      // demanded — no live session, no open stream, and past the detached idle
-      // TTL — and only then is the volume dropped along with the bookkeeping. A
-      // live session is spared because it may be mid-attach and about to mount
-      // that very volume; the TTL is what stops a just-started session from
-      // being raced. `isPending` re-checks the same thing inside the create gate.
+      //  - an open stream or a CDP hold means yes, at any age;
+      //  - so does MCP traffic inside the detached idle TTL, which a live
+      //    client bridge supplies with its 120s ping even between streams;
+      //  - past that with neither, the client has gone. It exited without a
+      //    DELETE and its `inst-<ppid>` name will never reconnect, so this is
+      //    the only place the session and its child can be closed.
+      //
+      // That is the same test the detached tier below applies to a name that
+      // does hold a container, so a session's lifetime no longer depends on
+      // whether it happened to browse.
+      //
+      // The disposable PROFILE VOLUME goes in the same pass (issue #58): a name
+      // whose container vanished out-of-band leaves ~200 MB behind. The TTL is
+      // what stops a just-started session from being raced, and `isPending`
+      // re-checks the same thing inside the create gate.
       if (containers && !containers.has(name)) {
-        if (this.registry.getByName(name) || a.streams > 0 || a.cdp > 0) continue;
+        if (a.streams > 0 || a.cdp > 0) continue;
         if (now - a.last <= config.idleTtlMs) continue;
         try {
+          const session = this.registry.getByName(name);
+          if (session) {
+            log.info(
+              `reaper: closing abandoned session ${name}: no browser, no open stream, ` +
+                `idle ${Math.round((now - a.last) / 1000)}s`,
+            );
+            await session.close("reaped: idle, no browser");
+            // Closing waits for the child to exit. A client that took the name
+            // in that window owns the record now; leave it everything.
+            if (this.registry.has(name)) continue;
+          }
           const discarded = await this.provisioner.removeInstanceVolume(
             name,
             () => !this.registry.isPending(name),
@@ -134,7 +158,7 @@ export class Reaper {
           this.registry.dropActivity(name);
         } catch (e) {
           // Leave the record in place so the next sweep retries the reclaim.
-          log.warn(`reaper: failed to reclaim ${name}'s orphaned profile volume`, String(e));
+          log.warn(`reaper: failed to reclaim ${name}`, String(e));
         }
         continue;
       }
@@ -206,6 +230,30 @@ export class Reaper {
       } catch (e) {
         log.warn(`reaper: failed to reclaim ${name}`, String(e));
       }
+    }
+
+    this.checkChildren();
+  }
+
+  /**
+   * Every session owns one child, so more children than sessions means a
+   * process nobody owns (#125). A child swap and a session still being created
+   * both hold one extra for a moment, so a single sweep is not evidence: warn
+   * when the excess is still there on the next one, once, until it clears.
+   */
+  private checkChildren(): void {
+    const children = liveChildren();
+    const sessions = this.registry.all().length;
+    if (children <= sessions) {
+      this.excessSweeps = 0;
+      return;
+    }
+    this.excessSweeps += 1;
+    if (this.excessSweeps === 2) {
+      log.warn(
+        `reaper: ${children} chrome-devtools-mcp children for ${sessions} session(s), on two ` +
+          `consecutive sweeps. ${children - sessions} child process(es) belong to no session (see #122)`,
+      );
     }
   }
 }

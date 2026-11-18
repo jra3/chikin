@@ -1,5 +1,6 @@
 import { config } from "./config.js";
 import { runtimeConfig, configWarnings } from "./runtime.js";
+import { liveChildren } from "./children.js";
 import type { Registry } from "./registry.js";
 import type { Provisioner, FleetMember, SandboxStatus } from "./provisioner.js";
 
@@ -208,8 +209,9 @@ function browserRow(
  * A live session that holds NO container — connected, tools registered, but it
  * has not yet made a browser tool call, so lazy provisioning (issue #63) has
  * not claimed it a fleet slot. Before that change these sessions were the ones
- * silently eating the fleet; now they are free, and the risk is the opposite —
- * that they are invisible.
+ * silently eating the fleet; now they hold no slot, and the risk is the
+ * opposite — that they are invisible. They are not free: each owns a
+ * chrome-devtools-mcp child process (issue #122).
  *
  * They get their own table rather than rows in the fleet table, because a
  * browser-shaped row describes them almost entirely in em-dashes: on a real host
@@ -539,6 +541,17 @@ export async function renderDashboard(
           : ""
       }</p>`;
 
+  // The leak gauge (#122, #125): one chrome-devtools-mcp child per session, so
+  // a child count that stays above the session count is a process nobody owns.
+  // Read from this process, not Docker, so it is honest even when `err` is set.
+  const sessionCount = registry.all().length;
+  const childCount = liveChildren();
+  const childLine = `<p class="meta">sessions: <strong>${sessionCount}</strong> · chrome-devtools-mcp children: <strong>${childCount}</strong>${
+    childCount > sessionCount
+      ? ` · <strong>${childCount - sessionCount} more than sessions</strong>; a child swap explains one for a moment, anything that stays is a leak (#122)`
+      : ""
+  }</p>`;
+
   const rc = runtimeConfig();
   const chips = [
     `<span class="chip ${rc.seedingOn ? "ok" : "bad"}">seeding ${rc.seedingOn ? "on" : "off"}</span>`,
@@ -560,7 +573,7 @@ export async function renderDashboard(
     ? `<section class="card">
     <header>
       <h2>connected sessions</h2><span class="count">${browserless.length}</span>
-      <p class="hint">Live MCP sessions that have not made a browser tool call yet, so no container exists for them: <strong>connected — holds no fleet slot</strong>. They cost the fleet nothing until they browse, and have no browser to view (issue #63).</p>
+      <p class="hint">Live MCP sessions that have not made a browser tool call yet, so no container exists for them: <strong>connected — holds no fleet slot</strong>. They take no fleet slot until they browse and have no browser to view (issue #63), but each one runs a chrome-devtools-mcp child process. One whose client has gone is closed after IDLE_TTL_SEC (issue #122).</p>
     </header>
     <div class="scroll"><table class="sessions">
       <thead>
@@ -594,7 +607,7 @@ ${browserless.map((n) => sessionRow(n, registry, now)).join("\n")}
     </div>
     <div class="slots">
       ${err ? "" : gauge(members.length, config.maxFleet)}
-      <div>${slotLine}</div>
+      <div>${slotLine}${childLine}</div>
     </div>
   </header>
 
