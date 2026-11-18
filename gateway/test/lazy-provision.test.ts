@@ -125,6 +125,7 @@ process.env.GATEWAY_TOKEN = ""; // auth off; this test is about provisioning
 const { createApp } = await import("../src/server.js");
 const { Registry } = await import("../src/registry.js");
 const { FleetFullError } = await import("../src/provisioner.js");
+const { forgetHandshakes } = await import("../src/bridge.js");
 const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
 const { StreamableHTTPClientTransport } = await import(
   "@modelcontextprotocol/sdk/client/streamableHttp.js"
@@ -347,12 +348,16 @@ test("a client that disconnects after the browser child is up leaves no orphan",
     rmSync(holdFile, { force: true });
     await new Promise((r) => setTimeout(r, 300));
 
-    const spawned = spawnedPids().slice(before);
+    // Only the browser-bound child is new here: the handshake left none, or one
+    // browser-less child on a cold cache (#129), and both counts are taken
+    // after it.
+    const spawned = spawnedPids().slice(handshakeChildren);
     assert.ok(
-      spawned.length >= 2,
+      spawned.length >= 1,
       `the browser-bound child must actually have been spawned (got ${spawned.length})`,
     );
-    const leaked = await stillAlive(spawned);
+    const all = spawnedPids().slice(before);
+    const leaked = await stillAlive(all);
     for (const pid of leaked) {
       try {
         process.kill(pid, "SIGKILL");
@@ -370,6 +375,9 @@ test("a client that disconnects after the browser child is up leaves no orphan",
 // `initialize`, and the session closes: `Session.close` tears down the dead
 // child, so the replacement is owned by nobody (issue #122).
 test("a session closed while its child is being respawned leaves no orphan", { timeout: 30_000 }, async () => {
+  // A cold handshake cache, so this session HAS a browser-less child to kill
+  // (#129: a warm one would have none until its first browser call).
+  forgetHandshakes();
   const before = spawnedPids().length;
   try {
     const { close } = await connect("inst-respawn-close");
@@ -480,6 +488,34 @@ test("a browser call arriving during the child swap joins the attach", { timeout
     assert.deepEqual(state.ensured, ["inst-swap"], "one shared attach, not two provisions");
   } finally {
     rmSync(holdFile, { force: true });
+    await close();
+  }
+});
+
+// #129: once the gateway has seen this handshake, a new session is answered
+// without any child at all, and its first browser call spawns ONE child,
+// straight against the browser. Before, it spawned a browser-less child at
+// connect and swapped it for a second one on that call.
+test("a warm session spawns one child, bound to the browser, on its first browser call (#129)", async () => {
+  state.ensured.length = 0;
+  const warm = await connect("inst-warm-up"); // fills the cache if nothing has yet
+  await warm.client.listTools();
+  await warm.close();
+
+  const before = spawnedPids().length;
+  const { client, close } = await connect("inst-warm");
+  try {
+    await client.listTools();
+    await client.callTool({ name: "chikin_identify", arguments: { handle: "warm-test" } });
+    await client.ping();
+    assert.equal(spawnedPids().length, before, "no child before the first browser call");
+
+    const call = await client.callTool({ name: "list_pages", arguments: {} });
+    assert.notEqual(call.isError, true, textOf(call));
+    assert.match(textOf(call), new RegExp(`browserUrl=http://${BROWSER_IP}:`));
+    assert.equal(spawnedPids().length, before + 1, "exactly one child: the browser-bound one");
+    assert.deepEqual(state.ensured, ["inst-warm"]);
+  } finally {
     await close();
   }
 });

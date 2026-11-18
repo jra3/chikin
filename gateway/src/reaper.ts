@@ -239,7 +239,8 @@ export class Reaper {
   }
 
   /**
-   * Every session owns one child, so more children than sessions means a
+   * A session owns at most one child (none until it needs one, #129), so
+   * more children than sessions means a
    * process nobody owns (#125). A child swap and a session still being created
    * both hold one extra for a moment, so a single sweep is not evidence: warn
    * when the excess is still there on the next one, once, until it clears.
