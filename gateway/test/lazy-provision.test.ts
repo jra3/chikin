@@ -366,6 +366,36 @@ test("a client that disconnects after the browser child is up leaves no orphan",
   }
 });
 
+// A respawn has the same window. The child died, its replacement is replaying
+// `initialize`, and the session closes: `Session.close` tears down the dead
+// child, so the replacement is owned by nobody (issue #122).
+test("a session closed while its child is being respawned leaves no orphan", { timeout: 30_000 }, async () => {
+  const before = spawnedPids().length;
+  try {
+    const { close } = await connect("inst-respawn-close");
+    writeFileSync(holdFile, "");
+    process.kill(spawnedPids()[before], "SIGKILL");
+    // The replacement has started and is stuck on its replayed initialize.
+    while (spawnedPids().length < before + 2) await new Promise((r) => setTimeout(r, 20));
+    await close();
+    while (registry.getByName("inst-respawn-close")) await new Promise((r) => setTimeout(r, 20));
+    rmSync(holdFile, { force: true });
+    await new Promise((r) => setTimeout(r, 300));
+
+    const leaked = await stillAlive(spawnedPids().slice(before));
+    for (const pid of leaked) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* raced us to it */
+      }
+    }
+    assert.deepEqual(leaked, [], "the replacement child must be closed with the session");
+  } finally {
+    rmSync(holdFile, { force: true });
+  }
+});
+
 test("chikin_reset on a browser-less session is a no-op, not a provision", async () => {
   state.ensured.length = 0;
   state.recreated.length = 0;

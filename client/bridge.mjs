@@ -59,6 +59,8 @@ const HEARTBEAT_MS = Number(process.env.CHIKIN_HEARTBEAT_MS || 120000);
 const RECONNECT_MIN_MS = Number(process.env.CHIKIN_RECONNECT_MIN_MS || 500);
 const RECONNECT_MAX_MS = Number(process.env.CHIKIN_RECONNECT_MAX_MS || 30000);
 const REPLAY_TIMEOUT_MS = Number(process.env.CHIKIN_REPLAY_TIMEOUT_MS || 20000);
+// How long a clean exit waits for the gateway to acknowledge the session DELETE.
+const TERMINATE_TIMEOUT_MS = 1000;
 
 const log = (m) => process.stderr.write(`chikin bridge: ${m}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -275,9 +277,34 @@ stdio.onmessage = (m) => {
 
 // Only a genuine client disconnect (stdio closed) — or a signal from the
 // supervisor — tears us down. Both are clean exits (initPath is removed).
+// The SDK's stdio transport does not watch for end of input, so `onclose` fires
+// only when something calls `close()`. The client hanging up is stdin ending.
 stdio.onclose = () => shutdown("client disconnected (stdio closed)");
+process.stdin.once("end", () => shutdown("client disconnected (stdin ended)"));
+// A write to a closed stdout raises EPIPE as an `error` event. Unhandled, it
+// kills the process before the DELETE below is sent, and shutdown itself
+// writes there when it fails the requests still in flight.
+process.stdout.on("error", () => shutdown("client disconnected (stdout closed)"));
+// Same for stderr, which shutdown logs to. A client that died took all three
+// pipes with it, and there is nobody left to tell.
+process.stderr.on("error", () => {});
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+
+// Tell the gateway the session is over. `close()` on the transport only aborts
+// the local fetch: the gateway keeps the session, and the chrome-devtools-mcp
+// child it runs for us, until its reaper notices (issue #122). The DELETE is
+// what frees both now. Bounded, because a gateway that is down or wedged must
+// not hold up the client's exit.
+async function endSession(h) {
+  let timer;
+  const bound = new Promise((r) => (timer = setTimeout(r, TERMINATE_TIMEOUT_MS)));
+  try {
+    await Promise.race([h.terminateSession().catch(() => {}), bound]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function shutdown(why, code = 0) {
   if (shuttingDown) return;
@@ -288,11 +315,14 @@ function shutdown(why, code = 0) {
   try {
     if (initPath) unlinkSync(initPath); // clean exit: the session is over, drop the crash-recovery frame
   } catch {}
-  http?.close().catch(() => {});
-  setTimeout(() => {
-    stdio.close().catch(() => {});
-    process.exit(code);
-  }, 50).unref?.();
+  const h = http;
+  (h ? endSession(h) : Promise.resolve()).finally(() => {
+    h?.close().catch(() => {});
+    setTimeout(() => {
+      stdio.close().catch(() => {});
+      process.exit(code);
+    }, 50);
+  });
 }
 
 // Initial connect, then start the stdio side.

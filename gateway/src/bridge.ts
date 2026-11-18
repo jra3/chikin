@@ -4,6 +4,7 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import { config, deciderIsJev, deciderModel, deciderProvider, textModel } from "./config.js";
 import { Session } from "./session.js";
+import { childExited, childSpawned } from "./children.js";
 import { log } from "./log.js";
 import { isValidHandle, HANDLE_RULE } from "./names.js";
 import type { Registry } from "./registry.js";
@@ -731,6 +732,13 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // choose its own JSON-RPC ids, and one that happened to pick the gateway's
   // would have its reply swallowed here.
   const injected = new Map<string, (f: Frame | null) => void>();
+  // Children this session has running, by transport, so each one is counted
+  // down exactly once, when its process closes (issue #125). `proc` is the
+  // SDK's own handle, kept only to say HOW the child ended in the exit line.
+  const running = new Map<
+    StdioClientTransport,
+    { pid: number | null; proc?: { exitCode: number | null; signalCode: string | null } }
+  >();
   const injectPrefix = `chikin/${randomUUID()}/`;
   let injectedSeq = 0;
 
@@ -960,6 +968,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       http.send(msg).catch((e) => log.warn(`session[${name}]: http send failed`, String(e)));
     };
     c.onclose = () => {
+      // Fires on the process's `close` event, for every child including ones a
+      // swap already discarded, so the count is settled before the generation
+      // check below can return.
+      const r = running.get(c);
+      if (r) {
+        running.delete(c);
+        childExited();
+        const how = r.proc?.signalCode ?? (r.proc?.exitCode != null ? `code ${r.proc.exitCode}` : "unknown");
+        log.info(`session[${name}]: child exited pid=${r.pid ?? "?"} (${how})`);
+      }
       if (gen !== childGen || session?.isClosed) return;
       void respawnChild("child process exited");
     };
@@ -1075,6 +1093,18 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     });
     wireChild(c, gen);
     await c.start();
+    // Counted from here to the process's `close` event (wireChild). A spawn
+    // that failed rejected above and never reaches this line.
+    running.set(c, {
+      pid: c.pid,
+      proc: (c as unknown as { _process?: { exitCode: number | null; signalCode: string | null } })
+        ._process,
+    });
+    childSpawned();
+    log.info(
+      `session[${name}]: child spawned pid=${c.pid ?? "?"} gen=${gen} ` +
+        (ip ? `browser=${ip}` : "browser-less"),
+    );
     c.stderr?.on("data", (d: Buffer) => {
       const line = d.toString().trimEnd();
       log.debug(`[cdm:${name}] ${line}`);
@@ -1122,6 +1152,13 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
           const ip = wantBrowser ? await provision() : null;
           spawned = await startChild(gen, ip);
           await replayInitialize(spawned, gen);
+          // The session can close while the replacement is still replaying
+          // `initialize`. `Session.close` tore down the OLD child, so nothing
+          // owns this one: close it here or it runs until the gateway restarts.
+          if (session?.isClosed) {
+            await spawned.close().catch(() => {});
+            return;
+          }
           child = spawned;
           spawned = null;
           const chrome = ip ? await refreshChromeVersion(ip) : null;
@@ -2022,6 +2059,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     },
     (s) => deps.registry.remove(s),
   );
+  session.hasBrowser = () => currentIp !== null;
 
   // Child first so its stdin is ready before the initialize frame arrives — but
   // BROWSER-LESS (issue #63). It answers the handshake, tools/list and pings on

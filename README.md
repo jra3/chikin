@@ -6,7 +6,7 @@ Real (non-headless) Google Chrome in Docker, for browser automation that should 
 
 - Full **headed** Chrome with no physical display (Xvfb). No `HeadlessChrome` in the User-Agent; `navigator.webdriver` is `undefined`; `navigator.plugins` populated.
 - **Per-name sticky profiles**: connect as `alice` and you always get the same cookies/history; `bob` is fully isolated.
-- **On-demand lifecycle**: a browser is provisioned on a session's first *browser tool call* — not on connect — and reaped when idle. Merely having chikin in your MCP config costs nothing, so idle clients can't sit on the fleet.
+- **On-demand lifecycle**: a browser is provisioned on a session's first *browser tool call* — not on connect — and reaped when idle. Merely having chikin in your MCP config takes no fleet slot, so idle clients can't sit on the fleet.
 - **noVNC** for every browser, so a human can watch or solve a captcha from one dashboard.
 - A per-browser host directory (`/tmp/chikin-shared/<name>`) wired into that browser as `~/Downloads` for file upload/download.
 
@@ -56,9 +56,14 @@ docker compose --profile build pull
 docker compose up -d
 
 # 3. Sanity check.
-curl -s http://localhost:8080/healthz        # {"status":"ok","config":{…},"warnings":[…],"canary":{…}}
+curl -s http://localhost:8080/healthz        # {"status":"ok","config":{…},"warnings":[…],"canary":{…},"sessions":N,"children":N,"browserless":N}
 open http://localhost:8080/                   # fleet dashboard
 ```
+
+`sessions`, `children` and `browserless` are the leak gauge. Every session runs
+one `chrome-devtools-mcp` child process, so `children` should equal `sessions`,
+and the reaper warns when it stays above it. `browserless` counts sessions that
+have not made a browser tool call.
 
 `/healthz` carries the **effective runtime config of the running gateway** — see
 [Checking the effective config](#checking-the-effective-config) — plus a
@@ -93,7 +98,7 @@ Env (read by `chikin-mcp`): `CHIKIN_GATEWAY` (default `http://localhost:8080`), 
 
 The first browser tool call provisions and starts the browser (about a second). Connecting alone does not — a client that never browses holds no fleet slot. A named browser (`giard`) always gets the same profile. Disconnect and the browser stays warm for a fast reconnect; leave it idle past `IDLE_TTL_SEC` with no client attached and it's **removed** — for a named browser the profile volume is preserved, so reconnecting restores everything, while a disposable `inst-<pid>` browser's profile goes with it (see [Profile volumes](#profile-volumes-and-cleaning-them-up)).
 
-A connected client that never browses costs nothing at all — it holds no container, so it can't sit on a slot however long it stays open. And a session that *did* browse but has run no browser tool for `ATTACHED_IDLE_TTL_SEC` (4h) is reclaimed even while attached; the client bridge reconnects transparently on the next tool call.
+A connected client that never browses holds no container, so it can't sit on a slot however long it stays open. It does run one `chrome-devtools-mcp` child process inside the gateway for as long as its session lives. The client bridge ends that session when it exits, and the reaper closes a session whose client vanished without doing so once it has had no open stream and no MCP traffic for `IDLE_TTL_SEC`. And a session that *did* browse but has run no browser tool for `ATTACHED_IDLE_TTL_SEC` (4h) is reclaimed even while attached; the client bridge reconnects transparently on the next tool call.
 
 #### Direct HTTP transport (pin a browser, or non–Claude-Code clients)
 

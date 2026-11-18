@@ -8,6 +8,7 @@ import { rpcError, RPC } from "./rpc.js";
 import { Registry } from "./registry.js";
 import { Provisioner, FleetFullError, ProvisionError } from "./provisioner.js";
 import { createSession } from "./bridge.js";
+import { liveChildren } from "./children.js";
 import { renderDashboard } from "./dashboard.js";
 import { runtimeConfig, configWarnings } from "./runtime.js";
 import { makeVncHttpHandler, vncUpgradeHandler, hostOk } from "./vnc.js";
@@ -151,11 +152,21 @@ export function createApp(deps: ServerDeps): express.Express {
     // that actually governs whether the wedge reproduces. Here rather than only
     // on the dashboard because /healthz is the surface that answers "what does
     // this process actually have" without a browser.
+    //
+    // `sessions`, `children` and `browserless` are the leak gauge (#122, #125):
+    // every session owns one chrome-devtools-mcp child, so `children` staying
+    // above `sessions` means a process nobody owns. All three are read from
+    // this process's own state. Docker is not asked, because the compose
+    // healthcheck polls this route.
+    const sessions = deps.registry.all();
     res.json({
       status: "ok",
       config: runtimeConfig(),
       warnings: configWarnings(),
       canary: deps.registry.canarySummary(),
+      sessions: sessions.length,
+      children: liveChildren(),
+      browserless: sessions.filter((s) => !s.hasBrowser()).length,
     });
   });
 

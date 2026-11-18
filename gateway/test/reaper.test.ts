@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 import { Registry } from "../src/registry.js";
 import { Reaper } from "../src/reaper.js";
 import { config } from "../src/config.js";
+import { Session } from "../src/session.js";
+import { childExited, childSpawned } from "../src/children.js";
+import { withWarnings } from "./log-tap.js";
 
 // `fleet` names the containers that actually exist. Since issue #63 that is not
 // a formality: a name can have an activity record with no container (a session
@@ -293,8 +296,9 @@ test("a mid-provision browser keeps its freshly-seeded volume (CHK-015)", async 
 
 // --- Names with no container (issue #63) ------------------------------------
 // Lazy provisioning means an activity record no longer implies a fleet slot.
-// The reaper's job is to reclaim SLOTS, so a name holding none is not its
-// business — evicting one would cost a client its session and free nothing.
+// A name holding none has no slot to reclaim, so a client that is still there
+// keeps its session. It does have a child process, so a session whose client
+// has gone is closed (issue #122, further down).
 
 test("a connected session that never browsed holds no slot and is not evicted", async () => {
   const reg = new Registry();
@@ -360,6 +364,117 @@ test("a containerless name is spared while a session or stream still holds it", 
   assert.deepEqual(volumesRemoved, [], "a live client's profile is never pulled out from under it");
   assert.deepEqual(stopped, [], "and it is not evicted — it holds no slot to reclaim");
   assert.ok(reg.getActivity("inst-attached-lazy"), "its bookkeeping survives");
+});
+
+// --- Abandoned sessions (issue #122) -----------------------------------------
+// A session owns a chrome-devtools-mcp child whether or not it ever browsed.
+// The reaper used to skip every containerless name that still had a session,
+// so a client that exited without DELETE left its session, and that child,
+// until the gateway restarted: 731 of them in 3.5 days.
+
+/** A registered session whose child teardown is observable. */
+function liveSession(reg: Registry, name: string, at: number) {
+  const closed: string[] = [];
+  const session = new Session(
+    name,
+    { close: async () => {} } as never,
+    async () => void closed.push(name),
+    (s) => reg.remove(s),
+  );
+  assert.ok(reg.reserve(name, at));
+  reg.add(session);
+  return { session, closed };
+}
+
+test("a containerless session whose client is gone is closed, child and all", async () => {
+  const reg = new Registry();
+  const { session, closed } = liveSession(reg, "inst-abandoned", 0);
+  // The client's stream came and went; nothing has been heard since.
+  reg.streamOpened("inst-abandoned", 0);
+  reg.streamClosed("inst-abandoned", 0);
+
+  const { provisioner, stopped, volumesRemoved } = fakeProvisioner([]);
+  await new Reaper(reg, provisioner as never).sweep(config.idleTtlMs + 1000);
+
+  assert.equal(session.isClosed, true, "the session is closed");
+  assert.deepEqual(closed, ["inst-abandoned"], "which is what tears its child down");
+  assert.equal(reg.getByName("inst-abandoned"), undefined, "the name is free again");
+  assert.equal(reg.getActivity("inst-abandoned"), undefined, "and its bookkeeping is dropped");
+  assert.deepEqual(volumesRemoved, ["inst-abandoned"], "a leftover instance volume goes with it");
+  assert.deepEqual(stopped, [], "there was never a container to stop");
+});
+
+test("a client that takes the name during the volume call keeps its record", async () => {
+  const reg = new Registry();
+  reg.touch("inst-retaken", 0); // abandoned long ago: no session, no container
+  const { provisioner } = fakeProvisioner([]);
+  // The Docker call is where a reconnect can land.
+  provisioner.removeInstanceVolume = async () => {
+    liveSession(reg, "inst-retaken", config.idleTtlMs + 1000);
+    reg.streamOpened("inst-retaken", config.idleTtlMs + 1000);
+    return false;
+  };
+  await new Reaper(reg, provisioner as never).sweep(config.idleTtlMs + 1000);
+
+  assert.equal(reg.getActivity("inst-retaken")?.streams, 1, "its open-stream count survives the sweep");
+});
+
+test("a containerless session still inside the idle TTL is spared without a stream", async () => {
+  const reg = new Registry();
+  const now = 8 * HOUR;
+  // A live client bridge between event streams: no stream right now, but its
+  // 120s ping keeps `last` fresh.
+  const { session, closed } = liveSession(reg, "inst-between-streams", 0);
+  reg.touch("inst-between-streams", now - 120_000);
+
+  const { provisioner, volumesRemoved } = fakeProvisioner([]);
+  await new Reaper(reg, provisioner as never).sweep(now);
+
+  assert.equal(session.isClosed, false, "a client that is still talking keeps its session");
+  assert.deepEqual(closed, []);
+  assert.deepEqual(volumesRemoved, []);
+});
+
+test("a containerless session with an open stream is spared at any age", async () => {
+  const reg = new Registry();
+  const { session } = liveSession(reg, "inst-quiet-window", 0);
+  reg.streamOpened("inst-quiet-window", 0);
+
+  const { provisioner } = fakeProvisioner([]);
+  await new Reaper(reg, provisioner as never).sweep(8 * HOUR);
+
+  assert.equal(session.isClosed, false, "an open stream means the client is there");
+});
+
+test("more children than sessions warns on the second sweep, once (issue #125)", async () => {
+  const reg = new Registry();
+  const { provisioner } = fakeProvisioner([]);
+  const reaper = new Reaper(reg, provisioner as never);
+  const excess = (lines: string[]) => lines.filter((l) => l.includes("belong to no session"));
+
+  childSpawned(); // a child process with no session to own it
+  try {
+    // One sweep is not evidence: a child swap holds an extra for a moment.
+    const [, first] = await withWarnings(() => reaper.sweep(1000));
+    assert.deepEqual(excess(first), []);
+    const [, second] = await withWarnings(() => reaper.sweep(2000));
+    assert.equal(excess(second).length, 1, "still there on the next sweep: say so");
+    assert.match(excess(second)[0], /1 chrome-devtools-mcp children for 0 session/);
+    const [, third] = await withWarnings(() => reaper.sweep(3000));
+    assert.deepEqual(excess(third), [], "and say it once, not every 30s");
+  } finally {
+    childExited();
+  }
+  // Back in balance, then out again: the warning is armed afresh.
+  await reaper.sweep(4000);
+  childSpawned();
+  try {
+    await reaper.sweep(5000);
+    const [, again] = await withWarnings(() => reaper.sweep(6000));
+    assert.equal(excess(again).length, 1);
+  } finally {
+    childExited();
+  }
 });
 
 test("a containerless NAMED profile is never discarded (golden/hermes/sticky)", async () => {
