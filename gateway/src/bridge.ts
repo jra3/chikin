@@ -1152,6 +1152,13 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
           const ip = wantBrowser ? await provision() : null;
           spawned = await startChild(gen, ip);
           await replayInitialize(spawned, gen);
+          // The session can close while the replacement is still replaying
+          // `initialize`. `Session.close` tore down the OLD child, so nothing
+          // owns this one: close it here or it runs until the gateway restarts.
+          if (session?.isClosed) {
+            await spawned.close().catch(() => {});
+            return;
+          }
           child = spawned;
           spawned = null;
           const chrome = ip ? await refreshChromeVersion(ip) : null;

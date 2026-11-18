@@ -43,6 +43,24 @@ const transport = new StreamableHTTPClientTransport(
   token ? { requestInit: { headers: { Authorization: `Bearer ${token}` } } } : undefined,
 );
 const client = new Client({ name: "chikin-keepalive", version: "0.0.0" }, { capabilities: {} });
+
+// "Kill to release" has to release the SESSION too. Without a DELETE the gateway
+// keeps it, and the chrome-devtools-mcp child it runs for us, until the reaper
+// reclaims the browser (issue #122). Bounded so a dead gateway cannot hold us.
+// Installed before the first await, so Ctrl-C during provisioning is covered.
+let leaving = false;
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, async () => {
+    if (leaving) return;
+    leaving = true;
+    await Promise.race([
+      transport.terminateSession().catch(() => {}),
+      new Promise((r) => setTimeout(r, 1000)),
+    ]);
+    process.exit(0);
+  });
+}
+
 try {
   await client.connect(transport);
 } catch (e) {
@@ -98,19 +116,3 @@ setInterval(
   PING_MS,
 );
 setInterval(() => {}, 1 << 30); // never exit on its own
-
-// "Kill to release" has to release the SESSION too. Without a DELETE the gateway
-// keeps it, and the chrome-devtools-mcp child it runs for us, until the reaper
-// reclaims the browser (issue #122). Bounded so a dead gateway cannot hold us.
-let leaving = false;
-for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, async () => {
-    if (leaving) return;
-    leaving = true;
-    await Promise.race([
-      transport.terminateSession().catch(() => {}),
-      new Promise((r) => setTimeout(r, 1000)),
-    ]);
-    process.exit(0);
-  });
-}

@@ -145,17 +145,17 @@ export class Reaper {
             // in that window owns the record now; leave it everything.
             if (this.registry.has(name)) continue;
           }
-          const discarded = await this.provisioner.removeInstanceVolume(
-            name,
-            () => !this.registry.isPending(name),
-          );
+          const unclaimed = () => !this.registry.has(name) && !this.registry.isPending(name);
+          const discarded = await this.provisioner.removeInstanceVolume(name, unclaimed);
           if (discarded) {
             log.info(
               `reaper: discarded orphaned profile volume for ${name} — it has no container and no ` +
                 `session, and has been idle ${Math.round((now - a.last) / 1000)}s`,
             );
           }
-          this.registry.dropActivity(name);
+          // The same recheck after the Docker call: a client that connected
+          // meanwhile owns this record, its open-stream count included.
+          if (unclaimed()) this.registry.dropActivity(name);
         } catch (e) {
           // Leave the record in place so the next sweep retries the reclaim.
           log.warn(`reaper: failed to reclaim ${name}`, String(e));

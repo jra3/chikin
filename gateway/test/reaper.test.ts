@@ -404,6 +404,21 @@ test("a containerless session whose client is gone is closed, child and all", as
   assert.deepEqual(stopped, [], "there was never a container to stop");
 });
 
+test("a client that takes the name during the volume call keeps its record", async () => {
+  const reg = new Registry();
+  reg.touch("inst-retaken", 0); // abandoned long ago: no session, no container
+  const { provisioner } = fakeProvisioner([]);
+  // The Docker call is where a reconnect can land.
+  provisioner.removeInstanceVolume = async () => {
+    liveSession(reg, "inst-retaken", config.idleTtlMs + 1000);
+    reg.streamOpened("inst-retaken", config.idleTtlMs + 1000);
+    return false;
+  };
+  await new Reaper(reg, provisioner as never).sweep(config.idleTtlMs + 1000);
+
+  assert.equal(reg.getActivity("inst-retaken")?.streams, 1, "its open-stream count survives the sweep");
+});
+
 test("a containerless session still inside the idle TTL is spared without a stream", async () => {
   const reg = new Registry();
   const now = 8 * HOUR;

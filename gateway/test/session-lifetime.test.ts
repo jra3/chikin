@@ -189,8 +189,11 @@ const healthz = async () =>
   };
 
 test("the reaper closes sessions abandoned without a container, and their children exit (#123)", { timeout: 60_000 }, async () => {
-  const sessions = await Promise.all(["inst-gone-1", "inst-gone-2", "inst-gone-3"].map(connect));
+  // One at a time: `connect` finds its child by its offset in the pid file.
+  const sessions = [];
+  for (const name of ["inst-gone-1", "inst-gone-2", "inst-gone-3"]) sessions.push(await connect(name));
   const pids = sessions.map((s) => s.pid);
+  assert.equal(new Set(pids).size, 3, "three sessions, three distinct child processes");
   assert.equal(pids.filter(isAlive).length, 3, "each session owns a live child process");
 
   for (const s of sessions) await s.abandon();

@@ -546,7 +546,11 @@ export async function renderDashboard(
   // Read from this process, not Docker, so it is honest even when `err` is set.
   const sessionCount = registry.all().length;
   const childCount = liveChildren();
-  const childLine = `<p class="meta">sessions: <strong>${sessionCount}</strong> · chrome-devtools-mcp children: <strong>${childCount}</strong>${
+  // `browserless` is the bridge's own answer, as on /healthz: a session whose
+  // child is not bound to a browser. It can exceed the table below, which is
+  // derived from Docker and so omits a new session on a still-warm Name.
+  const unbound = registry.all().filter((s) => !s.hasBrowser?.()).length;
+  const childLine = `<p class="meta">sessions: <strong>${sessionCount}</strong> · browserless: <strong>${unbound}</strong> · chrome-devtools-mcp children: <strong>${childCount}</strong>${
     childCount > sessionCount
       ? ` · <strong>${childCount - sessionCount} more than sessions</strong>; a child swap explains one for a moment, anything that stays is a leak (#122)`
       : ""

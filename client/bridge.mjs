@@ -60,7 +60,7 @@ const RECONNECT_MIN_MS = Number(process.env.CHIKIN_RECONNECT_MIN_MS || 500);
 const RECONNECT_MAX_MS = Number(process.env.CHIKIN_RECONNECT_MAX_MS || 30000);
 const REPLAY_TIMEOUT_MS = Number(process.env.CHIKIN_REPLAY_TIMEOUT_MS || 20000);
 // How long a clean exit waits for the gateway to acknowledge the session DELETE.
-const TERMINATE_TIMEOUT_MS = Number(process.env.CHIKIN_TERMINATE_TIMEOUT_MS || 1000);
+const TERMINATE_TIMEOUT_MS = 1000;
 
 const log = (m) => process.stderr.write(`chikin bridge: ${m}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -281,6 +281,10 @@ stdio.onmessage = (m) => {
 // only when something calls `close()`. The client hanging up is stdin ending.
 stdio.onclose = () => shutdown("client disconnected (stdio closed)");
 process.stdin.once("end", () => shutdown("client disconnected (stdin ended)"));
+// A write to a closed stdout raises EPIPE as an `error` event. Unhandled, it
+// kills the process before the DELETE below is sent, and shutdown itself
+// writes there when it fails the requests still in flight.
+process.stdout.on("error", () => shutdown("client disconnected (stdout closed)"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
