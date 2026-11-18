@@ -285,6 +285,9 @@ process.stdin.once("end", () => shutdown("client disconnected (stdin ended)"));
 // kills the process before the DELETE below is sent, and shutdown itself
 // writes there when it fails the requests still in flight.
 process.stdout.on("error", () => shutdown("client disconnected (stdout closed)"));
+// Same for stderr, which shutdown logs to. A client that died took all three
+// pipes with it, and there is nobody left to tell.
+process.stderr.on("error", () => {});
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 

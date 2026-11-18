@@ -145,7 +145,10 @@ export class Reaper {
             // in that window owns the record now; leave it everything.
             if (this.registry.has(name)) continue;
           }
-          const unclaimed = () => !this.registry.has(name) && !this.registry.isPending(name);
+          const unclaimed = () =>
+            !this.registry.has(name) &&
+            !this.registry.isPending(name) &&
+            !this.registry.heldByCdp(name);
           const discarded = await this.provisioner.removeInstanceVolume(name, unclaimed);
           if (discarded) {
             log.info(

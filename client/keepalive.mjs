@@ -49,17 +49,16 @@ const client = new Client({ name: "chikin-keepalive", version: "0.0.0" }, { capa
 // reclaims the browser (issue #122). Bounded so a dead gateway cannot hold us.
 // Installed before the first await, so Ctrl-C during provisioning is covered.
 let leaving = false;
-for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, async () => {
-    if (leaving) return;
-    leaving = true;
-    await Promise.race([
-      transport.terminateSession().catch(() => {}),
-      new Promise((r) => setTimeout(r, 1000)),
-    ]);
-    process.exit(0);
-  });
+async function leave(code) {
+  if (leaving) return;
+  leaving = true;
+  await Promise.race([
+    transport.terminateSession().catch(() => {}),
+    new Promise((r) => setTimeout(r, 1000)),
+  ]);
+  process.exit(code);
 }
+for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => leave(0));
 
 try {
   await client.connect(transport);
@@ -97,8 +96,9 @@ try {
   await call("chikin_identify", { handle });
   await beat();
 } catch (e) {
+  // The handshake succeeded, so a session exists even though the browser was refused.
   console.error(`keepalive: ${e.message}`);
-  process.exit(1);
+  await leave(1);
 }
 
 console.log(`keepalive: holding ${name} as '${handle}' — log in at ${vnc} (kill to release)`);
