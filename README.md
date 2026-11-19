@@ -60,9 +60,11 @@ curl -s http://localhost:8080/healthz        # {"status":"ok","config":{…},"wa
 open http://localhost:8080/                   # fleet dashboard
 ```
 
-`sessions`, `children` and `browserless` are the leak gauge. Every session runs
-one `chrome-devtools-mcp` child process, so `children` should equal `sessions`,
-and the reaper warns when it stays above it. `browserless` counts sessions that
+`sessions`, `children` and `browserless` are the leak gauge. A session runs at
+most one `chrome-devtools-mcp` child process, and none until it needs one: the
+gateway answers the handshake, `tools/list` and pings itself once it has seen a
+child answer the same `initialize` (#129). So `children` never exceeds
+`sessions`, and the reaper warns when it stays above it. `browserless` counts sessions that
 have not made a browser tool call.
 
 `/healthz` carries the **effective runtime config of the running gateway** — see

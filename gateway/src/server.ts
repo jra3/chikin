@@ -154,8 +154,9 @@ export function createApp(deps: ServerDeps): express.Express {
     // this process actually have" without a browser.
     //
     // `sessions`, `children` and `browserless` are the leak gauge (#122, #125):
-    // every session owns one chrome-devtools-mcp child, so `children` staying
-    // above `sessions` means a process nobody owns. All three are read from
+    // a session owns at most one chrome-devtools-mcp child (none until it
+    // needs one, #129), so `children` staying above `sessions` means a process
+    // nobody owns. All three are read from
     // this process's own state. Docker is not asked, because the compose
     // healthcheck polls this route.
     const sessions = deps.registry.all();

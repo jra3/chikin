@@ -41,11 +41,12 @@ process.stdin.on("data", (d) => {
       m.method === "initialize"
         ? {
             protocolVersion: m.params.protocolVersion,
-            capabilities: { tools: {} },
+            capabilities: { logging: {}, tools: {} },
             serverInfo: { name: "chrome_devtools", version: "0.0.0" },
+            instructions: "UPSTREAM DOC",
           }
         : m.method === "tools/list"
-          ? { tools: [] }
+          ? { tools: [{ name: "list_pages", description: "fake", inputSchema: { type: "object" } }] }
           : {};
     process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");
   }
@@ -85,6 +86,7 @@ const { createApp } = await import("../src/server.js");
 const { Registry } = await import("../src/registry.js");
 const { Reaper } = await import("../src/reaper.js");
 const { config } = await import("../src/config.js");
+const { forgetHandshakes } = await import("../src/bridge.js");
 const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
 const { StreamableHTTPClientTransport } = await import(
   "@modelcontextprotocol/sdk/client/streamableHttp.js"
@@ -159,20 +161,28 @@ test.after(async () => {
 
 const base = `http://127.0.0.1:${port}`;
 
-async function connect(name: string) {
+/**
+ * Connect a client. Since #129 a session only gets a child process when the
+ * gateway cannot answer for it, so `child: true` starts from a cold handshake
+ * cache: the first session to see a given `initialize` is answered by a real
+ * child, which is the process the lifetime tests below follow. `child: false`
+ * connects on whatever the cache holds and returns no pid.
+ */
+async function connect(name: string, opts: { child: boolean } = { child: true }) {
+  if (opts.child) forgetHandshakes();
   const before = spawnedPids().length;
   const transport = new StreamableHTTPClientTransport(new URL(`${base}/b/${name}/`));
   const client = new Client({ name: "lifetime-test", version: "0.0.0" }, { capabilities: {} });
   await client.connect(transport);
-  await until(`${name}'s child to start`, () => spawnedPids().length > before);
+  if (opts.child) await until(`${name}'s child to start`, () => spawnedPids().length > before);
   // The SDK opens the standalone event stream just AFTER connect() resolves.
   // It is what tells the gateway a client is attached, so wait for it.
   await until(`${name}'s event stream`, () => (registry.getActivity(name)?.streams ?? 0) > 0);
-  const pid = spawnedPids()[before];
+  const pid = opts.child ? spawnedPids()[before] : undefined;
   return {
     client,
     transport,
-    pid,
+    pid: pid as number,
     /** What a killed client looks like to the gateway: the link drops, no DELETE. */
     abandon: async () => {
       await client.close();
@@ -258,6 +268,55 @@ test("/healthz counts sessions, live children and browser-less sessions (#125)",
   assertAllGone(await stillAlive([a.pid, b.pid]), "a zero count means zero processes");
 });
 
+test("a session that only handshakes, lists tools and pings has no child process (#129)", { timeout: 60_000 }, async () => {
+  await until("children left by earlier tests to exit", async () => (await healthz()).children === 0);
+  // The first session answers from a real child and fills the cache.
+  const a = await connect("inst-warm-a");
+  const aTools = await a.client.listTools();
+  const before = spawnedPids().length;
+
+  const b = await connect("inst-warm-b", { child: false });
+  try {
+    const bTools = await b.client.listTools();
+    await b.client.ping();
+    await sleep(200); // room for a child the gateway should not be spawning
+    assert.equal(spawnedPids().length, before, "the second session spawned no child");
+    const h = await healthz();
+    assert.equal(h.sessions, 2);
+    assert.equal(h.children, 1, "only the session that filled the cache has a child");
+
+    // What the client sees is the same either way.
+    assert.deepEqual(bTools, aTools, "tools/list from the gateway matches the child's, chikin tools included");
+    assert.deepEqual(b.client.getServerVersion(), a.client.getServerVersion());
+    assert.deepEqual(b.client.getServerCapabilities(), a.client.getServerCapabilities());
+    assert.equal(b.client.getInstructions(), a.client.getInstructions());
+    assert.match(b.client.getInstructions() ?? "", /chikin_identify[\s\S]*UPSTREAM DOC/, "chikin's contract, then upstream's");
+  } finally {
+    for (const s of [a, b]) {
+      await s.transport.terminateSession().catch(() => {});
+      await s.client.close();
+    }
+  }
+});
+
+test("a request the gateway cannot answer itself gets a child, and the child's reply (#129)", { timeout: 60_000 }, async () => {
+  const a = await connect("inst-fallback-a"); // warms the cache
+  const b = await connect("inst-fallback-b", { child: false });
+  try {
+    const before = spawnedPids().length;
+    await b.client.setLoggingLevel("debug");
+    assert.equal(spawnedPids().length, before + 1, "logging/setLevel is the child's to answer, so it spawned one");
+    await b.client.ping();
+    assert.equal((await healthz()).children, 2);
+  } finally {
+    for (const s of [a, b]) {
+      await s.transport.terminateSession().catch(() => {});
+      await s.client.close();
+    }
+  }
+  await until("both children to exit", async () => (await healthz()).children === 0);
+});
+
 // --- client/bridge.mjs (#124) ------------------------------------------------
 
 /** Run the real bridge and speak newline-delimited JSON-RPC to its stdio. */
@@ -302,6 +361,7 @@ function startBridge(url: string) {
 for (const how of ["SIGTERM", "stdin close"] as const) {
   test(`client/bridge.mjs ends its gateway session on ${how} (#124)`, { timeout: 60_000 }, async () => {
     const name = how === "SIGTERM" ? "inst-bridge-term" : "inst-bridge-eof";
+    forgetHandshakes(); // a cold cache, so this session has a child to follow
     const before = spawnedPids().length;
     const bridge = startBridge(`${base}/b/${name}/`);
     try {

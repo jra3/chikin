@@ -640,6 +640,45 @@ export function augmentInstructions(result: { instructions?: string }): void {
 }
 
 /**
+ * What a chrome-devtools-mcp child answered to a given `initialize` and to
+ * `tools/list` after it, so a later session sending the same `initialize` can
+ * be answered with no child at all (#129). A browser-less child is ~120 MiB
+ * PSS, and most sessions never browse.
+ *
+ * Keyed on the client's whole `initialize` params, verbatim. Upstream's reply
+ * depends only on the protocol version asked for, so this is stricter than it
+ * has to be, and a client that changes anything (a new version string) simply
+ * misses once and is answered by a real child that refills the entry. Entries
+ * hold the child's UNDECORATED result: chikin's instructions and tools are
+ * added per reply, exactly as on the child path. Per process, because the
+ * binary and its args are fixed for the life of the gateway.
+ */
+interface Handshake {
+  init?: Record<string, unknown>;
+  /** tools/list results by the request's own params (a cursor pages). */
+  toolsList: Map<string, Record<string, unknown>>;
+}
+const handshakes = new Map<string, Handshake>();
+const MAX_HANDSHAKES = 32;
+
+function handshakeFor(initKey: string): Handshake {
+  let h = handshakes.get(initKey);
+  if (!h) {
+    if (handshakes.size >= MAX_HANDSHAKES) handshakes.delete(handshakes.keys().next().value as string);
+    h = { toolsList: new Map() };
+    handshakes.set(initKey, h);
+  }
+  return h;
+}
+
+/** Empty the handshake cache, so the next session is answered by a real child. Tests only. */
+export function forgetHandshakes(): void {
+  handshakes.clear();
+}
+
+const paramsKey = (params: unknown): string => JSON.stringify(params ?? null);
+
+/**
  * Spawn this session's chrome-devtools-mcp child and wire a transparent
  * JSON-RPC pump between the client's HTTP MCP transport and the child's stdio.
  * Returns once both transports are started; the caller then drives the
@@ -706,8 +745,16 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   // effectively suppressed says so instead of just going quiet.
   let navSuperseded = 0;
   let cdpFailStreak = 0;
-  // tools/list request ids whose replies need the synthetic chikin_reset appended
-  const toolsListIds = new Set<string | number>();
+  // tools/list request ids whose replies need the synthetic chikin tools
+  // appended, each with its params key so the undecorated reply can be cached.
+  const toolsListIds = new Map<string | number, string>();
+  // `paramsKey` of the client's initialize, once it has sent one.
+  let initKey: string | undefined;
+  // True once the gateway has answered `initialize` itself, so the child has
+  // never seen it: whichever child starts later must be sent a replay.
+  let initAnsweredHere = false;
+  // In-flight `ensureChild`, so frames that need a child share one spawn.
+  let childStarting: Promise<void> | null = null;
   // Moves whenever a CLIENT frame that can change which page the child's tools
   // act on is handed over. Only the screenshot activation reads it, to tell
   // "the selection is still the one I read" from "the client has chosen since"
@@ -930,18 +977,22 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
       }
       if (f && f.id !== undefined) {
         inflight.delete(f.id);
-        // Append the gateway's synthetic tools to tools/list replies.
-        if (toolsListIds.has(f.id)) {
+        // Append the gateway's synthetic tools to tools/list replies, keeping
+        // the child's own list for sessions answered without a child (#129).
+        const listKey = toolsListIds.get(f.id);
+        if (listKey !== undefined) {
           toolsListIds.delete(f.id);
           if (Array.isArray(f.result?.tools)) {
-            f.result.tools.push(RESET_TOOL, IDENTIFY_TOOL, SNAPSHOT_TOOL, ACT_TOOL);
-            if (deciderFor(deps)) f.result.tools.push(ACHIEVE_TOOL);
+            if (initKey !== undefined)
+              handshakeFor(initKey).toolsList.set(listKey, structuredClone(f.result));
+            decorateToolsList(f.result as { tools: unknown[] });
           }
         }
         // Layer 1 of the self-directing design: fold chikin's contract into the
         // initialize result's `instructions` before the client sees it. This is
         // the genuine handshake reply (respawn replays are swallowed elsewhere).
         if (initId !== undefined && f.id === initId && f.result && typeof f.result === "object") {
+          if (initKey !== undefined) handshakeFor(initKey).init = structuredClone(f.result);
           augmentInstructions(f.result as { instructions?: string });
         }
         // A nav tool replied: schedule out-of-band verification against the
@@ -1730,7 +1781,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     const tracked = f && f.method !== undefined && f.id !== undefined;
     if (tracked) {
       inflight.set(f.id as string | number, true);
-      if (f.method === "tools/list") toolsListIds.add(f.id as string | number);
+      if (f.method === "tools/list") toolsListIds.set(f.id as string | number, paramsKey(f.params));
       // Record what each nav asked for, so its reply can be verified
       // out-of-band. Only the requested URL is kept here: the child's own view
       // of the browser comes off the reply itself (see wireChild/verifyNav).
@@ -1761,6 +1812,99 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         failRequest(f.id as string | number, `chikin browser send failed (${why}); retry the request`);
       if (gen === childGen) void respawnChild(`child send failed: ${why}`);
     });
+  }
+
+  /** chikin's own tools, appended to every tools/list reply the client sees. */
+  function decorateToolsList(result: { tools: unknown[] }): void {
+    result.tools.push(RESET_TOOL, IDENTIFY_TOOL, SNAPSHOT_TOOL, ACT_TOOL);
+    if (deciderFor(deps)) result.tools.push(ACHIEVE_TOOL);
+  }
+
+  const replyResult = (id: string | number, result: unknown): void => {
+    http
+      .send({ jsonrpc: "2.0", id, result } as JSONRPCMessage)
+      .catch((e) => log.warn(`session[${name}]: ->client reply failed`, String(e)));
+  };
+
+  /**
+   * Answer a frame on the child's behalf while this session has none (#129).
+   * True when it was handled. Only what the gateway knows the child's answer
+   * to: the handshake and tools/list it has already seen a child give for this
+   * exact `initialize`, `ping`, and notifications (the child that starts later
+   * is sent `notifications/initialized` by the replay). Anything else, such as
+   * `logging/setLevel`, is the child's to answer, so the caller starts one.
+   */
+  function answerWithoutChild(f: Frame): boolean {
+    if (!f) return false;
+    if (f.method === undefined) return true; // a reply to a request no child made
+    if (f.id === undefined) return true; // a notification
+    if (f.method === "ping") {
+      replyResult(f.id, {});
+      return true;
+    }
+    const h = initKey !== undefined ? handshakes.get(initKey) : undefined;
+    if (f.method === "initialize" && f.id === initId && h?.init) {
+      const result = structuredClone(h.init);
+      augmentInstructions(result as { instructions?: string });
+      initAnsweredHere = true;
+      replyResult(f.id, result);
+      return true;
+    }
+    if (f.method === "tools/list" && initAnsweredHere) {
+      const cached = h?.toolsList.get(paramsKey(f.params));
+      if (!cached) return false;
+      const result = structuredClone(cached) as { tools: unknown[] };
+      decorateToolsList(result);
+      replyResult(f.id, result);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Start a BROWSER-LESS child for a frame the gateway cannot answer itself
+   * (#129). Shared across racers, and run under `respawning`, the flag every
+   * other swap site already waits on, so it never interleaves with an attach,
+   * a respawn or a reset.
+   */
+  function ensureChild(): Promise<void> {
+    if (child) return Promise.resolve();
+    if (childStarting) return childStarting;
+    childStarting = (async () => {
+      while (respawning && !session.isClosed) await sleep(250);
+      if (session.isClosed || child) return;
+      respawning = true;
+      const gen = ++childGen;
+      let spawned: StdioClientTransport | null = null;
+      try {
+        spawned = await startChild(gen, null);
+        // A child that never saw `initialize` has no MCP session. If the client
+        // has not sent one yet, the frame being dispatched IS it.
+        if (initAnsweredHere) await replayInitialize(spawned, gen);
+        if (session.isClosed) return;
+        child = spawned;
+        spawned = null;
+      } finally {
+        respawning = false;
+        await spawned?.close().catch(() => {});
+      }
+    })().finally(() => {
+      childStarting = null;
+    });
+    return childStarting;
+  }
+
+  async function startChildThenDispatch(msg: JSONRPCMessage, f: Frame): Promise<void> {
+    try {
+      await ensureChild();
+    } catch (e) {
+      log.warn(`session[${name}]: child start failed`, String(e));
+      if (f?.id !== undefined && f.method !== undefined)
+        failRequest(f.id, `chikin could not start its devtools child (${String(e)}); retry the request`);
+      return;
+    }
+    if (session.isClosed) return;
+    dispatch(msg, f);
   }
 
   // First browser work on a browser-less session (issue #63): provision, rebind
@@ -2004,6 +2148,7 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
     if (f && f.method === "initialize") {
       initFrame = msg;
       initId = f.id;
+      initKey = paramsKey(f.params);
     }
     // Gateway-owned tools + the identify gate. Only tools/call is affected;
     // initialize / tools/list / notifications always fall through to forward.
@@ -2041,6 +2186,12 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
         return;
       }
     }
+    // No child yet (#129): answer what the gateway can, start one for the rest.
+    if (!child) {
+      if (!childStarting && answerWithoutChild(f)) return;
+      void startChildThenDispatch(msg, f);
+      return;
+    }
     dispatch(msg, f);
   };
 
@@ -2062,11 +2213,10 @@ export async function createSession(name: string, deps: BridgeDeps): Promise<Ses
   );
   session.hasBrowser = () => currentIp !== null;
 
-  // Child first so its stdin is ready before the initialize frame arrives — but
-  // BROWSER-LESS (issue #63). It answers the handshake, tools/list and pings on
-  // its own; `attachBrowser` provisions the container later, if and when this
-  // session actually drives a browser.
-  child = await startChild(++childGen, null);
+  // No child yet (#129). The gateway answers the handshake, tools/list and
+  // pings from what an earlier child said; `ensureChild` starts a browser-less
+  // one for anything else, and `attachBrowser` starts the browser-bound one on
+  // the first browser call (issue #63).
   await http.start();
 
   return session;
